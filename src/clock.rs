@@ -30,8 +30,13 @@ const GATE2: f64 = 16.0;
 /// Before the pair has converged the gate is wider, or a correct but young
 /// model could reject everything it sees.
 const GATE2_YOUNG: f64 = 64.0;
-/// Consecutive rejections that mean "this clock jumped": start over.
+/// Consecutive rejections that may mean "this clock jumped" (then checked
+/// for coherence before starting over).
 const RESET_AFTER: u32 = 6;
+/// Largest noise scale a pair may adopt (variance factor; 25 = 5x sigma).
+const NIS_MAX: f64 = 25.0;
+/// EWMA weight of the noise-level tracker (~50 observations).
+const NIS_ALPHA: f64 = 0.02;
 /// Updates (observations) before the pair is usable for multilateration.
 /// 10, not 6: in production (2026-10-24) young pairs that had just been
 /// reset were the ones feeding the worst normalisations.
@@ -67,6 +72,17 @@ pub struct PairModel {
     pub band: u8,
     /// (drift, its variance) to keep across the next init (offset reset)
     keep_drift: Option<(f64, f64)>,
+    /// EWMA of the normalised innovation squared against the NOMINAL noise:
+    /// ~1 when the receivers are as good as their clock type says, larger
+    /// when they are noisier. The measurement noise used is r * nis (clamped):
+    /// production showed many pairs far noisier than the nominal 0.5 us,
+    /// which a fixed r turned into rejection runs and resets.
+    nis: f64,
+    /// Innovations of the current run of rejections, to tell a real clock
+    /// jump (they agree with each other) from plain noise (they don't).
+    rej_nu: Vec<f64>,
+    /// Consecutive updates refused because they implied an impossible drift.
+    drift_rejects_in_row: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,7 +112,20 @@ impl PairModel {
             reject_rate: 0.0,
             band,
             keep_drift: None,
+            nis: 1.0,
+            rej_nu: Vec::with_capacity(RESET_AFTER as usize),
+            drift_rejects_in_row: 0,
         }
+    }
+
+    /// Effective measurement variance: nominal, scaled by observed noise.
+    fn r_eff(&self) -> f64 {
+        self.r * self.nis.clamp(1.0, NIS_MAX)
+    }
+
+    /// How much noisier than nominal this pair is (1 = as specified).
+    pub fn noise_scale(&self) -> f64 {
+        self.nis.clamp(1.0, NIS_MAX).sqrt()
     }
 
     fn init(&mut self, s_a: f64, theta: f64, wall: f64) {
@@ -104,9 +133,11 @@ impl PairModel {
         self.s_ref = s_a;
         let (drift, pd) = self.keep_drift.take().unwrap_or((0.0, self.max_drift * self.max_drift));
         self.x = [0.0, drift];
-        self.p = [[self.r, 0.0], [0.0, pd]];
+        self.p = [[self.r_eff(), 0.0], [0.0, pd]];
         self.updates = 1;
         self.rejects_in_row = 0;
+        self.rej_nu.clear();
+        self.drift_rejects_in_row = 0;
         self.updated_wall = wall;
     }
 
@@ -135,34 +166,56 @@ impl PairModel {
         }
         let (x, p) = self.propagate(s_a);
         let nu = (theta - self.base) - x[0];
-        let s = p[0][0] + self.r;
+        // Noise level tracking against the nominal r, capped so one wild
+        // observation cannot blow it up.
+        let nis_obs = (nu * nu / (p[0][0] + self.r)).min(4.0 * NIS_MAX);
+        let s = p[0][0] + self.r_eff();
         let gate = if self.updates < MIN_UPDATES { GATE2_YOUNG } else { GATE2 };
         if nu * nu > gate * s {
             self.rejects += 1;
             self.rejects_in_row += 1;
             self.reject_rate += 0.05 * (1.0 - self.reject_rate);
+            self.nis += NIS_ALPHA * 0.5 * (nis_obs - self.nis);
+            self.rej_nu.push(nu);
             if self.rejects_in_row >= RESET_AFTER {
-                self.resets += 1;
-                self.init(s_a, theta, wall);
-                return Outcome::Reset;
+                // A clock jump moves every following observation by the same
+                // amount; noise scatters them. Only the first is a reason to
+                // start over (mlat-server resets on any 77-point streak).
+                let lo = self.rej_nu.iter().cloned().fold(f64::INFINITY, f64::min);
+                let hi = self.rej_nu.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let mean = self.rej_nu.iter().sum::<f64>() / self.rej_nu.len() as f64;
+                let coherent = hi - lo <= (6.0 * self.r_eff().sqrt()).max(0.2 * mean.abs());
+                self.rej_nu.clear();
+                self.rejects_in_row = 0;
+                if coherent {
+                    self.resets += 1;
+                    self.init(s_a, theta, wall);
+                    return Outcome::Reset;
+                }
             }
             return Outcome::Rejected;
         }
         let k0 = p[0][0] / s;
         let k1 = p[0][1] / s;
         let mut nx = [x[0] + k0 * nu, x[1] + k1 * nu];
+        if nx[1].abs() > self.max_drift {
+            // An update that would put the drift beyond what the two crystals
+            // can do is bad data: refuse it, as mlat-server does. Only a
+            // sustained run means the pair itself is wrong.
+            self.rejects += 1;
+            self.drift_rejects_in_row += 1;
+            if self.drift_rejects_in_row >= RESET_AFTER {
+                self.resets += 1;
+                self.init(s_a, theta, wall);
+                return Outcome::ResetDrift;
+            }
+            return Outcome::Rejected;
+        }
         // Joseph-free update is fine for a 2x2 with these magnitudes.
         let np = [
             [(1.0 - k0) * p[0][0], (1.0 - k0) * p[0][1]],
             [p[0][1] - k1 * p[0][0], p[1][1] - k1 * p[0][1]],
         ];
-        if nx[1].abs() > self.max_drift {
-            // A drift beyond what either crystal can do: the data is not one
-            // clock pair any more (receiver restarted, or moved). Start over.
-            self.resets += 1;
-            self.init(s_a, theta, wall);
-            return Outcome::ResetDrift;
-        }
         // Re-centre: keep the offset small relative to base.
         if nx[0].abs() > 1.0 {
             self.base += nx[0];
@@ -173,8 +226,11 @@ impl PairModel {
         self.s_ref = s_a;
         self.updates = self.updates.saturating_add(1);
         self.rejects_in_row = 0;
+        self.rej_nu.clear();
+        self.drift_rejects_in_row = 0;
         self.updated_wall = wall;
         self.reject_rate -= 0.05 * self.reject_rate;
+        self.nis += NIS_ALPHA * (nis_obs - self.nis);
         Outcome::Accepted
     }
 
@@ -264,8 +320,10 @@ mod tests {
         s += 0.5;
         assert_eq!(m.observe(s, 5.0 + 1e-6 * s + 30e-6, 51.0), Outcome::Rejected);
         // a persistent jump of 1 ms resets the pair
+        // A preceding lone outlier makes the first run of rejections
+        // incoherent, so the jump is confirmed on the second run at the latest.
         let mut reset_at = None;
-        for i in 0..RESET_AFTER {
+        for i in 0..2 * RESET_AFTER {
             s += 0.5;
             if m.observe(s, 5.001 + 1e-6 * s, 52.0 + i as f64) == Outcome::Reset {
                 reset_at = Some(i);

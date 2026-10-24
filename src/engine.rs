@@ -84,6 +84,9 @@ struct Rx {
     mlat_msgs: u64,
     /// Copies this receiver contributed to accepted multilateration updates.
     used: u64,
+    /// Timestamp noise relative to its clock type's nominal jitter, from the
+    /// noise its clock pairs observe (1 = as specified).
+    noise_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -399,6 +402,7 @@ impl Engine {
             sync_msgs: 0,
             mlat_msgs: 0,
             used: 0,
+            noise_scale: 1.0,
         };
         self.rx_by_conn.insert(conn, key);
         self.rxs.insert(key, r);
@@ -705,7 +709,7 @@ impl Engine {
                 Some(i) => i,
                 None => {
                     keys.push(k);
-                    nodes.push(Node { pos: r.pos, jitter: r.jitter });
+                    nodes.push(Node { pos: r.pos, jitter: r.jitter * r.noise_scale });
                     keys.len() - 1
                 }
             };
@@ -804,7 +808,8 @@ impl Engine {
             let ac = self.aircraft.get(&d.address).unwrap();
             let alt = self.altitude_for(ac, d.altitude_ft, now);
             let used_keys: Vec<RxKey> = cl.iter().map(|&i| keys[copies[normd.copies[i]].node]).collect();
-            let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped };
+            let sites = distinct_sites(&meas);
+            let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped, sites };
             self.update_aircraft(d.address, &meas, &cov, alt, t_wall, now, &used_keys, &ctx);
         }
     }
@@ -844,7 +849,14 @@ impl Engine {
         ctx: &GroupCtx,
     ) {
         let n = meas.len();
-        let can_fix = n >= 4 || (n >= 3 && alt.is_some());
+        // Decisions count SITES, not receivers: two antennas a few metres
+        // apart (production: ADSB_PRI/ADSB_SEC, 3 m) are one point of
+        // geometry. A stand-alone fix needs one redundant site (dof >= 1):
+        // an exactly determined fix fits both mirror lobes perfectly, so a
+        // wrong one is undetectable (chi2 = 0). Those groups go to the track
+        // as a TDOA update instead, where the track's prior picks the lobe.
+        let sites_dof = ctx.sites as i32 + alt.is_some() as i32 - 4;
+        let can_fix = sites_dof >= 1;
         let guesses = self.guesses(self.aircraft.get(&icao), meas, alt, t);
         let mut accepted = false;
         let mut fix_used: Option<Fix> = None;
@@ -897,13 +909,17 @@ impl Engine {
                     fix_used = Some(fix);
                 }
             }
-        } else if n >= 2 {
+        } else if n >= 2 && ctx.sites >= 2 {
             let ac = self.aircraft.get_mut(&icao).unwrap();
             if let Some(tr) = ac.track.as_mut() {
                 if t - tr.last_update() < 30.0 {
                     match tr.update_tdoa(meas, cov, alt, t) {
                         Gate::Accepted => {
-                            accepted = true;
+                            // 2-site updates feed the track but never publish
+                            // it on their own: they constrain a hyperbola, not
+                            // a point (production: 85 of the 113 published
+                            // errors over 1 km).
+                            accepted = ctx.sites >= 3;
                             self.stats.track_tdoa_updates.fetch_add(1, Ordering::Relaxed);
                         }
                         Gate::Rejected(_) => {
@@ -1241,20 +1257,24 @@ impl Engine {
         // Receiver health: a receiver most of whose converged pairs keep
         // rejecting observations has a wrong position or a broken clock; its
         // copies are kept out of multilateration until that changes.
-        let mut rate: HashMap<RxKey, (f64, u32)> = HashMap::new();
+        let mut rate: HashMap<RxKey, (f64, u32, f64)> = HashMap::new();
         for ((a, b), m) in &self.pairs {
             if m.updates < crate::clock::MIN_UPDATES {
                 continue;
             }
             for k in [a, b] {
-                let e = rate.entry(*k).or_insert((0.0, 0));
+                let e = rate.entry(*k).or_insert((0.0, 0, 0.0));
                 e.0 += m.reject_rate;
                 e.1 += 1;
+                e.2 += m.noise_scale();
             }
         }
         for (k, r) in self.rxs.iter_mut() {
-            let (sum, n) = rate.get(k).copied().unwrap_or((0.0, 0));
+            let (sum, n, noise) = rate.get(k).copied().unwrap_or((0.0, 0, 0.0));
             r.suspect = n >= 4 && sum / n as f64 > 0.35;
+            // A pair's noise mixes both receivers; averaged over all of a
+            // receiver's pairs it mostly reflects the receiver itself.
+            r.noise_scale = if n >= 3 { (noise / n as f64).max(1.0) } else { 1.0 };
         }
         // Tracks.
         self.aircraft.retain(|_, a| {
@@ -1317,11 +1337,25 @@ impl Engine {
 
 /// Per-group facts carried into the per-cluster update, for diagnostics.
 struct GroupCtx {
+    /// distinct receiver sites in this update (receivers < 1 km apart = one)
+    sites: usize,
     df: u8,
     clusters: usize,
     copies: usize,
     edges: usize,
     dropped: usize,
+}
+
+/// Number of distinct sites among the measurements: receivers closer than
+/// 1 km merge into one (mlat-server's `is_distinct` rule).
+fn distinct_sites(meas: &[Meas]) -> usize {
+    let mut reps: Vec<Ecef> = Vec::with_capacity(meas.len());
+    for m in meas {
+        if !reps.iter().any(|r| dist(r, &m.rx) < 1000.0) {
+            reps.push(m.rx);
+        }
+    }
+    reps.len()
 }
 
 /// Measurements and covariance for one cluster of a normalised group.

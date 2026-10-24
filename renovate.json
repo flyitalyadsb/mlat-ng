@@ -1,0 +1,77 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "Europe/Rome",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 5,
+
+  "packageRules": [
+    {
+      "description": "Nesso platform libraries (WS1 bricks) - group together, prefer pinned git-tag bumps",
+      "matchPackageNames": [
+        "/^nesso-notify$/",
+        "/^nesso-fetch$/",
+        "/^mcp-common$/",
+        "/^nesso-scraping$/",
+        "/^nesso-ocr$/",
+        "/^nesso-k8s-bases$/",
+        "/^nesso-k8s-template$/"
+      ],
+      "groupName": "nesso platform libraries",
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Patch/minor bumps of platform libs auto-merge after CI passes - org policy: compatible-release range (>=x.y,<x.(y+1)) is enforced by requiring manual review only on major bumps",
+      "matchPackageNames": [
+        "/^nesso-notify$/",
+        "/^nesso-fetch$/",
+        "/^mcp-common$/",
+        "/^nesso-scraping$/",
+        "/^nesso-ocr$/"
+      ],
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Major bumps of platform libs always need a human - may be a breaking change",
+      "matchPackageNames": [
+        "/^nesso-notify$/",
+        "/^nesso-fetch$/",
+        "/^mcp-common$/",
+        "/^nesso-scraping$/",
+        "/^nesso-ocr$/"
+      ],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "breaking-change-review"]
+    }
+  ],
+
+  "customManagers": [
+    {
+      "description": "git-tag uv/pip installs, e.g. `nesso-notify @ git+https://github.com/nesso-labs/nesso-notify@v0.1.0` in pyproject.toml / requirements*.txt",
+      "customType": "regex",
+      "fileMatch": [
+        "(^|/)pyproject\\.toml$",
+        "(^|/)requirements.*\\.txt$"
+      ],
+      "matchStrings": [
+        "git\\+https://github\\.com/nesso-labs/(?<depName>[a-zA-Z0-9_.-]+)(\\.git)?@(?<currentValue>v?\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-tags",
+      "packageNameTemplate": "nesso-labs/{{{depName}}}"
+    },
+    {
+      "description": "Kustomize remote-base refs pinned to a tag, e.g. `github.com/nesso-labs/nesso-k8s-template//path?ref=v1.1.0` in kustomization.yaml",
+      "customType": "regex",
+      "fileMatch": ["(^|/)kustomization\\.ya?ml$"],
+      "matchStrings": [
+        "github\\.com/nesso-labs/(?<depName>[a-zA-Z0-9_.-]+)//[^\\s\"']*\\?ref=(?<currentValue>v?\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-tags",
+      "packageNameTemplate": "nesso-labs/{{{depName}}}"
+    }
+  ]
+}

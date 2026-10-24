@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# FORWARDING SHIM - not the source of truth.
+#
+# The real http-app base now lives in nesso-k8s-template (WS1 dedup, see
+# ../../../README.md). This file exists only so the ~30 production repos that
+# already reference:
+#
+#   github.com/nesso-labs/new-repo-template//nesso-k8s-bases/archetypes/http-app/base?ref=main
+#
+# keep working unmodified. New consumers should reference nesso-k8s-template
+# directly (see docs/PINNING.md) instead of going through this shim.
+#
+# Do NOT add deployment.yaml/service.yaml/ingress.yaml back here -
+# scripts/check_k8s_bases_sync.py (run in CI) fails the build if you do.
+resources:
+  - github.com/nesso-labs/nesso-k8s-template//nesso-k8s-bases/archetypes/http-app/base?ref=v1.1.0

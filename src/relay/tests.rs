@@ -309,3 +309,30 @@ fn a_live_receiver_that_turns_multi_clock_is_disconnected_then_retried() {
     assert_eq!(ld(&st.receivers_multi_clock), 0);
     assert_eq!(ld(&st.receivers_live), 1);
 }
+
+#[test]
+fn late_delivery_is_not_a_clock_jump() {
+    let (mut a, st) = adapter(AdapterConfig::default(), &[(1, ClockType::Dump1090)]);
+    let mut evs = Vec::new();
+    let ld = |x: &std::sync::atomic::AtomicU64| x.load(std::sync::atomic::Ordering::Relaxed);
+    live(&mut a, &[1], &mut evs);
+    evs.clear();
+    // three 5 s stalls in a minute: frames come late, then in a burst
+    let mut ts = 1_000_000 + 21 * 12_000_000u64;
+    let mut wall = 1021.0;
+    for _ in 0..3 {
+        ts += 12_000_000; // generated 1 s later...
+        wall += 6.0; // ...delivered 6 s later
+        a.on_frame(&frame(1, ts, &df11(0x3C0001)), wall, &mut evs);
+        for _ in 0..5 {
+            ts += 12_000_000; // the backlog, then on time again
+            a.on_frame(&frame(1, ts, &df11(0x3C0001)), wall, &mut evs);
+        }
+        wall += 0.01;
+    }
+    assert!(!kinds(&evs).contains(&"reset") && !kinds(&evs).contains(&"disconnect"), "{:?}", kinds(&evs));
+    assert_eq!(ld(&st.clock_jumps), 0);
+    assert_eq!(ld(&st.late_deliveries), 3);
+    a.tick(wall, &mut evs);
+    assert_eq!(ld(&st.receivers_live), 1);
+}

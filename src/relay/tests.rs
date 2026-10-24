@@ -257,3 +257,55 @@ fn moved_antenna_is_reported() {
     a.set_registry(r, &mut evs);
     assert_eq!(kinds(&evs), vec!["moved"]);
 }
+
+#[test]
+fn two_clocks_under_one_id_are_left_out() {
+    let (mut a, st) = adapter(AdapterConfig::default(), &[(1, ClockType::Dump1090)]);
+    let mut evs = Vec::new();
+    let ld = |x: &std::sync::atomic::AtomicU64| x.load(std::sync::atomic::Ordering::Relaxed);
+    // an aggregating feeder: two counters 50 s apart, interleaved
+    for s in 0..40u64 {
+        for (k, base) in [(0u64, 1_000_000u64), (1, 600_000_000)] {
+            a.on_frame(&frame(1, base + s * 12_000_000 + k, &df11(0x3C0001)), 1000.0 + s as f64, &mut evs);
+        }
+    }
+    a.tick(1040.0, &mut evs);
+    assert!(!kinds(&evs).contains(&"connect"), "{:?}", kinds(&evs));
+    assert_eq!(ld(&st.receivers_multi_clock), 1);
+    assert_eq!(ld(&st.clock_resets), 0);
+}
+
+#[test]
+fn a_live_receiver_that_turns_multi_clock_is_disconnected_then_retried() {
+    let (mut a, st) = adapter(AdapterConfig::default(), &[(1, ClockType::Dump1090)]);
+    let mut evs = Vec::new();
+    let ld = |x: &std::sync::atomic::AtomicU64| x.load(std::sync::atomic::Ordering::Relaxed);
+    live(&mut a, &[1], &mut evs);
+    evs.clear();
+    let t0 = 1_000_000 + 22 * 12_000_000u64;
+    // one restart: a reset, still live
+    a.on_frame(&frame(1, 5, &df11(0x3C0001)), 1022.0, &mut evs);
+    assert_eq!(kinds(&evs)[0], "reset");
+    assert_eq!(ld(&st.clock_resets), 1);
+    evs.clear();
+    // then a second clock appears: jumps pile up
+    for i in 0..4u64 {
+        a.on_frame(&frame(1, t0 + i * 12_000_000, &df11(0x3C0001)), 1023.0 + i as f64, &mut evs);
+        a.on_frame(&frame(1, 5 + (i + 1) * 12_000_000, &df11(0x3C0001)), 1023.2 + i as f64, &mut evs);
+    }
+    assert!(kinds(&evs).contains(&"disconnect"), "{:?}", kinds(&evs));
+    // the restart and the next jump each reset; the third makes it multi-clock: no reset storm
+    assert_eq!(ld(&st.clock_resets), 2);
+    a.tick(1030.0, &mut evs);
+    assert_eq!(ld(&st.receivers_multi_clock), 1);
+    evs.clear();
+    // the duplicate goes away; after 10 calm minutes and a probation it is back
+    let base = 5 + 5 * 12_000_000u64;
+    for s in 0..=640u64 {
+        a.on_frame(&frame(1, base + s * 12_000_000, &df11(0x3C0001)), 1027.2 + s as f64, &mut evs);
+    }
+    assert!(kinds(&evs).contains(&"connect"), "{:?}", kinds(&evs));
+    a.tick(1027.2 + 641.0, &mut evs);
+    assert_eq!(ld(&st.receivers_multi_clock), 0);
+    assert_eq!(ld(&st.receivers_live), 1);
+}

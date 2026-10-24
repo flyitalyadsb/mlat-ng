@@ -267,6 +267,8 @@ pub fn render_metrics(o: &mut String, s: &FeedStats, service: &str) {
         ("feed_mlat_modes_only_events_total", l(&a.ev_mlat_modes_only)),
         ("feed_mlat_bench_events_total", l(&a.ev_mlat_bench)),
         ("feed_clock_jumps_total", l(&a.clock_jumps)),
+        ("feed_clock_resets_total", l(&a.clock_resets)),
+        ("feed_receivers_multi_clock", l(&a.receivers_multi_clock)),
         ("feed_receivers_live", l(&a.receivers_live)),
         ("feed_receivers_probation", l(&a.receivers_probation)),
         ("feed_receivers_bad_clock", l(&a.receivers_bad_clock)),

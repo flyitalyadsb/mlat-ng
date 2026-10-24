@@ -249,6 +249,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             "frames_zero_ts": l(&astats.frames_zero_ts), "frames_modeac": l(&astats.frames_modeac),
             "sync_events": l(&astats.ev_sync), "mlat_modes_only_events": l(&astats.ev_mlat_modes_only),
             "mlat_bench_events": l(&astats.ev_mlat_bench), "clock_jumps": l(&astats.clock_jumps),
+            "clock_resets": l(&astats.clock_resets), "receivers_multi_clock": l(&astats.receivers_multi_clock),
             "receivers_live": l(&astats.receivers_live), "receivers_bad_clock": l(&astats.receivers_bad_clock),
             "receivers_probation": l(&astats.receivers_probation), "receivers_unmapped": l(&astats.receivers_unmapped),
         },

@@ -45,6 +45,9 @@ pub struct Normalized {
 /// Normalised residual (squared, in sigmas) above which an edge is treated as
 /// inconsistent with the others and dropped.
 const EDGE_OUTLIER2: f64 = 25.0;
+/// Inconsistent edges dropped per group at most. 3 was too few for the large
+/// groups seen in production, where several young pairs disagree at once.
+const MAX_DROPPED: usize = 8;
 
 struct Edge {
     i: usize,
@@ -169,7 +172,7 @@ pub fn normalize(
                 }
             }
             if let Some(idx) = worst {
-                if dropped < 3 {
+                if dropped < MAX_DROPPED {
                     edges.swap_remove(idx);
                     dropped += 1;
                     continue;

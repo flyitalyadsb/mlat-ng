@@ -33,7 +33,9 @@ const GATE2_YOUNG: f64 = 64.0;
 /// Consecutive rejections that mean "this clock jumped": start over.
 const RESET_AFTER: u32 = 6;
 /// Updates (observations) before the pair is usable for multilateration.
-pub const MIN_UPDATES: u32 = 6;
+/// 10, not 6: in production (2026-10-24) young pairs that had just been
+/// reset were the ones feeding the worst normalisations.
+pub const MIN_UPDATES: u32 = 10;
 /// A pair whose predicted offset sigma exceeds this is not used.
 pub const MAX_SIGMA: f64 = 1.5e-6;
 /// Not updated for this long: the pair is not used (and is expired later).
@@ -71,8 +73,10 @@ pub struct PairModel {
 pub enum Outcome {
     Accepted,
     Rejected,
-    /// The pair restarted from this observation (jump or drift out of range).
+    /// The pair restarted after a run of rejections (a clock jump).
     Reset,
+    /// The pair restarted because its drift estimate left the physical range.
+    ResetDrift,
 }
 
 impl PairModel {
@@ -157,7 +161,7 @@ impl PairModel {
             // clock pair any more (receiver restarted, or moved). Start over.
             self.resets += 1;
             self.init(s_a, theta, wall);
-            return Outcome::Reset;
+            return Outcome::ResetDrift;
         }
         // Re-centre: keep the offset small relative to base.
         if nx[0].abs() > 1.0 {

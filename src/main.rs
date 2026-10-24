@@ -97,6 +97,10 @@ fn main() -> anyhow::Result<()> {
             match path {
                 "/healthz" => Some(("text/plain", "ok\n".into())),
                 "/metrics" => Some(("text/plain; version=0.0.4", render_metrics(&render_stats, &render_counters))),
+                "/debug.json" => {
+                    let d = render_stats.debug.lock().unwrap().clone();
+                    Some(("application/json", serde_json::to_string_pretty(&d).unwrap_or_default()))
+                }
                 "/state.json" => {
                     let s = render_stats.snapshot.lock().unwrap().clone();
                     Some(("application/json", serde_json::to_string_pretty(&s).unwrap_or_default()))
@@ -173,6 +177,10 @@ fn render_metrics(s: &engine::Stats, c: &proto::Counters) -> String {
     m("pair_updates_total", "counter", l(&s.pair_updates));
     m("pair_rejects_total", "counter", l(&s.pair_rejects));
     m("pair_resets_total", "counter", l(&s.pair_resets));
+    m("pair_resets_drift_total", "counter", l(&s.pair_resets_drift));
+    m("tracks_born_total", "counter", l(&s.tracks_born));
+    m("tracks_refused_dof0_total", "counter", l(&s.tracks_refused_dof0));
+    m("outputs_held_no_fix_total", "counter", l(&s.outputs_held_no_fix));
     m("pair_budget_refused_total", "counter", l(&s.pair_budget_refused));
     m("mlat_events_total", "counter", l(&s.mlat_msgs));
     m("groups_total", "counter", l(&s.groups));
@@ -209,8 +217,17 @@ fn render_metrics(s: &engine::Stats, c: &proto::Counters) -> String {
     m("holdout_error_p50_m", "gauge", snap.holdout_p50);
     m("holdout_error_p90_m", "gauge", snap.holdout_p90);
     m("holdout_error_p99_m", "gauge", snap.holdout_p99);
+    let mut extra = String::new();
+    for (b, n, f50, f90, o50, o90) in &snap.adsb_check {
+        let _ = writeln!(extra, "mlat_ng_adsb_check_count{{receivers=\"{b}\"}} {n}");
+        let _ = writeln!(extra, "mlat_ng_adsb_check_fix_error_m{{receivers=\"{b}\",q=\"0.5\"}} {f50}");
+        let _ = writeln!(extra, "mlat_ng_adsb_check_fix_error_m{{receivers=\"{b}\",q=\"0.9\"}} {f90}");
+        let _ = writeln!(extra, "mlat_ng_adsb_check_out_error_m{{receivers=\"{b}\",q=\"0.5\"}} {o50}");
+        let _ = writeln!(extra, "mlat_ng_adsb_check_out_error_m{{receivers=\"{b}\",q=\"0.9\"}} {o90}");
+    }
     let (cpu, rss) = proc_self();
     m("process_cpu_seconds_total", "counter", cpu);
     m("process_resident_memory_bytes", "gauge", rss);
+    o.push_str(&extra);
     o
 }

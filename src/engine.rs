@@ -147,6 +147,14 @@ struct Aircraft {
     track_rejects: u32,
     last_fix: Option<(Ecef, f64)>,
     last_out: f64,
+    /// Time of the last full fix accepted into the track (TDOA updates don't
+    /// count): a track is only published while a real fix anchors it.
+    last_fix_update: f64,
+    /// Last ADS-B position from a validated sync point, and its arrival time,
+    /// plus a velocity from the previous one: the in-engine truth used to
+    /// diagnose multilateration of aircraft that also broadcast ADS-B.
+    adsb: Option<(Ecef, f64)>,
+    adsb_vel: Option<[f64; 3]>,
 }
 
 struct AcTrack {
@@ -154,6 +162,35 @@ struct AcTrack {
     mode_c: bool,
     track: Track,
     last_out: f64,
+}
+
+/// One multilaterated update of an aircraft that also broadcasts ADS-B,
+/// compared with its ADS-B position at the same time.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Diag {
+    pub t: f64,
+    pub icao: String,
+    pub df: u8,
+    /// receivers in this update
+    pub n: usize,
+    /// transmissions (clusters) found in the message group, and its copies
+    pub clusters: usize,
+    pub copies: usize,
+    /// clock-pair edges used / dropped by the normalisation
+    pub edges: usize,
+    pub dropped: usize,
+    /// stand-alone fix (None for a TDOA update)
+    pub chi2: Option<f64>,
+    pub dof: Option<i32>,
+    pub err_h: Option<f64>,
+    pub gdop: Option<f64>,
+    /// horizontal error of the stand-alone fix vs ADS-B (m)
+    pub fix_err_m: Option<f64>,
+    /// horizontal error of what was published (track position) vs ADS-B (m)
+    pub out_err_m: Option<f64>,
+    pub accepted: bool,
+    pub confirmed: bool,
+    pub users: Vec<String>,
 }
 
 /// Counters published for /metrics. Monotonic unless named *_now.
@@ -165,6 +202,10 @@ pub struct Stats {
     pub pair_updates: AtomicU64,
     pub pair_rejects: AtomicU64,
     pub pair_resets: AtomicU64,
+    pub pair_resets_drift: AtomicU64,
+    pub tracks_born: AtomicU64,
+    pub tracks_refused_dof0: AtomicU64,
+    pub outputs_held_no_fix: AtomicU64,
     pub pair_budget_refused: AtomicU64,
     pub mlat_msgs: AtomicU64,
     pub groups: AtomicU64,
@@ -187,6 +228,8 @@ pub struct Stats {
     pub loop_late_ms_max: AtomicU64,
     /// Snapshot for /state.json and the gauges, rewritten every second.
     pub snapshot: Mutex<Snapshot>,
+    /// Worst recent ADS-B-checked updates, for /debug.json.
+    pub debug: Mutex<Vec<Diag>>,
 }
 
 #[derive(Default, Clone, serde::Serialize)]
@@ -207,6 +250,9 @@ pub struct Snapshot {
     pub holdout_p50: f64,
     pub holdout_p90: f64,
     pub holdout_p99: f64,
+    /// MLAT vs ADS-B for aircraft that broadcast both, last 10 minutes, by
+    /// receivers per update: (bucket, count, fix p50, fix p90, out p50, out p90).
+    pub adsb_check: Vec<(String, usize, f64, f64, f64, f64)>,
     pub started: f64,
 }
 
@@ -228,6 +274,9 @@ pub struct Engine {
     actracks: HashMap<u32, AcTrack>,
     next_ac_id: u32,
     holdout_err: VecDeque<(f64, f64)>,
+    /// (time, receivers, fix error, published error) of ADS-B-checked updates
+    adsb_err: VecDeque<(f64, usize, Option<f64>, Option<f64>)>,
+    diag_bad: VecDeque<Diag>,
 }
 
 fn pair_key(a: RxKey, b: RxKey) -> (RxKey, RxKey) {
@@ -259,6 +308,8 @@ impl Engine {
             actracks: HashMap::new(),
             next_ac_id: 0,
             holdout_err: VecDeque::new(),
+            adsb_err: VecDeque::new(),
+            diag_bad: VecDeque::new(),
         }
     }
 
@@ -511,6 +562,15 @@ impl Engine {
             ac.last_adsb = now;
             ac.alt_ft = Some(alt_b);
             ac.alt_t = now;
+            if let Some((p0, t0)) = ac.adsb {
+                let dt = now - t0;
+                if dt > 0.5 && dt < 15.0 {
+                    ac.adsb_vel = Some([(pb[0] - p0[0]) / dt, (pb[1] - p0[1]) / dt, (pb[2] - p0[2]) / dt]);
+                }
+            }
+            if ac.adsb.map(|(_, t0)| now - t0 > 0.5).unwrap_or(true) {
+                ac.adsb = Some((pb, now));
+            }
         }
         let variant = &mut entry.variants[vi];
         if variant.obs.iter().any(|o| o.rx == k) {
@@ -571,6 +631,7 @@ impl Engine {
                 Outcome::Accepted => self.stats.pair_updates.fetch_add(1, Ordering::Relaxed),
                 Outcome::Rejected => self.stats.pair_rejects.fetch_add(1, Ordering::Relaxed),
                 Outcome::Reset => self.stats.pair_resets.fetch_add(1, Ordering::Relaxed),
+                Outcome::ResetDrift => self.stats.pair_resets_drift.fetch_add(1, Ordering::Relaxed),
             };
         }
     }
@@ -735,6 +796,7 @@ impl Engine {
         let mut cls = norm::clusters(&normd, &copies, &nodes, 2);
         cls.sort_by(|a, b| normd.t[a[0]].partial_cmp(&normd.t[b[0]]).unwrap_or(std::cmp::Ordering::Equal));
         let t_first = cls.first().map(|c| normd.t[c[0]]).unwrap_or(0.0);
+        let n_clusters = cls.len();
         for cl in cls {
             self.stats.clusters.fetch_add(1, Ordering::Relaxed);
             let t_wall = g.first_wall + (normd.t[cl[0]] - t_first);
@@ -742,7 +804,8 @@ impl Engine {
             let ac = self.aircraft.get(&d.address).unwrap();
             let alt = self.altitude_for(ac, d.altitude_ft, now);
             let used_keys: Vec<RxKey> = cl.iter().map(|&i| keys[copies[normd.copies[i]].node]).collect();
-            self.update_aircraft(d.address, &meas, &cov, alt, t_wall, now, &used_keys);
+            let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped };
+            self.update_aircraft(d.address, &meas, &cov, alt, t_wall, now, &used_keys, &ctx);
         }
     }
 
@@ -778,6 +841,7 @@ impl Engine {
         t: f64,
         now: f64,
         used: &[RxKey],
+        ctx: &GroupCtx,
     ) {
         let n = meas.len();
         let can_fix = n >= 4 || (n >= 3 && alt.is_some());
@@ -796,24 +860,38 @@ impl Engine {
                             Gate::Accepted => {
                                 accepted = true;
                                 ac.track_rejects = 0;
+                                ac.last_fix_update = t;
                                 self.stats.track_fix_updates.fetch_add(1, Ordering::Relaxed);
                             }
                             Gate::Rejected(_) => {
                                 ac.track_rejects += 1;
                                 self.stats.track_rejects.fetch_add(1, Ordering::Relaxed);
-                                if ac.track_rejects >= 4 {
+                                if ac.track_rejects >= 4 && fix.dof >= 1 {
                                     // The track lost the aircraft (or was a
-                                    // ghost): restart from the fix.
+                                    // ghost): restart from an over-determined fix.
                                     ac.track = Some(Track::new(&fix, t));
                                     ac.track_rejects = 0;
+                                    ac.last_fix_update = t;
+                                    self.stats.tracks_born.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                             Gate::Skipped => {}
                         },
-                        _ => {
+                        // A track is born only from an over-determined fix:
+                        // with dof 0 (3 receivers + altitude, or 4 without)
+                        // both mirror solutions fit exactly, and a track born
+                        // on the wrong one was then kept alive for minutes by
+                        // 2-receiver TDOA updates (production, 2026-10-24:
+                        // 612 of the 713 errors over 5 km).
+                        _ if fix.dof >= 1 => {
                             ac.track = Some(Track::new(&fix, t));
                             ac.track_rejects = 0;
+                            ac.last_fix_update = t;
                             accepted = true;
+                            self.stats.tracks_born.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            self.stats.tracks_refused_dof0.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     fix_used = Some(fix);
@@ -836,32 +914,105 @@ impl Engine {
                 }
             }
         }
-        if !accepted {
-            return;
-        }
-        for k in used {
-            if let Some(r) = self.rxs.get_mut(k) {
-                r.used += 1;
+        let published = if accepted {
+            for k in used {
+                if let Some(r) = self.rxs.get_mut(k) {
+                    r.used += 1;
+                }
             }
-        }
-        self.emit(icao, fix_used.as_ref(), n, t, now);
+            self.emit(icao, fix_used.as_ref(), n, t, now)
+        } else {
+            None
+        };
+        self.check_adsb(icao, n, t, now, fix_used.as_ref(), published, accepted, used, ctx);
     }
 
-    fn emit(&mut self, icao: u32, fix: Option<&Fix>, n: usize, t: f64, now: f64) {
-        let ac = self.aircraft.get_mut(&icao).unwrap();
-        if t - ac.last_out < 0.5 {
+    /// Compare this update with the aircraft's own ADS-B position, when it has
+    /// one: the live equivalent of the holdout, but for the real MLAT path
+    /// (grouping, clustering, tracks, publication), not just the solver.
+    #[allow(clippy::too_many_arguments)]
+    fn check_adsb(
+        &mut self,
+        icao: u32,
+        n: usize,
+        t: f64,
+        now: f64,
+        fix: Option<&Fix>,
+        published: Option<Ecef>,
+        accepted: bool,
+        used: &[RxKey],
+        ctx: &GroupCtx,
+    ) {
+        let Some(ac) = self.aircraft.get(&icao) else { return };
+        let Some((p0, t0)) = ac.adsb else { return };
+        let dt = t - t0;
+        let truth = match ac.adsb_vel {
+            Some(v) if dt.abs() <= 5.0 => [p0[0] + v[0] * dt, p0[1] + v[1] * dt, p0[2] + v[2] * dt],
+            _ if dt.abs() <= 1.0 => p0,
+            _ => return,
+        };
+        let tl = ecef_to_llh(truth);
+        let herr = |p: &Ecef| {
+            let l = ecef_to_llh(*p);
+            crate::geo::haversine_m(l.lat, l.lon, tl.lat, tl.lon)
+        };
+        let fix_err = fix.map(|f| herr(&f.pos));
+        let out_err = published.as_ref().map(herr);
+        if fix_err.is_none() && out_err.is_none() {
             return;
         }
-        let Some(tr) = ac.track.as_ref() else { return };
+        self.adsb_err.push_back((now, n, fix_err, out_err));
+        let bad = fix_err.unwrap_or(0.0) > 1000.0 || out_err.unwrap_or(0.0) > 1000.0;
+        if bad {
+            let users = used.iter().filter_map(|k| self.rxs.get(k).map(|r| r.info.user.clone())).collect();
+            self.diag_bad.push_back(Diag {
+                t,
+                icao: format!("{icao:06X}"),
+                df: ctx.df,
+                n,
+                clusters: ctx.clusters,
+                copies: ctx.copies,
+                edges: ctx.edges,
+                dropped: ctx.dropped,
+                chi2: fix.map(|f| f.chi2),
+                dof: fix.map(|f| f.dof),
+                err_h: fix.map(|f| f.err_h),
+                gdop: fix.map(|f| f.gdop),
+                fix_err_m: fix_err,
+                out_err_m: out_err,
+                accepted,
+                confirmed: ac.track.as_ref().map(|tr| tr.confirmed()).unwrap_or(false),
+                users,
+            });
+            while self.diag_bad.len() > 400 {
+                self.diag_bad.pop_front();
+            }
+        }
+    }
+
+    /// Publish the aircraft's position; returns what was published.
+    fn emit(&mut self, icao: u32, fix: Option<&Fix>, n: usize, t: f64, now: f64) -> Option<Ecef> {
+        let ac = self.aircraft.get_mut(&icao).unwrap();
+        if t - ac.last_out < 0.5 {
+            return None;
+        }
+        let tr = ac.track.as_ref()?;
         // Publish from a confirmed track, or a stand-alone fix good enough on
         // its own (over-determined and tight). Everything else waits: one
         // wrong fix on the public map costs more than a second of latency.
-        let (pos, err, vel) = if tr.confirmed() {
+        // A confirmed track is published only while a full fix anchors it
+        // (one in the last 10 s): TDOA updates from 2-3 receivers constrain a
+        // hyperbola, not a point, and alone they let a track slide.
+        let anchored = t - ac.last_fix_update <= 10.0;
+        let (pos, err, vel) = if tr.confirmed() && anchored {
             (tr.predict(t).0, tr.err_h(), true)
         } else if let Some(f) = fix.filter(|f| f.dof >= 1 && f.err_h < 1000.0) {
             (f.pos, f.err_h, false)
         } else {
-            return;
+            if tr.confirmed() {
+                self.stats.outputs_held_no_fix.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
         };
         let l = ecef_to_llh(pos);
         let alt_ft = ac.alt_ft.filter(|_| now - ac.alt_t < 10.0);
@@ -884,6 +1035,7 @@ impl Engine {
         ac.last_out = t;
         self.stats.outputs.fetch_add(1, Ordering::Relaxed);
         let _ = self.out.send(Arc::from(line));
+        Some(pos)
     }
 
     // ------------------------------------------------------------ mode a/c --
@@ -1060,6 +1212,12 @@ impl Engine {
             }
             self.holdout_err.pop_front();
         }
+        while let Some(&(t, ..)) = self.adsb_err.front() {
+            if now - t < 600.0 {
+                break;
+            }
+            self.adsb_err.pop_front();
+        }
     }
 
     fn housekeeping(&mut self, now: f64) {
@@ -1136,7 +1294,34 @@ impl Engine {
         s.holdout_p50 = q(0.5);
         s.holdout_p90 = q(0.9);
         s.holdout_p99 = q(0.99);
+        let qv = |v: &mut Vec<f64>, p: f64| {
+            if v.is_empty() {
+                return 0.0;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[((v.len() - 1) as f64 * p) as usize]
+        };
+        let mut buckets = Vec::new();
+        for (name, lo, hi) in [("2", 2, 2), ("3", 3, 3), ("4-5", 4, 5), ("6-9", 6, 9), ("10+", 10, usize::MAX)] {
+            let sel: Vec<&(f64, usize, Option<f64>, Option<f64>)> =
+                self.adsb_err.iter().filter(|x| x.1 >= lo && x.1 <= hi).collect();
+            let mut f: Vec<f64> = sel.iter().filter_map(|x| x.2).collect();
+            let mut o: Vec<f64> = sel.iter().filter_map(|x| x.3).collect();
+            buckets.push((name.to_string(), sel.len(), qv(&mut f, 0.5), qv(&mut f, 0.9), qv(&mut o, 0.5), qv(&mut o, 0.9)));
+        }
+        s.adsb_check = buckets;
+        drop(s);
+        *self.stats.debug.lock().unwrap() = self.diag_bad.iter().cloned().collect();
     }
+}
+
+/// Per-group facts carried into the per-cluster update, for diagnostics.
+struct GroupCtx {
+    df: u8,
+    clusters: usize,
+    copies: usize,
+    edges: usize,
+    dropped: usize,
 }
 
 /// Measurements and covariance for one cluster of a normalised group.

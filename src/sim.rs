@@ -427,3 +427,197 @@ fn sparse_noisy_network_still_tracks() {
     eprintln!("sparse Mode-S-only error p50 {p50:.0} m p90 {p90:.0} m");
     assert!(p50 < 400.0 && p90 < 1500.0, "p50 {p50} p90 {p90}");
 }
+
+/// DF17 airborne position frame, for other modules' tests.
+pub(crate) fn test_df17_position(icao: u32, lat: f64, lon: f64, alt_ft: i32, odd: bool) -> Vec<u8> {
+    df17_position(icao, lat, lon, alt_ft, odd)
+}
+
+/// A clean DF11 acquisition squitter.
+fn df11_squitter(icao: u32) -> Vec<u8> {
+    let mut f = vec![0x5D, (icao >> 16) as u8, (icao >> 8) as u8, icao as u8, 0, 0, 0];
+    set_parity(&mut f, 0);
+    f
+}
+
+/// The feed path end to end: receivers whose readsb forwards only part of
+/// what it hears (as `beast_reduce` does) send receiver-tagged frames; the
+/// adapter turns them into engine events with no mlat-client involved.
+/// Returns (Mode-S-only errors, bench errors, stats).
+fn run_feed_sim(seed: u64, n_rx: usize, forward_p: f64, duration: f64) -> (Scored, Scored, Arc<Stats>) {
+    use crate::relay::adapter::{Adapter, AdapterConfig, AdapterStats};
+    use crate::relay::beast::Frame;
+    use crate::relay::registry::Receiver;
+    use std::collections::HashMap;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let epoch = 1_800_000_000.0;
+    let rxs: Vec<SimRx> = (0..n_rx)
+        .map(|i| {
+            let a = 2.0 * PI * i as f64 / n_rx as f64 + rng.gen::<f64>() * 0.3;
+            let r = 40e3 + rng.gen::<f64>() * 110e3;
+            let lat = 45.46 + r * a.sin() / 111_320.0;
+            let lon = 9.19 + r * a.cos() / (111_320.0 * 45.46f64.to_radians().cos());
+            SimRx {
+                pos: llh_to_ecef(Llh { lat, lon, alt: 100.0 + rng.gen::<f64>() * 300.0 }),
+                offset: rng.gen::<f64>() * 5000.0,
+                drift: (rng.gen::<f64>() - 0.5) * 80e-6,
+            }
+        })
+        .collect();
+    let mut acs: Vec<SimAc> = Vec::new();
+    for i in 0..8 {
+        let a = rng.gen::<f64>() * 2.0 * PI;
+        acs.push(SimAc {
+            icao: 0x4C0000 + i,
+            start: Llh { lat: 45.2 + rng.gen::<f64>() * 0.6, lon: 8.8 + rng.gen::<f64>() * 0.8, alt: 0.0 },
+            vel: (230.0 * a.cos(), 230.0 * a.sin()),
+            alt_ft: 30_000 + 1000 * i as i32,
+            adsb: true,
+            squawk: None,
+            modeac_only: false,
+        });
+    }
+    for i in 0..3 {
+        let a = rng.gen::<f64>() * 2.0 * PI;
+        acs.push(SimAc {
+            icao: 0x3C1000 + i,
+            start: Llh { lat: 45.3 + rng.gen::<f64>() * 0.4, lon: 8.9 + rng.gen::<f64>() * 0.6, alt: 0.0 },
+            vel: (200.0 * a.cos(), 200.0 * a.sin()),
+            alt_ft: 24_000 + 2000 * i as i32,
+            adsb: false,
+            squawk: None,
+            modeac_only: false,
+        });
+    }
+    let registry: HashMap<u64, Receiver> = rxs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let l = ecef_to_llh(r.pos);
+            (0x1000 + i as u64, Receiver { user: format!("rx{i}"), lat: l.lat, lon: l.lon, alt: l.alt, clock: ClockType::Dump1090, privacy: false })
+        })
+        .collect();
+
+    // (arrival wall, frame)
+    let mut frames: Vec<(f64, Frame)> = Vec::new();
+    let mut push = |rng: &mut StdRng, frames: &mut Vec<(f64, Frame)>, msg: &[u8], t: f64, pe: &Ecef, p: f64| {
+        for (ri, r) in rxs.iter().enumerate() {
+            if rng.gen::<f64>() >= p {
+                continue;
+            }
+            let a = t + dist(pe, &r.pos) / C_AIR;
+            let mut m = [0u8; 14];
+            m[..msg.len()].copy_from_slice(msg);
+            let f = Frame {
+                rid: 0x1000 + ri as u64,
+                ts: r.ticks(a, rng, 0.15e-6).round() as u64,
+                sig: 0x40,
+                kind: if msg.len() == 7 { b'2' } else { b'3' },
+                len: msg.len() as u8,
+                msg: m,
+            };
+            // readsb flush + WAN
+            frames.push((a + 0.05 + rng.gen::<f64>() * 0.25, f));
+        }
+    };
+    let mut t = 0.5;
+    let mut odd = false;
+    while t < duration {
+        for ac in &acs {
+            let p = ac.llh(t);
+            let pe = llh_to_ecef(p);
+            if ac.adsb {
+                push(&mut rng, &mut frames, &df17_position(ac.icao, p.lat, p.lon, ac.alt_ft, odd), t, &pe, 0.9);
+                if odd {
+                    // a roll-call reply once a second: what the bench multilaterates
+                    push(&mut rng, &mut frames, &df4_altitude(ac.icao, ac.alt_ft), t + 0.01, &pe, forward_p);
+                }
+            } else {
+                push(&mut rng, &mut frames, &df4_altitude(ac.icao, ac.alt_ft), t, &pe, forward_p);
+                if odd {
+                    push(&mut rng, &mut frames, &df11_squitter(ac.icao), t + 0.02, &pe, forward_p);
+                }
+            }
+        }
+        odd = !odd;
+        t += 0.25;
+    }
+    frames.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    let stats = Arc::new(Stats::default());
+    let (out, mut sbs) = broadcast::channel(1 << 16);
+    let (bench, mut bench_rx) = broadcast::channel(1 << 16);
+    let mut eng = Engine::new(EngineConfig { shadow: true, mlat_delay: 1.5, holdout_every: 20 }, stats.clone(), out).with_bench_output(bench);
+    let cfg = AdapterConfig { sync_every: 2, bench_every: 1, probation: 10.0, ..Default::default() };
+    let mut ad = Adapter::new(cfg, Arc::new(AdapterStats::default()));
+    let mut evs = Vec::new();
+    ad.set_registry(registry, &mut evs);
+    let (mut next_tick, mut next_second, mut next_house) = (0.0, 0.0, 10.0);
+    for (at, f) in frames {
+        while next_tick <= at {
+            eng.tick_at(epoch + next_tick, next_tick >= next_house);
+            if next_tick >= next_house {
+                next_house += 10.0;
+            }
+            if next_tick >= next_second {
+                ad.tick(epoch + next_tick, &mut evs);
+                next_second += 1.0;
+            }
+            for ev in evs.drain(..) {
+                eng.handle_at(ev, epoch + next_tick);
+            }
+            next_tick += 0.05;
+        }
+        ad.on_frame(&f, epoch + at, &mut evs);
+        for ev in evs.drain(..) {
+            eng.handle_at(ev, epoch + at);
+        }
+    }
+    eng.tick_at(epoch + duration + 5.0, true);
+
+    let score = |rx: &mut broadcast::Receiver<Arc<str>>, want_adsb: bool| {
+        let mut errs = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            let f: Vec<&str> = line.trim_end().split(',').collect();
+            let icao = u32::from_str_radix(f[4], 16).unwrap_or(0);
+            let Some(ac) = acs.iter().find(|a| a.icao == icao) else { continue };
+            assert_eq!(ac.adsb, want_adsb, "{icao:06X} in the wrong output");
+            let (lat, lon): (f64, f64) = (f[14].parse().unwrap(), f[15].parse().unwrap());
+            let hms: Vec<f64> = f[7].split(':').map(|x| x.parse().unwrap()).collect();
+            let t_fix = hms[0] * 3600.0 + hms[1] * 60.0 + hms[2] - (epoch % 86_400.0);
+            if t_fix < 60.0 {
+                continue;
+            }
+            let truth = ac.llh(t_fix);
+            errs.push(haversine_m(lat, lon, truth.lat, truth.lon));
+        }
+        Scored { errs }
+    };
+    let modes_only = score(&mut sbs, false);
+    let bench_s = score(&mut bench_rx, true);
+    (modes_only, bench_s, stats)
+}
+
+#[test]
+fn feed_path_multilaterates_without_mlat_client() {
+    let (m, b, stats) = run_feed_sim(11, 8, 0.7, 180.0);
+    let snap = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "feed sim: sync_points={} pair_updates={} groups={} fixes={} outputs={} bench_outputs={} modes-only n={} bench n={}",
+        snap(&stats.sync_points),
+        snap(&stats.pair_updates),
+        snap(&stats.groups),
+        snap(&stats.fixes),
+        snap(&stats.outputs),
+        snap(&stats.bench_outputs),
+        m.errs.len(),
+        b.errs.len()
+    );
+    assert!(m.errs.len() > 100, "too few Mode-S-only positions: {}", m.errs.len());
+    assert!(b.errs.len() > 100, "too few bench positions: {}", b.errs.len());
+    let (m50, m90, b50) = (m.quantile(0.5), m.quantile(0.9), b.quantile(0.5));
+    eprintln!("feed sim: Mode-S-only p50 {m50:.0} m p90 {m90:.0} m; bench p50 {b50:.0} m");
+    assert!(m50 < 150.0 && m90 < 600.0, "Mode-S-only p50 {m50:.0} p90 {m90:.0}");
+    assert!(b50 < 150.0, "bench p50 {b50:.0}");
+}

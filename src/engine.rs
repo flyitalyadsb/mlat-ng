@@ -221,6 +221,11 @@ pub struct Stats {
     pub track_tdoa_updates: AtomicU64,
     pub track_rejects: AtomicU64,
     pub outputs: AtomicU64,
+    /// Positions of aircraft that also broadcast ADS-B, sent to the bench
+    /// output instead (feed mode only).
+    pub bench_outputs: AtomicU64,
+    /// unix ms of the last published position (liveness).
+    pub last_output_ms: AtomicU64,
     pub modeac_groups: AtomicU64,
     pub modeac_blacklisted: AtomicU64,
     pub modeac_fixes: AtomicU64,
@@ -233,6 +238,9 @@ pub struct Stats {
     pub snapshot: Mutex<Snapshot>,
     /// Worst recent ADS-B-checked updates, for /debug.json.
     pub debug: Mutex<Vec<Diag>>,
+    /// `/receivers.json`: mlat-client receivers with a UUID and their
+    /// positions, for the feed instance (cluster-internal only).
+    pub registry_json: Mutex<String>,
 }
 
 #[derive(Default, Clone, serde::Serialize)]
@@ -263,6 +271,9 @@ pub struct Engine {
     cfg: EngineConfig,
     stats: Arc<Stats>,
     out: broadcast::Sender<Arc<str>>,
+    /// Feed mode: where positions of aircraft that broadcast ADS-B go (the
+    /// bench), so the main output carries only aircraft without ADS-B.
+    bench_out: Option<broadcast::Sender<Arc<str>>>,
     rx_by_conn: HashMap<ConnId, RxKey>,
     rxs: HashMap<RxKey, Rx>,
     next_key: RxKey,
@@ -297,6 +308,7 @@ impl Engine {
             cfg,
             stats,
             out,
+            bench_out: None,
             rx_by_conn: HashMap::new(),
             rxs: HashMap::new(),
             next_key: 1,
@@ -314,6 +326,12 @@ impl Engine {
             adsb_err: VecDeque::new(),
             diag_bad: VecDeque::new(),
         }
+    }
+
+    /// Send positions of aircraft that also broadcast ADS-B to `bench`.
+    pub fn with_bench_output(mut self, bench: broadcast::Sender<Arc<str>>) -> Engine {
+        self.bench_out = Some(bench);
+        self
     }
 
     /// Run until the event channel closes. Meant for a dedicated thread with
@@ -1049,8 +1067,17 @@ impl Engine {
             err_m: Some(err),
         });
         ac.last_out = t;
-        self.stats.outputs.fetch_add(1, Ordering::Relaxed);
-        let _ = self.out.send(Arc::from(line));
+        self.stats.last_output_ms.store((now * 1000.0) as u64, Ordering::Relaxed);
+        match &self.bench_out {
+            Some(bench) if now - ac.last_adsb < 30.0 => {
+                self.stats.bench_outputs.fetch_add(1, Ordering::Relaxed);
+                let _ = bench.send(Arc::from(line));
+            }
+            _ => {
+                self.stats.outputs.fetch_add(1, Ordering::Relaxed);
+                let _ = self.out.send(Arc::from(line));
+            }
+        }
         Some(pos)
     }
 
@@ -1291,10 +1318,42 @@ impl Engine {
             self.groups.clear();
             self.group_due.clear();
         }
+        self.render_registry(now);
+    }
+
+    /// Receivers with a UUID, keyed as readsb keys the feed (first 64 bits).
+    fn render_registry(&self, now: f64) {
+        let receivers: Vec<crate::relay::registry::Entry> = self
+            .rxs
+            .values()
+            .filter_map(|r| {
+                let k = crate::relay::registry::key_of_uuid(r.info.uuid.as_deref()?)?;
+                Some(crate::relay::registry::Entry {
+                    key: format!("{k:016x}"),
+                    user: r.info.user.clone(),
+                    lat: r.info.lat,
+                    lon: r.info.lon,
+                    alt: r.info.alt,
+                    clock: r.info.clock.as_str().to_string(),
+                    privacy: r.info.privacy,
+                })
+            })
+            .collect();
+        let doc = crate::relay::registry::Doc { generated: now, receivers };
+        *self.stats.registry_json.lock().unwrap() = serde_json::to_string(&doc).unwrap_or_default();
     }
 
     fn publish(&self, queue_depth: usize) {
-        let now = unix_now();
+        self.publish_at(queue_depth, unix_now());
+    }
+
+    /// ADS-B-checked updates of the last 10 minutes: (receivers, stand-alone
+    /// fix error, published error), metres.
+    pub(crate) fn adsb_errors(&self) -> Vec<(usize, Option<f64>, Option<f64>)> {
+        self.adsb_err.iter().map(|x| (x.1, x.2, x.3)).collect()
+    }
+
+    pub(crate) fn publish_at(&self, queue_depth: usize, now: f64) {
         let mut errs: Vec<f64> = self.holdout_err.iter().map(|x| x.1).collect();
         errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let q = |p: f64| if errs.is_empty() { 0.0 } else { errs[((errs.len() - 1) as f64 * p) as usize] };
@@ -1372,7 +1431,7 @@ fn sub_problem(normd: &norm::Normalized, cl: &[usize], copies: &[Copy], nodes: &
 }
 
 /// FNV-1a: a stable hash for the holdout selection (same choice on restart).
-fn fxhash(b: &[u8]) -> u64 {
+pub(crate) fn fxhash(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &x in b {
         h ^= x as u64;

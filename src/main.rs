@@ -15,6 +15,8 @@ mod modes;
 mod norm;
 mod output;
 mod proto;
+#[cfg(test)]
+mod sim;
 mod solver;
 mod track;
 mod types;

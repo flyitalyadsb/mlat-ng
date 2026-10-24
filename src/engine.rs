@@ -298,7 +298,12 @@ impl Engine {
     }
 
     fn handle(&mut self, ev: Event) {
-        let now = unix_now();
+        self.handle_at(ev, unix_now());
+    }
+
+    /// Process one event at wall time `now` (separate so tests can drive a
+    /// simulated clock).
+    pub(crate) fn handle_at(&mut self, ev: Event, now: f64) {
         match ev {
             Event::Connect { conn, info, tx } => self.connect(conn, info, tx, now),
             Event::Disconnect { conn } => self.disconnect(conn),
@@ -592,6 +597,15 @@ impl Engine {
         });
         if g.copies.len() < MAX_COPIES {
             g.copies.push((k, t / freq));
+        }
+    }
+
+    /// Everything the periodic tick does, at wall time `now` (for tests).
+    pub(crate) fn tick_at(&mut self, now: f64, housekeeping: bool) {
+        self.process_due(now);
+        self.expire(now);
+        if housekeeping {
+            self.housekeeping(now);
         }
     }
 

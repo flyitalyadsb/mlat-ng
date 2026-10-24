@@ -85,6 +85,29 @@ fn df4_altitude(icao: u32, alt_ft: i32) -> Vec<u8> {
     f
 }
 
+/// DF5 identity reply with the squawk's ID13 bits (C1 A1 C2 A2 C4 A4 X B1 D1 B2 D2 B4 D4).
+fn df5_identity(icao: u32, squawk: u16) -> Vec<u8> {
+    let d = |i: u32| ((squawk as u32) >> (12 - 4 * i)) & 0xf; // decimal-looking octal digits A,B,C,D
+    let (a, b, c, dd) = (d(0), d(1), d(2), d(3));
+    let bit = |v: u32, k: u32| (v >> k) & 1;
+    let id13 = (bit(c, 0) << 12) | (bit(a, 0) << 11) | (bit(c, 1) << 10) | (bit(a, 1) << 9) | (bit(c, 2) << 8)
+        | (bit(a, 2) << 7) | (bit(b, 0) << 5) | (bit(dd, 0) << 4) | (bit(b, 1) << 3) | (bit(dd, 1) << 2)
+        | (bit(b, 2) << 1) | bit(dd, 2);
+    let mut f = vec![0u8; 7];
+    f[0] = 5 << 3;
+    f[2] = (id13 >> 8) as u8 & 0x1f;
+    f[3] = id13 as u8;
+    set_parity(&mut f, icao);
+    f
+}
+
+/// mlat-client's false_ac frame for a Mode A/C payload written as 0xABCD.
+fn false_ac_frame(code: u16) -> Vec<u8> {
+    let digits = format!("{code:04x}");
+    let v: u32 = format!("{digits}00").parse::<u32>().unwrap() % 1_000_000;
+    vec![0x5d, (v >> 16) as u8, (v >> 8) as u8, v as u8, 0xa4, 0x92, 0x4f]
+}
+
 struct SimRx {
     pos: Ecef,
     offset: f64,
@@ -106,6 +129,10 @@ struct SimAc {
     vel: (f64, f64),
     alt_ft: i32,
     adsb: bool,
+    /// Mode S identity (DF5) and Mode A replies with this code (0xABCD).
+    squawk: Option<u16>,
+    /// Mode A/C only: no Mode S frames at all.
+    modeac_only: bool,
 }
 
 impl SimAc {
@@ -129,7 +156,7 @@ impl Scored {
     }
 }
 
-fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<Stats>) {
+fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> (Scored, Arc<Stats>, Vec<String>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let epoch = 1_800_000_000.0;
     // Receivers in a ~150 km disc around Milan.
@@ -146,7 +173,7 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
             }
         })
         .collect();
-    let mut acs = Vec::new();
+    let mut acs: Vec<SimAc> = Vec::new();
     for i in 0..8 {
         let a = rng.gen::<f64>() * 2.0 * PI;
         acs.push(SimAc {
@@ -155,6 +182,8 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
             vel: (230.0 * a.cos(), 230.0 * a.sin()),
             alt_ft: 30_000 + 1000 * i as i32,
             adsb: true,
+            squawk: None,
+            modeac_only: false,
         });
     }
     for i in 0..3 {
@@ -165,6 +194,19 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
             vel: (200.0 * a.cos(), 200.0 * a.sin()),
             alt_ft: 24_000 + 2000 * i as i32,
             adsb: false,
+            squawk: if modeac && i == 0 { Some(0x4721) } else { None },
+            modeac_only: false,
+        });
+    }
+    if modeac {
+        acs.push(SimAc {
+            icao: 0,
+            start: Llh { lat: 45.5, lon: 9.3, alt: 0.0 },
+            vel: (-150.0, 60.0),
+            alt_ft: 18_000,
+            adsb: false,
+            squawk: Some(0x3456),
+            modeac_only: true,
         });
     }
 
@@ -224,7 +266,17 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
                     }
                 }
             } else {
-                let frame = df4_altitude(ac.icao, ac.alt_ft);
+                let mut frames = Vec::new();
+                if !ac.modeac_only {
+                    frames.push(df4_altitude(ac.icao, ac.alt_ft));
+                }
+                if let Some(sq) = ac.squawk {
+                    if !ac.modeac_only && odd {
+                        frames.push(df5_identity(ac.icao, sq));
+                    }
+                    frames.push(false_ac_frame(sq));
+                }
+                for frame in frames {
                 for (ri, r) in rxs.iter().enumerate() {
                     if rng.gen::<f64>() < 0.15 {
                         continue; // not every receiver hears every reply
@@ -234,6 +286,7 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
                         a + net(&mut rng),
                         Event::Mlat { conn: ri as u64, t: r.ticks(a, &mut rng, jitter), msg: frame.clone(), rx: epoch + a },
                     ));
+                }
                 }
             }
         }
@@ -266,7 +319,9 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
 
     // Score the Mode-S-only aircraft after warm-up.
     let mut errs = Vec::new();
+    let mut lines = Vec::new();
     while let Ok(line) = sbs.try_recv() {
+        lines.push(line.to_string());
         let f: Vec<&str> = line.trim_end().split(',').collect();
         let icao = u32::from_str_radix(f[4], 16).unwrap_or(0);
         let Some(ac) = acs.iter().find(|a| a.icao == icao && !a.adsb) else { continue };
@@ -281,12 +336,12 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64) -> (Scored, Arc<S
         let truth = ac.llh(t_fix);
         errs.push(haversine_m(lat, lon, truth.lat, truth.lon));
     }
-    (Scored { errs }, stats)
+    (Scored { errs }, stats, lines)
 }
 
 #[test]
 fn end_to_end_multilateration_is_accurate() {
-    let (s, stats) = run_sim(7, 8, 0.3e-6, 180.0);
+    let (s, stats, _) = run_sim(7, 8, 0.3e-6, 180.0, false);
     let snap = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
         "sync={} points={} pair_updates={} rejects={} resets={} groups={} clusters={} solves={} fixes={} tdoa={} outputs={} holdout={}/{} n_scored={}",
@@ -311,4 +366,64 @@ fn end_to_end_multilateration_is_accurate() {
     assert!(p50 < 250.0, "p50 {p50}");
     assert!(p90 < 800.0, "p90 {p90}");
     assert!(snap(&stats.holdout_solved) > 20);
+}
+
+#[test]
+fn mode_ac_is_associated_and_tracked() {
+    let (s, stats, lines) = run_sim(11, 10, 0.3e-6, 180.0, true);
+    let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "modeac groups={} blacklisted={} fixes={} assoc={} outputs={} mode-s scored={}",
+        get(&stats.modeac_groups),
+        get(&stats.modeac_blacklisted),
+        get(&stats.modeac_fixes),
+        get(&stats.modeac_assoc),
+        get(&stats.modeac_outputs),
+        s.errs.len()
+    );
+    // The Mode S aircraft answering Mode A with its own squawk is recognised
+    // as that aircraft, not turned into a second, fake target.
+    assert!(get(&stats.modeac_assoc) > 50, "assoc {}", get(&stats.modeac_assoc));
+    // The Mode A/C-only aircraft becomes a synthetic track near its truth.
+    let ac_lines: Vec<&String> = lines.iter().filter(|l| l.split(',').nth(4).map(|a| a.starts_with('~')).unwrap_or(false)).collect();
+    assert!(ac_lines.len() > 20, "Mode A/C outputs {}", ac_lines.len());
+    let start = Llh { lat: 45.5, lon: 9.3, alt: 0.0 };
+    let epoch = 1_800_000_000.0f64;
+    let mut errs: Vec<f64> = ac_lines
+        .iter()
+        .map(|l| {
+            let f: Vec<&str> = l.trim_end().split(',').collect();
+            let hms: Vec<f64> = f[7].split(':').map(|x| x.parse().unwrap()).collect();
+            let t = hms[0] * 3600.0 + hms[1] * 60.0 + hms[2] - (epoch % 86_400.0);
+            let lat = start.lat + 60.0 * t / 111_320.0;
+            let lon = start.lon - 150.0 * t / (111_320.0 * start.lat.to_radians().cos());
+            haversine_m(f[14].parse().unwrap(), f[15].parse().unwrap(), lat, lon)
+        })
+        .collect();
+    errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = errs[errs.len() / 2];
+    eprintln!("Mode A/C-only track error p50 {p50:.0} m over {} outputs", errs.len());
+    assert!(p50 < 1500.0, "p50 {p50}");
+    // Mode A/C must never leak into the Mode S stream as a fake ICAO.
+    assert!(!lines.iter().any(|l| l.split(',').nth(4).map(|a| a == "000000" || a.ends_with("00") && a.len() == 6 && modes::is_false_ac_address(u32::from_str_radix(a, 16).unwrap_or(1))).unwrap_or(false)));
+}
+
+#[test]
+fn sparse_noisy_network_still_tracks() {
+    // 5 receivers, RTL-SDR-class jitter: the case where TDOA updates and the
+    // joint normalisation have to carry the network.
+    let (s, stats, _) = run_sim(23, 5, 0.6e-6, 240.0, false);
+    let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "sparse: fixes={} tdoa={} rejects={} outputs={} scored={}",
+        get(&stats.fixes),
+        get(&stats.track_tdoa_updates),
+        get(&stats.track_rejects),
+        get(&stats.outputs),
+        s.errs.len()
+    );
+    assert!(s.errs.len() >= 100, "scored {}", s.errs.len());
+    let (p50, p90) = (s.quantile(0.5), s.quantile(0.9));
+    eprintln!("sparse Mode-S-only error p50 {p50:.0} m p90 {p90:.0} m");
+    assert!(p50 < 400.0 && p90 < 1500.0, "p50 {p50} p90 {p90}");
 }

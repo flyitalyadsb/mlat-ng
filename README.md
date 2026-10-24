@@ -24,7 +24,32 @@ Every flag also reads an environment variable (`MLAT_NG_*`, see `--help`).
 |---|---|
 | 30100 | mlat-client connections (PROXY v1 line accepted) |
 | 31003 | BaseStation (SBS) MSG,3 results, mlat-server's layout; Mode A/C tracks as `~F0xxxx` |
-| 9100 | `/metrics` (Prometheus), `/state.json`, `/healthz` |
+| 9100 | `/metrics` (Prometheus), `/state.json`, `/healthz`, `/receivers.json` (receiver positions by UUID; cluster-internal) |
+| 31004 | bench SBS output, feed mode only (`--bench-sbs-listen`) |
+
+### Feed mode
+
+`--feed a=readsb-ingest-a:4906,b=readsb-ingest-b:4906` adds a second input:
+readsb-ingest's receiver-tagged Beast output, multilaterated with no
+mlat-client involved (receiver positions from `--feed-receivers-url`, the
+primary instance's `/receivers.json`). With `--bench-sbs-listen`, positions of
+aircraft that also broadcast ADS-B go to a separate port, so they can be
+scored against their own ADS-B. See [docs/PLAN.md](docs/PLAN.md#feed-input).
+
+### Replay
+
+```sh
+mlat-ng replay \
+  --capture capA.bin.gz@<start unix>@60 --capture capB.bin.gz@<start unix>@60 \
+  --receivers registry.json --out summary.json --dump-sbs modes-only.sbs
+```
+
+Runs the real feed adapter and engine on captures of the 4906 stream
+(`exec 3<>/dev/tcp/127.0.0.1/4906; timeout 60 cat <&3 | gzip -1` on each
+ingest pod) on a simulated clock, and prints clock-sync figures, the bench
+(error of ADS-B aircraft multilaterated from their non-ADS-B replies) and the
+Mode-S-only output. Captures and registries hold feeder identities and
+positions: keep them out of the repository.
 
 ## Layout
 
@@ -38,6 +63,8 @@ Every flag also reads an environment variable (`MLAT_NG_*`, see `--help`).
 | `src/track.rs` | EKF tracks with fix and direct TDOA updates |
 | `src/engine.rs` | the single owner of all state: sync, holdout, groups, tracks, Mode A/C |
 | `src/output.rs` | SBS server, HTTP server |
+| `src/relay/` | feed input: Beast parser, receiver registry, frames-to-events adapter, cell readers |
+| `src/replay.rs` | offline replay of feed captures |
 | `src/sim.rs` | end-to-end simulation test |
 
 ## Deploy

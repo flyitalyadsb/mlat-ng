@@ -15,6 +15,8 @@ mod modes;
 mod norm;
 mod output;
 mod proto;
+mod relay;
+mod replay;
 #[cfg(test)]
 mod sim;
 mod solver;
@@ -58,6 +60,39 @@ struct Args {
     /// Engine event queue capacity.
     #[arg(long, default_value_t = 400_000, env = "MLAT_NG_QUEUE")]
     queue: usize,
+    /// Service name in the liveness metrics (nesso_last_useful_work_*).
+    #[arg(long, default_value = "mlat-ng", env = "MLAT_NG_SERVICE")]
+    service: String,
+    /// Feed input: NAME=HOST:PORT,... of readsb-ingest receiver-tagged Beast
+    /// outputs (port 4906), one per cell. Empty = no feed.
+    #[arg(long, default_value = "", env = "MLAT_NG_FEED")]
+    feed: String,
+    /// Where the feed gets receiver positions (the primary's /receivers.json).
+    #[arg(long, default_value = "http://mlat-ng:9100/receivers.json", env = "MLAT_NG_FEED_RECEIVERS_URL")]
+    feed_receivers_url: String,
+    /// Keep 1 in N DF17 sync pairs (the same pairs at every receiver).
+    #[arg(long, default_value_t = 2, env = "MLAT_NG_FEED_SYNC_EVERY")]
+    feed_sync_every: u64,
+    /// Bench: multilaterate 1 in N ADS-B aircraft from their non-ADS-B replies (0 = off).
+    #[arg(long, default_value_t = 10, env = "MLAT_NG_FEED_BENCH_EVERY")]
+    feed_bench_every: u64,
+    /// Seconds without an ADS-B position before an aircraft counts as Mode-S-only.
+    #[arg(long, default_value_t = 20.0, env = "MLAT_NG_FEED_MODES_ONLY_AFTER")]
+    feed_modes_only_after: f64,
+    /// SBS listen address for bench positions (aircraft that also broadcast
+    /// ADS-B); empty = they go to the main SBS output like any other.
+    #[arg(long, default_value = "", env = "MLAT_NG_BENCH_SBS_LISTEN")]
+    bench_sbs_listen: String,
+}
+
+fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
+    s.split(',')
+        .filter(|x| !x.trim().is_empty())
+        .map(|x| {
+            let (n, a) = x.trim().split_once('=').ok_or_else(|| anyhow::anyhow!("feed cell must be NAME=HOST:PORT: {x}"))?;
+            Ok((n.to_string(), a.to_string()))
+        })
+        .collect()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -67,7 +102,12 @@ fn main() -> anyhow::Result<()> {
         // No colour codes in `kubectl logs`: only when stdout is a terminal.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|a| a == "replay").unwrap_or(false) {
+        return replay::main(argv[1..].to_vec());
+    }
     let args = Args::parse();
+    let cells = parse_cells(&args.feed)?;
     tracing::info!(?args, "mlat-ng {} starting", env!("CARGO_PKG_VERSION"));
 
     let (ev_tx, ev_rx) = mpsc::channel(args.queue);
@@ -77,7 +117,22 @@ fn main() -> anyhow::Result<()> {
 
     // The engine: one OS thread, its own single-threaded runtime.
     let ecfg = engine::EngineConfig { shadow: args.shadow, mlat_delay: args.mlat_delay, holdout_every: args.holdout_every };
-    let eng = engine::Engine::new(ecfg, stats.clone(), sbs_tx.clone());
+    let (bench_tx, _) = broadcast::channel::<Arc<str>>(16_384);
+    let mut eng = engine::Engine::new(ecfg, stats.clone(), sbs_tx.clone());
+    if !args.bench_sbs_listen.is_empty() {
+        eng = eng.with_bench_output(bench_tx.clone());
+    }
+    let feed_cfg = (!cells.is_empty()).then(|| relay::FeedConfig {
+        cells: cells.clone(),
+        receivers_url: args.feed_receivers_url.clone(),
+        adapter: relay::adapter::AdapterConfig {
+            sync_every: args.feed_sync_every,
+            bench_every: args.feed_bench_every,
+            modes_only_after: args.feed_modes_only_after,
+            ..Default::default()
+        },
+    });
+    let feed_stats = feed_cfg.as_ref().map(|c| Arc::new(relay::FeedStats::new(c)));
     let engine_thread = std::thread::Builder::new().name("engine".into()).spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("engine runtime");
         rt.block_on(eng.run(ev_rx));
@@ -91,12 +146,27 @@ fn main() -> anyhow::Result<()> {
         tracing::info!(clients = %args.listen, sbs = %args.sbs_listen, http = %args.http_listen, shadow = args.shadow, "listening");
 
         tokio::spawn(output::sbs_server(sbs_l, sbs_tx));
+        if !args.bench_sbs_listen.is_empty() {
+            let bench_l = TcpListener::bind(&args.bench_sbs_listen).await?;
+            tracing::info!(bench_sbs = %args.bench_sbs_listen, "bench output listening");
+            tokio::spawn(output::sbs_server(bench_l, bench_tx));
+        }
+        if let (Some(fc), Some(fs)) = (feed_cfg.clone(), feed_stats.clone()) {
+            tracing::info!(cells = ?fc.cells, receivers = %fc.receivers_url, "feed input enabled");
+            tokio::spawn(relay::run(fc, fs, ev_tx.clone()));
+        }
         let render_stats = stats.clone();
         let render_counters = counters.clone();
+        let render_feed = feed_stats.clone();
+        let service = args.service.clone();
         let render: Arc<dyn Fn(&str) -> Option<(&'static str, String)> + Send + Sync> = Arc::new(move |path: &str| {
             match path {
                 "/healthz" => Some(("text/plain", "ok\n".into())),
-                "/metrics" => Some(("text/plain; version=0.0.4", render_metrics(&render_stats, &render_counters))),
+                "/metrics" => Some((
+                    "text/plain; version=0.0.4",
+                    render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref()),
+                )),
+                "/receivers.json" => Some(("application/json", render_stats.registry_json.lock().unwrap().clone())),
                 "/debug.json" => {
                     let d = render_stats.debug.lock().unwrap().clone();
                     Some(("application/json", serde_json::to_string_pretty(&d).unwrap_or_default()))
@@ -153,7 +223,7 @@ fn proc_self() -> (f64, f64) {
     (cpu, rss)
 }
 
-fn render_metrics(s: &engine::Stats, c: &proto::Counters) -> String {
+fn render_metrics(s: &engine::Stats, c: &proto::Counters, service: &str, feed: Option<&relay::FeedStats>) -> String {
     let mut o = String::with_capacity(4096);
     let mut m = |name: &str, kind: &str, v: f64| {
         let _ = writeln!(o, "# TYPE mlat_ng_{name} {kind}\nmlat_ng_{name} {v}");
@@ -193,6 +263,7 @@ fn render_metrics(s: &engine::Stats, c: &proto::Counters) -> String {
     m("track_tdoa_updates_total", "counter", l(&s.track_tdoa_updates));
     m("track_rejects_total", "counter", l(&s.track_rejects));
     m("outputs_total", "counter", l(&s.outputs));
+    m("bench_outputs_total", "counter", l(&s.bench_outputs));
     m("modeac_groups_total", "counter", l(&s.modeac_groups));
     m("modeac_blacklisted_total", "counter", l(&s.modeac_blacklisted));
     m("modeac_fixes_total", "counter", l(&s.modeac_fixes));
@@ -229,5 +300,21 @@ fn render_metrics(s: &engine::Stats, c: &proto::Counters) -> String {
     m("process_cpu_seconds_total", "counter", cpu);
     m("process_resident_memory_bytes", "gauge", rss);
     o.push_str(&extra);
+    // The estate's "useful work" liveness series (docs/APP-LIVENESS.md in
+    // nesso-infra): published positions; the feed adds its own below.
+    let _ = writeln!(
+        o,
+        "nesso_last_useful_work_timestamp_seconds{{service=\"{service}\",work=\"positions\"}} {}",
+        l(&s.last_output_ms) / 1000.0
+    );
+    let _ = writeln!(
+        o,
+        "nesso_useful_work_items_total{{service=\"{service}\",work=\"positions\"}} {}",
+        l(&s.outputs) + l(&s.bench_outputs)
+    );
+    let _ = writeln!(o, "nesso_useful_work_max_age_seconds{{service=\"{service}\",work=\"positions\"}} 300");
+    if let Some(f) = feed {
+        relay::render_metrics(&mut o, f, service);
+    }
     o
 }

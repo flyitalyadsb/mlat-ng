@@ -76,10 +76,48 @@ Otherwise: keep production, fix what the numbers show, and run again.
 Serve mode (selective traffic + results to clients) per region through
 `PROXY_SHARD_MAP`: `rest` first, then `eu-w`, …; rollback is one line.
 
+## Feed input
+
+Added 2026-10-24 (v0.2), as a second contender, `mlat-ng-feed`: the same
+engine fed from readsb-ingest's receiver-tagged Beast output (port 4906, one
+per cell) instead of mlat-client. It answers the test's main limitation:
+contenders only see what production asks feeders for.
+
+Why it works (measured on two 60 s production captures, 11:00 and 11:44 UTC):
+
+- the feeders' 12 MHz timestamps reach 4906 untouched (readsb source: no hop
+  rewrites them); pairwise clock residuals p50 0.15 us, the same at 10 km and
+  800 km;
+- the receiver id is the first 64 bits of the feeder's UUID: 89% match an
+  mlat-client handshake, which gives the position (`/receivers.json`);
+- feeders' reduced output still forwards nearly every DF17 position, so clock
+  sync is dense: 4-6% of receivers without a sync partner, against 26% on the
+  mlat-client path.
+
+What the replay of those captures gives with this code (`mlat-ng replay`):
+
+| | capture 1 | capture 2 |
+|---|---|---|
+| bench, published error (ADS-B aircraft from non-ADS-B replies) | p50 74 m, p90 270 m, >1 km 1.6% | p50 76 m, p90 270 m, >1 km 1.5% |
+| Mode-S-only aircraft located in the minute | 134 | 125 |
+| of which production had no result for | 89 | 61 |
+| implausible jumps in the Mode-S-only output | 0.5% | 1.0% |
+| CPU | 4.1 s per 60 s | 4.1 s per 60 s |
+
+Limits: non-ADS-B replies are only the subset each feeder's reduce timers
+forward, so copies of one transmission are sparser than on the mlat-client
+path; 11% of feed ids have no position (no or different UUID); Radarcape GPS
+and zero timestamps arrive unflagged (the adapter checks each clock's rate
+before using it); feeders move between cells (both are read; receivers are
+keyed by UUID).
+
 ## Open items for v0.2
 
 - Serve mode: interest selection (sync aircraft by rate, MLAT targets),
   results back to clients.
 - Per-receiver bias learning (antenna position errors) from holdout residuals.
-- Optional native Mode A/C intake from readsb-ingest's Beast relay (today it
-  carries only `0000` frames, so it is off).
+- Hybrid: feed and mlat-client in one engine, linking each receiver's two
+  clocks (same hardware, constant offset).
+- Mode A/C: the feed carries none today (only `0000` heartbeats); it needs
+  readsb to forward Mode A/C on reduced output when asked (`1J`) and
+  `--modeac-auto` on feeders.

@@ -74,6 +74,8 @@ pub struct AdapterStats {
     pub ev_mlat_modes_only: AtomicU64,
     pub ev_mlat_bench: AtomicU64,
     pub clock_jumps: AtomicU64,
+    /// Frames that arrived late against their own timestamps (not jumps).
+    pub late_deliveries: AtomicU64,
     /// ClockReset events sent for live receivers (single jumps).
     pub clock_resets: AtomicU64,
     pub receivers_live: AtomicU64,
@@ -216,7 +218,15 @@ impl Adapter {
             // Clock continuity against wall time.
             let dts = (f.ts as f64 - rx.last.0 as f64) / TICK_HZ;
             let dwall = wall - rx.last.1;
-            if rx.phase != Phase::BadClock && (dts - dwall).abs() > JUMP_TOLERANCE + 1e-3 * dwall.abs() {
+            let tol = JUMP_TOLERANCE + 1e-3 * dwall.abs();
+            // Frames held back (a stalled connection catching up) arrive with
+            // timestamps behind wall time: that is the network, not the
+            // clock. Only a counter that runs ahead or goes back is a jump.
+            let late = dts - dwall < -tol && dts >= -tol;
+            if late {
+                self.stats.late_deliveries.fetch_add(1, Ordering::Relaxed);
+            }
+            if rx.phase != Phase::BadClock && !late && (dts - dwall).abs() > tol {
                 self.stats.clock_jumps.fetch_add(1, Ordering::Relaxed);
                 rx.jumps.push_back(wall);
                 while rx.jumps.front().is_some_and(|t| wall - t > MULTI_WINDOW) {

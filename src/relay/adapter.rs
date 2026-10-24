@@ -4,7 +4,11 @@
 //! supplies what mlat-client would have:
 //! - Connect, once a mapped receiver's clock has run at 12 MHz for a
 //!   probation period (Radarcape GPS and other formats arrive unflagged);
-//! - ClockReset, when its timestamps jump against wall time;
+//! - ClockReset, when its timestamps jump against wall time once (a feeder
+//!   restart); a receiver whose timestamps keep jumping carries more than one
+//!   clock under one id (an aggregating readsb forwarding several receivers
+//!   with its own UUID, or a UUID cloned across feeders: 47 of ~2,500 ids on
+//!   2026-10-24, 97% of all jumps) and is left out until it has been calm;
 //! - Seen/Lost, from the DF11/DF17 addresses it forwards (the engine only
 //!   multilaterates aircraft some receiver reports as seen);
 //! - Sync, as mlat-client builds it: a DF17 airborne position completes a
@@ -36,6 +40,11 @@ const PAIR_WINDOW: f64 = 5.0;
 /// and WAN jitter) before it counts as a clock jump.
 const JUMP_TOLERANCE: f64 = 2.0;
 const SEEN_TTL: f64 = 60.0;
+/// This many timestamp jumps within `MULTI_WINDOW` = more than one clock.
+const MULTI_JUMPS: usize = 3;
+const MULTI_WINDOW: f64 = 300.0;
+/// A multi-clock receiver is retried after this long without a jump.
+const MULTI_CALM: f64 = 600.0;
 
 #[derive(Debug, Clone)]
 pub struct AdapterConfig {
@@ -65,7 +74,10 @@ pub struct AdapterStats {
     pub ev_mlat_modes_only: AtomicU64,
     pub ev_mlat_bench: AtomicU64,
     pub clock_jumps: AtomicU64,
+    /// ClockReset events sent for live receivers (single jumps).
+    pub clock_resets: AtomicU64,
     pub receivers_live: AtomicU64,
+    pub receivers_multi_clock: AtomicU64,
     pub receivers_probation: AtomicU64,
     pub receivers_bad_clock: AtomicU64,
     pub receivers_unmapped: AtomicU64,
@@ -75,7 +87,10 @@ pub struct AdapterStats {
 enum Phase {
     Probation,
     Live,
+    /// Not a 12 MHz counter.
     BadClock,
+    /// Timestamps from more than one clock under one receiver id.
+    MultiClock,
 }
 
 struct RxState {
@@ -88,6 +103,8 @@ struct RxState {
     cpr: HashMap<u32, [Option<(u64, [u8; 14])>; 2]>,
     seen: HashMap<u32, f64>,
     unsent_seen: Vec<u32>,
+    /// wall times of recent timestamp jumps
+    jumps: std::collections::VecDeque<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +202,7 @@ impl Adapter {
                     cpr: HashMap::new(),
                     seen: HashMap::new(),
                     unsent_seen: Vec::new(),
+                    jumps: std::collections::VecDeque::new(),
                 },
             );
         }
@@ -200,7 +218,23 @@ impl Adapter {
             let dwall = wall - rx.last.1;
             if rx.phase != Phase::BadClock && (dts - dwall).abs() > JUMP_TOLERANCE + 1e-3 * dwall.abs() {
                 self.stats.clock_jumps.fetch_add(1, Ordering::Relaxed);
-                if rx.phase == Phase::Live {
+                rx.jumps.push_back(wall);
+                while rx.jumps.front().is_some_and(|t| wall - t > MULTI_WINDOW) {
+                    rx.jumps.pop_front();
+                }
+                if rx.jumps.len() >= MULTI_JUMPS {
+                    if rx.phase == Phase::Live {
+                        out.push(Event::Disconnect { conn: rx.conn });
+                    }
+                    if rx.phase != Phase::MultiClock {
+                        tracing::info!(rid = format!("{:016x}", f.rid), "feed receiver carries more than one clock: left out");
+                    }
+                    rx.phase = Phase::MultiClock;
+                    // Seen must go out again if it ever reconnects.
+                    rx.seen.clear();
+                    rx.unsent_seen.clear();
+                } else if rx.phase == Phase::Live {
+                    self.stats.clock_resets.fetch_add(1, Ordering::Relaxed);
                     out.push(Event::ClockReset { conn: rx.conn, reason: "feed timestamp jump" });
                 }
                 rx.cpr.clear();
@@ -209,6 +243,19 @@ impl Adapter {
             rx.last = (f.ts, wall);
             match rx.phase {
                 Phase::BadClock => {
+                    self.stats.frames_not_live.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Phase::MultiClock => {
+                    if rx.jumps.back().is_some_and(|t| wall - t < MULTI_CALM) {
+                        self.stats.frames_not_live.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Calm for long enough: one clock again (the duplicate
+                    // went away). Start over with a probation.
+                    rx.jumps.clear();
+                    rx.phase = Phase::Probation;
+                    rx.first = (f.ts, wall);
                     self.stats.frames_not_live.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -359,7 +406,7 @@ impl Adapter {
     pub fn tick(&mut self, wall: f64, out: &mut Vec<Event>) {
         let idle = self.cfg.idle_timeout;
         let mut gone = Vec::new();
-        let (mut live, mut prob, mut bad) = (0u64, 0u64, 0u64);
+        let (mut live, mut prob, mut bad, mut multi) = (0u64, 0u64, 0u64, 0u64);
         for (rid, rx) in self.rxs.iter_mut() {
             if wall - rx.last.1 > idle {
                 if rx.phase == Phase::Live {
@@ -372,6 +419,7 @@ impl Adapter {
                 Phase::Live => live += 1,
                 Phase::Probation => prob += 1,
                 Phase::BadClock => bad += 1,
+                Phase::MultiClock => multi += 1,
             }
             let mut lost = Vec::new();
             rx.seen.retain(|a, t| {
@@ -401,6 +449,7 @@ impl Adapter {
         self.stats.receivers_live.store(live, Ordering::Relaxed);
         self.stats.receivers_probation.store(prob, Ordering::Relaxed);
         self.stats.receivers_bad_clock.store(bad, Ordering::Relaxed);
+        self.stats.receivers_multi_clock.store(multi, Ordering::Relaxed);
         self.stats.receivers_unmapped.store(self.unmapped.len() as u64, Ordering::Relaxed);
     }
 }

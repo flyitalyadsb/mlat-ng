@@ -64,6 +64,8 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_target(false)
+        // No colour codes in `kubectl logs`: only when stdout is a terminal.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let args = Args::parse();
     tracing::info!(?args, "mlat-ng {} starting", env!("CARGO_PKG_VERSION"));

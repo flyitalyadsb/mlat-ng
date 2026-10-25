@@ -45,6 +45,12 @@ const MULTI_JUMPS: usize = 3;
 const MULTI_WINDOW: f64 = 300.0;
 /// A multi-clock receiver is retried after this long without a jump.
 const MULTI_CALM: f64 = 600.0;
+/// readsb marks frames that carry no receive time with timestamps from
+/// 0xFF0000000000 up (readsb.h): MLAT results (...4154), UAT converted from
+/// 978 MHz (...4155), no-forward (...4160), "any" (0xFFFFFFFFFFFF). Feeders
+/// forward them in their Beast output. Read as times they look like clock
+/// jumps: on 2026-10-24 they were 23 of 48 "multi-clock" exclusions.
+const MAGIC_TS_MIN: u64 = 0xFF00_0000_0000;
 
 #[derive(Debug, Clone)]
 pub struct AdapterConfig {
@@ -68,6 +74,8 @@ pub struct AdapterStats {
     pub frames: AtomicU64,
     pub frames_modeac: AtomicU64,
     pub frames_zero_ts: AtomicU64,
+    /// Frames with a readsb marker timestamp (no receive time).
+    pub frames_magic_ts: AtomicU64,
     pub frames_unmapped: AtomicU64,
     pub frames_not_live: AtomicU64,
     pub ev_sync: AtomicU64,
@@ -188,6 +196,10 @@ impl Adapter {
         }
         if f.ts == 0 {
             self.stats.frames_zero_ts.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if f.ts >= MAGIC_TS_MIN {
+            self.stats.frames_magic_ts.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let twelve_mhz = match self.registry.get(&f.rid) {

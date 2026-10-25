@@ -301,7 +301,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         "events": events,
         "adapter": {
             "frames_unmapped": l(&astats.frames_unmapped), "frames_not_live": l(&astats.frames_not_live),
-            "frames_zero_ts": l(&astats.frames_zero_ts), "frames_modeac": l(&astats.frames_modeac),
+            "frames_zero_ts": l(&astats.frames_zero_ts), "frames_magic_ts": l(&astats.frames_magic_ts), "frames_modeac": l(&astats.frames_modeac),
             "sync_events": l(&astats.ev_sync), "mlat_modes_only_events": l(&astats.ev_mlat_modes_only),
             "mlat_bench_events": l(&astats.ev_mlat_bench), "clock_jumps": l(&astats.clock_jumps),
             "clock_resets": l(&astats.clock_resets), "receivers_multi_clock": l(&astats.receivers_multi_clock),

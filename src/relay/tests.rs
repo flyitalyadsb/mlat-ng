@@ -336,3 +336,24 @@ fn late_delivery_is_not_a_clock_jump() {
     a.tick(wall, &mut evs);
     assert_eq!(ld(&st.receivers_live), 1);
 }
+
+#[test]
+fn readsb_marker_timestamps_are_not_clock_jumps() {
+    let (mut a, st) = adapter(AdapterConfig::default(), &[(1, ClockType::Dump1090)]);
+    let mut evs = Vec::new();
+    let ld = |x: &std::sync::atomic::AtomicU64| x.load(std::sync::atomic::Ordering::Relaxed);
+    live(&mut a, &[1], &mut evs);
+    evs.clear();
+    // A US feeder forwards UAT (and MLAT results) between its own frames,
+    // stamped with readsb's markers instead of a receive time.
+    for (i, ts) in [0xFF00_4D4C_4155u64, 0xFF00_4D4C_4154, 0xFF00_4D4C_4160, 0xFFFF_FFFF_FFFF].iter().enumerate() {
+        a.on_frame(&frame(1, *ts, &df11(0x3C0001)), 1022.0 + i as f64 * 0.1, &mut evs);
+        a.on_frame(&frame(1, 1_000_000 + (22 * 12_000_000) + i as u64 * 1_200_000, &df11(0x3C0001)), 1022.05 + i as f64 * 0.1, &mut evs);
+    }
+    a.tick(1023.0, &mut evs);
+    assert!(!kinds(&evs).contains(&"reset"), "{:?}", kinds(&evs));
+    assert!(!kinds(&evs).contains(&"disconnect"));
+    assert_eq!(ld(&st.clock_jumps), 0);
+    assert_eq!(ld(&st.frames_magic_ts), 4);
+    assert_eq!(ld(&st.receivers_live), 1);
+}

@@ -724,3 +724,72 @@ fn non_finite_times_do_not_panic() {
     assert_eq!(tr.update_fix(&f, f64::INFINITY), Gate::Skipped);
     assert!(!tr.stale(T_START));
 }
+
+// --------------------------------------------------------------- velocity
+
+/// tdoa_only with 2 receivers + altitude for `secs`, plus (when `vel`) a
+/// Comm-B BDS 5,0 ground velocity every 4 s (1 m/s noise per component, as
+/// the register's 2 kt / 0.18 deg resolution gives). Returns (worst
+/// horizontal error, velocity updates accepted, offered).
+fn two_rx_with_velocity(seed: u64, secs: usize, vel: bool) -> (f64, usize, usize) {
+    let (rx, fl) = tdoa_setup();
+    let rx = &rx[..2];
+    let mut g = Gauss::new(seed);
+    let (ve, vn) = (180.0, 150.0);
+    let truth = |t: f64| fl.point(ve * t, vn * t, 0.0);
+    let mut tr = Track::new(&fix_at(&mut g, &truth(0.0), (200.0, 150.0), 60.0, 20.0), T_START);
+    for i in 1..=15 {
+        let t = i as f64;
+        tr.update_fix(&fix_at(&mut g, &truth(t), (200.0, 150.0), 60.0, 20.0), T_START + t);
+    }
+    let (mut worst, mut acc, mut n) = (0.0f64, 0, 0);
+    for i in 1..=secs {
+        let t = 15.0 + i as f64;
+        let p = truth(t);
+        if vel && i % 4 == 0 {
+            n += 1;
+            acc += usize::from(tr.update_velocity(ve + g.normal(), vn + g.normal(), 1.0, T_START + t) == Gate::Accepted);
+        }
+        let cov = random_cov(&mut g, 2, 0.1e-6, 1.0e-6);
+        let meas = arrivals(&p, 123.0 + t, rx, &g.mvn(&cov));
+        let a = Some((ecef_to_llh(p).alt + ALT_SIGMA * g.normal(), ALT_SIGMA));
+        tr.update_tdoa(&meas, &cov, a, T_START + t);
+        worst = worst.max(horiz_dist(&tr.position(), &p));
+    }
+    (worst, acc, n)
+}
+
+#[test]
+fn comm_b_velocity_keeps_a_two_receiver_track_for_five_minutes() {
+    let (mut with_v, mut without, mut acc, mut n) = (0.0f64, 0.0f64, 0, 0);
+    for seed in 0..10 {
+        let (w, a, m) = two_rx_with_velocity(seed, 300, true);
+        with_v = with_v.max(w);
+        acc += a;
+        n += m;
+        without = without.max(two_rx_with_velocity(seed, 300, false).0);
+    }
+    eprintln!(
+        "[track] 2 rx + alt, 300 s, x10: worst horizontal error with BDS 5,0 velocity {with_v:.0} m, \
+         without {without:.0} m; velocity accepted {acc}/{n}"
+    );
+    assert!(with_v < 1_500.0, "{with_v}");
+    assert!(with_v < without, "{with_v} vs {without}");
+    assert!(acc as f64 >= 0.95 * n as f64, "{acc}/{n}");
+}
+
+#[test]
+fn a_wrong_velocity_is_rejected() {
+    let (rx, fl) = tdoa_setup();
+    let _ = rx;
+    let mut g = Gauss::new(3);
+    let truth = |t: f64| fl.point(180.0 * t, 150.0 * t, 0.0);
+    let mut tr = Track::new(&fix_at(&mut g, &truth(0.0), (200.0, 150.0), 60.0, 20.0), T_START);
+    for i in 1..=30 {
+        tr.update_fix(&fix_at(&mut g, &truth(i as f64), (200.0, 150.0), 60.0, 20.0), T_START + i as f64);
+    }
+    // A BDS 6,0 read as 5,0, say: 120 m/s off in both components.
+    assert!(matches!(tr.update_velocity(60.0, 30.0, 1.0, T_START + 31.0), Gate::Rejected(_)));
+    assert_eq!(tr.update_velocity(f64::NAN, 0.0, 1.0, T_START + 31.0), Gate::Skipped);
+    assert_eq!(tr.update_velocity(180.0, 150.0, 1.0, T_START + 31.0), Gate::Accepted);
+}

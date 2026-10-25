@@ -163,6 +163,8 @@ struct Aircraft {
     /// diagnose multilateration of aircraft that also broadcast ADS-B.
     adsb: Option<(Ecef, f64)>,
     adsb_vel: Option<[f64; 3]>,
+    /// Time of the last Comm-B ground velocity accepted into the track.
+    last_vel_update: f64,
 }
 
 struct AcTrack {
@@ -224,6 +226,9 @@ pub struct Stats {
     pub fixes: AtomicU64,
     pub track_fix_updates: AtomicU64,
     pub track_tdoa_updates: AtomicU64,
+    /// Comm-B BDS 5,0 ground velocities offered to tracks / accepted.
+    pub commb_vel_offered: AtomicU64,
+    pub commb_vel_accepted: AtomicU64,
     pub track_rejects: AtomicU64,
     pub outputs: AtomicU64,
     /// Positions of aircraft that also broadcast ADS-B, sent to the bench
@@ -851,6 +856,9 @@ impl Engine {
         // The AP address of a corrupted frame is garbage; requiring that some
         // receiver reported the aircraft as seen filters those out.
         let known = self.aircraft.get(&d.address).map(|a| a.tracking > 0).unwrap_or(false);
+        if known && (d.df == 20 || d.df == 21) && bytes.len() == 14 {
+            self.commb_velocity(d.address, &bytes, g.first_wall);
+        }
         if !known || g.copies.len() < 2 {
             self.stats.groups_unknown_ac.fetch_add(1, Ordering::Relaxed);
             return;
@@ -892,6 +900,42 @@ impl Engine {
             let sites = distinct_sites(&meas);
             let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped, sites };
             self.update_aircraft(d.address, &meas, &cov, alt, t_wall, now, &used_keys, &ctx);
+        }
+    }
+
+    /// A DF20/21 reply's MB field as Comm-B BDS 5,0 ground velocity, into the
+    /// aircraft's track. Radars ask EHS aircraft for it every sweep; with it a
+    /// track that drops to 2 receivers keeps its along-curve position (a
+    /// 2-receiver + altitude track stayed within 333 m for 5 min in tests,
+    /// 1.7 km without). Ambiguous 5,0/6,0 readings are taken as 5,0 only when
+    /// they agree with the track's own speed; the track's gate rejects the rest.
+    fn commb_velocity(&mut self, icao: u32, msg: &[u8], t: f64) {
+        let Some(ac) = self.aircraft.get_mut(&icao) else { return };
+        let Some(tr) = ac.track.as_mut() else { return };
+        if t - tr.last_update() > 60.0 {
+            return;
+        }
+        let mut mb = [0u8; 7];
+        mb.copy_from_slice(&msg[4..11]);
+        let b50 = match modes::commb::infer_kinematics(&mb, ac.alt_ft) {
+            Some(modes::commb::Kinematics::Bds50(b)) => b,
+            Some(modes::commb::Kinematics::Ambiguous(b, _)) => {
+                let agrees = b.gs_kt.is_some_and(|gs| (gs - tr.ground_speed_kt()).abs() < 40.0)
+                    && b.true_track_deg.is_some_and(|trk| ((trk - tr.track_deg() + 540.0) % 360.0 - 180.0).abs() < 20.0);
+                if !agrees {
+                    return;
+                }
+                b
+            }
+            _ => return,
+        };
+        let Some((ve, vn)) = b50.ground_velocity_en() else { return };
+        self.stats.commb_vel_offered.fetch_add(1, Ordering::Relaxed);
+        // 2 kt and 0.18 deg resolution plus reporting latency: ~1.5 m/s.
+        let t = t.max(tr.last_update());
+        if tr.update_velocity(ve, vn, 1.5, t) == Gate::Accepted {
+            ac.last_vel_update = t;
+            self.stats.commb_vel_accepted.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1100,7 +1144,10 @@ impl Engine {
         // A confirmed track is published only while a full fix anchors it
         // (one in the last 10 s): TDOA updates from 2-3 receivers constrain a
         // hyperbola, not a point, and alone they let a track slide.
-        let anchored = t - ac.last_fix_update <= 10.0;
+        // Or coasting: a fix in the last 5 min, a Comm-B ground velocity in
+        // the last 15 s holding the along-curve position, and a tight track.
+        let anchored = t - ac.last_fix_update <= 10.0
+            || (t - ac.last_fix_update <= 300.0 && t - ac.last_vel_update <= 15.0 && tr.err_h() < 1500.0);
         let (pos, err, vel) = if tr.confirmed() && anchored {
             (tr.predict(t).0, tr.err_h(), true)
         } else if let Some(f) = fix.filter(|f| f.dof >= 1 && f.err_h < 1000.0) {

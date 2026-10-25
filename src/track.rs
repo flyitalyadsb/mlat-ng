@@ -223,6 +223,45 @@ impl Observation for TdoaObs {
     }
 }
 
+/// Ground velocity east/north at the aircraft (m/s), as Comm-B BDS 5,0
+/// reports it (ground speed + true track, from GNSS/IRS: no wind error). A
+/// linear observation of the state velocity, projected on the local east and
+/// north at the state position (the frame's axes drift from those with
+/// distance from its anchor).
+struct VelObs {
+    frame: Enu,
+    rot: Matrix3<f64>,
+    z: DVector<f64>,
+    r: DMatrix<f64>,
+}
+
+impl Observation for VelObs {
+    fn dim(&self) -> usize {
+        2
+    }
+    fn r(&self) -> &DMatrix<f64> {
+        &self.r
+    }
+    fn linearise(&self, x: &Vector6<f64>) -> Option<(DVector<f64>, DMatrix<f64>)> {
+        let llh = geo::ecef_to_llh(self.frame.to_ecef(&[x[0], x[1], x[2]]));
+        let (sla, cla) = llh.lat.to_radians().sin_cos();
+        let (slo, clo) = llh.lon.to_radians().sin_cos();
+        let east = self.rot * Vector3::new(-slo, clo, 0.0);
+        let north = self.rot * Vector3::new(-sla * clo, -sla * slo, cla);
+        let mut h = DMatrix::zeros(2, 6);
+        for c in 0..3 {
+            h[(0, 3 + c)] = east[c];
+            h[(1, 3 + c)] = north[c];
+        }
+        let v = Vector3::new(x[3], x[4], x[5]);
+        let resid = DVector::from_vec(vec![self.z[0] - east.dot(&v), self.z[1] - north.dot(&v)]);
+        Some((resid, h))
+    }
+    fn iterations(&self) -> usize {
+        1
+    }
+}
+
 /// Result of updating one model.
 struct Upd {
     model: Model,
@@ -316,6 +355,22 @@ impl Track {
             r[(m - 1, m - 1)] = s * s;
         }
         Some(TdoaObs { frame: self.frame, rot: self.rot, rx: meas.iter().map(|m| m.rx).collect(), z, r, alt: alt.is_some() })
+    }
+
+    /// Ground velocity (east, north m/s at the aircraft) with a 1-sigma per
+    /// component, e.g. from Comm-B BDS 5,0. Gated like any update, so a
+    /// mis-inferred register is rejected; it never counts as a fix.
+    pub fn update_velocity(&mut self, ve: f64, vn: f64, sigma: f64, t: f64) -> Gate {
+        if !(ve.is_finite() && vn.is_finite() && sigma.is_finite() && sigma > 0.0) {
+            return Gate::Skipped;
+        }
+        let obs = VelObs {
+            frame: self.frame,
+            rot: self.rot,
+            z: DVector::from_vec(vec![ve, vn]),
+            r: DMatrix::from_diagonal_element(2, 2, sigma * sigma),
+        };
+        self.update(&obs, t, false)
     }
 
     pub fn confirmed(&self) -> bool {

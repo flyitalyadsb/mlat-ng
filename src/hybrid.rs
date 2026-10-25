@@ -127,6 +127,8 @@ impl Router {
         match ev {
             Event::Connect { conn, info, tx } => self.on_connect(src, Side { conn, info, tx }, out),
             Event::Disconnect { conn } => self.on_disconnect(conn, out),
+            // About an aircraft, not a receiver: nothing to route.
+            ev @ Event::GeoBaro { .. } => out.push(ev),
             ev => self.on_data(ev, out),
         }
         self.gauges();

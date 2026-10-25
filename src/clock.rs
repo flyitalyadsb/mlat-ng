@@ -16,6 +16,20 @@
 //! f64 still resolves ~4 ns. theta itself can be as large, so the filter state
 //! is kept relative to `base` (theta at initialisation) and every time is
 //! re-centred on the last update.
+//!
+//! Noise level. Each pair tracks its normalised innovation (NIS) against the
+//! nominal noise of its two clock types. It used to be clamped at 1, so a pair
+//! could only be found noisier than nominal; now it may also go below, to
+//! `NIS_MIN` (a tenth of the nominal variance). The EWMA starts at 1 and moves
+//! ~2% per observation, so a pair is credited with less noise only after
+//! ~50 of its own observations say so. A receiver's noise scale (the factor
+//! on its per-copy jitter in normalisation and the solver) comes from all its
+//! converged pairs through `receiver_noise_scale`: worse than nominal as
+//! before, better than nominal only as far as the number of its pairs backs
+//! it (shrinkage towards nominal, see there). On the 2026-10-25 replays this
+//! calibration (with the 250 ns dump1090 jitter, types.rs) took published p50
+//! from 116 to 101 m (10-minute capture) and brought the solver's error
+//! estimate close to the real error.
 
 use crate::types::ClockType;
 
@@ -35,6 +49,15 @@ const GATE2_YOUNG: f64 = 64.0;
 const RESET_AFTER: u32 = 6;
 /// Largest noise scale a pair may adopt (variance factor; 25 = 5x sigma).
 const NIS_MAX: f64 = 25.0;
+/// Smallest: a tenth of the nominal variance (~80 ns per dump1090 receiver,
+/// still well above the 24 ns a 12 MHz counter's quantisation allows). In
+/// the 2026-10-25 study 0.1 and 0.25 gave the same accuracy.
+pub const NIS_MIN: f64 = 0.1;
+/// Converged pairs a receiver needs before its noise scale moves at all.
+const RX_MIN_PAIRS: usize = 3;
+/// Prior weight of the nominal noise, in pairs, when a receiver looks
+/// better than nominal (see `receiver_noise_scale`).
+const RX_PRIOR_PAIRS: f64 = 3.0;
 /// EWMA weight of the noise-level tracker (~50 observations).
 const NIS_ALPHA: f64 = 0.02;
 /// Updates (observations) before the pair is usable for multilateration.
@@ -74,9 +97,11 @@ pub struct PairModel {
     keep_drift: Option<(f64, f64)>,
     /// EWMA of the normalised innovation squared against the NOMINAL noise:
     /// ~1 when the receivers are as good as their clock type says, larger
-    /// when they are noisier. The measurement noise used is r * nis (clamped):
-    /// production showed many pairs far noisier than the nominal 0.5 us,
-    /// which a fixed r turned into rejection runs and resets.
+    /// when they are noisier, smaller when better. The measurement noise used
+    /// is r * nis (clamped to [NIS_MIN, NIS_MAX]): production showed many
+    /// pairs far noisier than nominal, which a fixed r turned into rejection
+    /// runs and resets, and most of them quieter than nominal, which a fixed r
+    /// turned into weak gates and over-wide covariances.
     nis: f64,
     /// Innovations of the current run of rejections, to tell a real clock
     /// jump (they agree with each other) from plain noise (they don't).
@@ -120,12 +145,13 @@ impl PairModel {
 
     /// Effective measurement variance: nominal, scaled by observed noise.
     fn r_eff(&self) -> f64 {
-        self.r * self.nis.clamp(1.0, NIS_MAX)
+        self.r * self.nis.clamp(NIS_MIN, NIS_MAX)
     }
 
-    /// How much noisier than nominal this pair is (1 = as specified).
+    /// Observed noise relative to nominal, as a sigma factor (1 = as
+    /// specified, < 1 quieter, > 1 noisier).
     pub fn noise_scale(&self) -> f64 {
-        self.nis.clamp(1.0, NIS_MAX).sqrt()
+        self.nis.clamp(NIS_MIN, NIS_MAX).sqrt()
     }
 
     fn init(&mut self, s_a: f64, theta: f64, wall: f64) {
@@ -240,6 +266,19 @@ impl PairModel {
         (self.base + x[0], p[0][0].max(0.0))
     }
 
+    /// a's clock time at the instant b's clock reads `s_b` (the inverse of
+    /// `predict`, whose model is a function of a's time). A fixed point:
+    /// theta changes by at most |drift| <= ~2e-4 per second of a's time, so
+    /// each iteration shrinks the error ~5000-fold; the first guess can be off
+    /// by drift x offset (offsets reach 1e6 s), four more reach the ns level.
+    pub fn a_time_at(&self, s_b: f64) -> f64 {
+        let mut s_a = s_b - self.predict(s_b).0;
+        for _ in 0..4 {
+            s_a = s_b - self.predict(s_a).0;
+        }
+        s_a
+    }
+
     pub fn drift_ppm(&self) -> f64 {
         self.x[1] * 1e6
     }
@@ -258,6 +297,30 @@ impl PairModel {
         self.updates = 0;
         self.resets += 1;
     }
+}
+
+/// A receiver's timestamp noise relative to its clock type's nominal jitter,
+/// from the noise scales of its converged clock pairs.
+///
+/// A pair's noise mixes both receivers, but averaged over all of a
+/// receiver's pairs it mostly reflects the receiver itself. With fewer than
+/// `RX_MIN_PAIRS` pairs nothing is concluded (1). Worse than nominal (mean >=
+/// 1): the mean, as before. Better than nominal: a lower noise makes every
+/// copy of this receiver weigh more, so the claim must be backed by evidence:
+/// the mean is shrunk towards 1 as if `RX_PRIOR_PAIRS` more pairs had said
+/// "nominal". A receiver whose 3 pairs say 0.5 gets 0.75; with 30 pairs it
+/// gets 0.55. Never below sqrt(NIS_MIN), the floor a single pair can reach.
+pub fn receiver_noise_scale(pair_scales: &[f64]) -> f64 {
+    let n = pair_scales.len();
+    if n < RX_MIN_PAIRS {
+        return 1.0;
+    }
+    let mean = pair_scales.iter().sum::<f64>() / n as f64;
+    if mean >= 1.0 {
+        return mean;
+    }
+    let shrunk = (n as f64 * mean + RX_PRIOR_PAIRS) / (n as f64 + RX_PRIOR_PAIRS);
+    shrunk.max(NIS_MIN.sqrt())
 }
 
 /// Distance band used by the pair budget: <50, 50-100, 100-150, >=150 km.
@@ -332,6 +395,67 @@ mod tests {
         }
         assert!(reset_at.is_some(), "no reset");
         assert_eq!(m.updates, 1);
+    }
+
+    /// Feed a dump1090 pair with Gaussian noise of `scale` x nominal.
+    fn pair_with_noise(scale: f64, n: usize) -> PairModel {
+        let mut m = PairModel::new(ClockType::Dump1090, ClockType::Dump1090, 0);
+        let mut seed = 0x0bad_cafe_1234_5678u64;
+        let sigma = scale * (2.0f64).sqrt() * ClockType::Dump1090.jitter();
+        let mut s = 1000.0;
+        for i in 0..n {
+            s += 0.5;
+            m.observe(s, 42.0 + 3e-6 * (s - 1000.0) + sigma * gauss(&mut seed), i as f64 * 0.5);
+        }
+        m
+    }
+
+    #[test]
+    fn pair_noise_can_go_below_nominal_with_evidence() {
+        // Young: the estimate starts at nominal and has not moved far yet.
+        let young = pair_with_noise(0.5, 12);
+        assert!(young.noise_scale() > 0.8, "young {}", young.noise_scale());
+        // After a few hundred observations it follows the evidence (0.5).
+        let old = pair_with_noise(0.5, 600);
+        assert!((old.noise_scale() - 0.5).abs() < 0.12, "old {}", old.noise_scale());
+        // Never below the floor, however quiet the pair.
+        let quiet = pair_with_noise(0.05, 600);
+        assert!((quiet.noise_scale() - NIS_MIN.sqrt()).abs() < 1e-9, "quiet {}", quiet.noise_scale());
+        // And still found noisier than nominal when it is.
+        let noisy = pair_with_noise(2.0, 600);
+        assert!(noisy.noise_scale() > 1.6, "noisy {}", noisy.noise_scale());
+    }
+
+    #[test]
+    fn receiver_floor_follows_its_own_evidence() {
+        // Too few pairs: no conclusion either way.
+        assert_eq!(receiver_noise_scale(&[0.4, 0.4]), 1.0);
+        assert_eq!(receiver_noise_scale(&[3.0, 3.0]), 1.0);
+        // Noisier than nominal: the plain mean, as before.
+        assert!((receiver_noise_scale(&[2.0, 2.0, 2.0]) - 2.0).abs() < 1e-12);
+        // Quieter: 3 pairs move it only half way, 30 pairs nearly all the way.
+        let few = receiver_noise_scale(&[0.5; 3]);
+        let many = receiver_noise_scale(&[0.5; 30]);
+        assert!((few - 0.75).abs() < 1e-12, "few {few}");
+        assert!((many - (30.0 * 0.5 + 3.0) / 33.0).abs() < 1e-12, "many {many}");
+        assert!(many < few && few < 1.0);
+        // Never below what a single pair can reach.
+        assert!((receiver_noise_scale(&[NIS_MIN.sqrt(); 1000]) - NIS_MIN.sqrt()).abs() < 5e-3);
+        assert!(receiver_noise_scale(&[0.0; 1000]) >= NIS_MIN.sqrt());
+    }
+
+    #[test]
+    fn a_time_inverts_predict() {
+        let mut m = PairModel::new(ClockType::Dump1090, ClockType::Dump1090, 0);
+        // b runs 1.2e6 s ahead of a and 80 ppm fast.
+        let mut s = 5000.0;
+        for i in 0..60 {
+            s += 0.5;
+            m.observe(s, 1.2e6 + 80e-6 * (s - 5000.0), i as f64);
+        }
+        let s_a = s + 3.0;
+        let s_b = s_a + m.predict(s_a).0;
+        assert!((m.a_time_at(s_b) - s_a).abs() < 1e-9, "{}", m.a_time_at(s_b) - s_a);
     }
 
     #[test]

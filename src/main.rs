@@ -24,6 +24,7 @@ mod replay;
 mod sim;
 mod solver;
 mod track;
+mod twosite;
 mod types;
 
 use std::fmt::Write as _;
@@ -95,6 +96,11 @@ struct Args {
     /// loaded at start, saved every 30 min. Empty = in memory only.
     #[arg(long, default_value = "", env = "MLAT_NG_COVERAGE_FILE")]
     coverage_file: String,
+    /// Aircraft heard by only two sites (twosite.rs): off, bench (solve, but
+    /// only aircraft with ADS-B get the result, on the bench output) or
+    /// publish.
+    #[arg(long, default_value = "off", env = "MLAT_NG_TWO_SITE")]
+    two_site: engine::TwoSite,
 }
 
 fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -137,6 +143,7 @@ fn main() -> anyhow::Result<()> {
     if !args.coverage_file.is_empty() {
         eng = eng.with_coverage_file(&args.coverage_file);
     }
+    eng = eng.with_two_site(args.two_site);
     let (q_tx, q_rx) = mpsc::channel(64);
     eng = eng.with_queries(q_rx);
     let feed_cfg = (!cells.is_empty()).then(|| relay::FeedConfig {
@@ -338,6 +345,20 @@ fn render_metrics(
     m("holdout_error_p50_m", "gauge", snap.holdout_p50);
     m("holdout_error_p90_m", "gauge", snap.holdout_p90);
     m("holdout_error_p99_m", "gauge", snap.holdout_p99);
+    m("two_site_tries_total", "counter", l(&s.two_site_tries));
+    m("two_site_solved_total", "counter", l(&s.two_site_solved));
+    m("two_site_accepted_total", "counter", l(&s.two_site_accepted));
+    m("two_site_tracked_total", "counter", l(&s.two_site_tracked));
+    m("two_site_solve_seconds_total", "counter", l(&s.two_site_us) / 1e6);
+    m("two_site_bench_n", "gauge", snap.two_site_all.0 as f64);
+    m("two_site_bench_error_p50_m", "gauge", snap.two_site_all.1);
+    m("two_site_bench_error_p90_m", "gauge", snap.two_site_all.2);
+    m("two_site_bench_ok_n", "gauge", snap.two_site_ok.0 as f64);
+    m("two_site_bench_ok_error_p50_m", "gauge", snap.two_site_ok.1);
+    m("two_site_bench_ok_error_p90_m", "gauge", snap.two_site_ok.2);
+    m("two_site_bench_published_n", "gauge", snap.two_site_pub.0 as f64);
+    m("two_site_bench_published_error_p50_m", "gauge", snap.two_site_pub.1);
+    m("two_site_bench_published_error_p90_m", "gauge", snap.two_site_pub.2);
     let mut extra = String::new();
     for (b, n, f50, f90, o50, o90) in &snap.adsb_check {
         let _ = writeln!(extra, "mlat_ng_adsb_check_count{{receivers=\"{b}\"}} {n}");

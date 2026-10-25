@@ -66,6 +66,20 @@ pub struct ReplayArgs {
     /// Save the receiver coverage maps built during the replay here.
     #[arg(long)]
     coverage_file: Option<String>,
+    /// Start from these coverage maps (a file saved by a live engine or an
+    /// earlier replay).
+    #[arg(long)]
+    coverage_from: Option<String>,
+    /// Write every 2-site solution of an aircraft with ADS-B here (JSON lines).
+    #[arg(long)]
+    two_site_dump: Option<String>,
+    /// Aircraft heard by only two sites: off | bench | publish.
+    #[arg(long, default_value = "off")]
+    two_site: crate::engine::TwoSite,
+    /// Bench of the 2-site path: aircraft with ADS-B keep the copies of one
+    /// pair of receivers only, so the bench scores 2-site positions.
+    #[arg(long, default_value_t = false)]
+    bench_two_sites: bool,
 }
 
 struct Counting<R> {
@@ -152,7 +166,16 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let (out, mut out_rx) = broadcast::channel(1 << 16);
     let (bench, mut bench_rx) = broadcast::channel(1 << 16);
     let ecfg = EngineConfig { shadow: true, mlat_delay: a.mlat_delay, holdout_every: a.holdout_every };
-    let mut eng = Engine::new(ecfg, stats.clone(), out).with_bench_output(bench);
+    let mut eng = Engine::new(ecfg, stats.clone(), out)
+        .with_bench_output(bench)
+        .with_two_site(a.two_site)
+        .with_bench_two_sites(a.bench_two_sites);
+    if let Some(p) = &a.coverage_from {
+        eng = eng.load_coverage(p)?;
+    }
+    if let Some(p) = &a.two_site_dump {
+        eng = eng.with_two_site_dump(p)?;
+    }
     let astats = Arc::new(AdapterStats::default());
     let acfg = AdapterConfig {
         sync_every: a.sync_every,
@@ -278,11 +301,31 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     eng.tick_at(t, true);
     drain(&mut out_rx, &mut bench_rx);
     eng.publish_at(0, t);
+    eng.flush_two_site_dump();
     let wall_s = started.elapsed().as_secs_f64();
     if let Some(p) = &a.coverage_file {
         eng.save_coverage(p)?;
     }
 
+    // 2-site solutions vs the aircraft's own ADS-B (bench aircraft only).
+    let two = eng.two_site_errors();
+    let qs = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        let at = |p: f64| if v.is_empty() { 0.0 } else { (v[((v.len() - 1) as f64 * p) as usize] / 10.0).round() / 100.0 };
+        json!({"n": v.len(), "p50_km": at(0.5), "p90_km": at(0.9), "p99_km": at(0.99),
+               "under_1km": v.iter().filter(|e| **e < 1000.0).count(), "over_5km": v.iter().filter(|e| **e > 5000.0).count()})
+    };
+    let two_site = json!({
+        "tries": stats.two_site_tries.load(Ordering::Relaxed),
+        "solved": stats.two_site_solved.load(Ordering::Relaxed),
+        "accepted": stats.two_site_accepted.load(Ordering::Relaxed),
+        "tracked": stats.two_site_tracked.load(Ordering::Relaxed),
+        "solve_ms_mean": stats.two_site_us.load(Ordering::Relaxed) as f64
+            / stats.two_site_tries.load(Ordering::Relaxed).max(1) as f64 / 1000.0,
+        "all": qs(two.iter().map(|x| x.1).collect()),
+        "accepted_err": qs(two.iter().filter(|x| x.2).map(|x| x.1).collect()),
+        "published_err": qs(eng.two_site_published().iter().map(|x| x.1).collect()),
+    });
     let errs = eng.adsb_errors();
     let fix_errs: Vec<f64> = errs.iter().filter_map(|e| e.1).collect();
     let out_errs: Vec<f64> = errs.iter().filter_map(|e| e.2).collect();
@@ -301,6 +344,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let l = |x: &AtomicU64| x.load(Ordering::Relaxed);
     let snap = stats.snapshot.lock().unwrap().clone();
     let summary = json!({
+        "two_site": two_site,
         "sim_seconds": t_end - t0,
         "processing_seconds": (wall_s * 10.0).round() / 10.0,
         "frames": frames,

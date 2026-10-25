@@ -324,6 +324,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             "groups_unnormalised": l(&stats.groups_no_norm), "clusters": l(&stats.clusters),
             "solves": l(&stats.solves), "fixes": l(&stats.fixes), "tracks_born": l(&stats.tracks_born),
             "track_tdoa_updates": l(&stats.track_tdoa_updates),
+            "commb_vel_offered": l(&stats.commb_vel_offered), "commb_vel_accepted": l(&stats.commb_vel_accepted),
             "holdout": {"n": snap.holdout_n, "p50_m": snap.holdout_p50.round(), "p90_m": snap.holdout_p90.round()},
             "coverage_maps": snap.coverage_maps, "coverage_samples": snap.coverage_samples,
         },

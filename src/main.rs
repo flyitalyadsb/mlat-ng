@@ -296,6 +296,8 @@ fn render_metrics(
     m("fixes_total", "counter", l(&s.fixes));
     m("track_fix_updates_total", "counter", l(&s.track_fix_updates));
     m("track_tdoa_updates_total", "counter", l(&s.track_tdoa_updates));
+    m("commb_vel_offered_total", "counter", l(&s.commb_vel_offered));
+    m("commb_vel_accepted_total", "counter", l(&s.commb_vel_accepted));
     m("track_rejects_total", "counter", l(&s.track_rejects));
     m("outputs_total", "counter", l(&s.outputs));
     m("bench_outputs_total", "counter", l(&s.bench_outputs));

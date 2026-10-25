@@ -17,7 +17,10 @@
 //!   the same at every receiver that heard the pair and clock pairs still meet;
 //! - Mlat, for aircraft with no ADS-B position from any receiver (Mode-S-only,
 //!   DF17 without position included) and, for the bench, for 1 in
-//!   `bench_every` ADS-B aircraft from their non-DF17 replies only.
+//!   `bench_every` ADS-B aircraft from their non-DF17 replies only;
+//! - GeoBaro, an aircraft's geometric-minus-baro altitude from its ADS-B
+//!   velocity messages, for the engine's altitude model (altmodel.rs): once
+//!   per aircraft per `GEO_BARO_EVERY` seconds, or when it changes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +62,8 @@ const MAGIC_TS_MIN: u64 = 0xFF00_0000_0000;
 /// clocks 64 us (19 km) apart: on 2026-10-25 that made the hybrid's pair
 /// rejects 35x mlat-ng's and its holdout p90 31 km.
 const FRAME_START_TICKS: u64 = 768;
+/// An unchanged geometric-minus-baro difference is forwarded this often (s).
+const GEO_BARO_EVERY: f64 = 5.0;
 
 #[derive(Debug, Clone)]
 pub struct AdapterConfig {
@@ -139,6 +144,8 @@ pub struct Adapter {
     unmapped: HashMap<u64, f64>,
     /// last ADS-B airborne position (any receiver), wall time
     adsb_pos: HashMap<u32, f64>,
+    /// last geometric-minus-baro difference forwarded per aircraft: (ft, wall)
+    geo_baro: HashMap<u32, (i32, f64)>,
     next_conn: ConnId,
     tx: mpsc::Sender<ToClient>,
 }
@@ -155,6 +162,7 @@ impl Adapter {
             rxs: HashMap::new(),
             unmapped: HashMap::new(),
             adsb_pos: HashMap::new(),
+            geo_baro: HashMap::new(),
             next_conn: CONN_BASE,
             tx,
         }
@@ -385,6 +393,13 @@ impl Adapter {
                 }
                 let addr = d.address;
                 self.mark_seen(f.rid, addr, wall);
+                if let Some(delta_ft) = modes::es_geo_minus_baro_ft(msg) {
+                    let same = self.geo_baro.get(&addr).is_some_and(|&(v, t)| v == delta_ft && wall - t < GEO_BARO_EVERY);
+                    if !same {
+                        self.geo_baro.insert(addr, (delta_ft, wall));
+                        out.push(Event::GeoBaro { icao: addr, delta_ft });
+                    }
+                }
                 if let Some(es) = d.es.as_ref().filter(|e| e.kind == EsKind::AirbornePosition && (9..=18).contains(&e.tc)) {
                     self.adsb_pos.insert(addr, wall);
                     // NUCp >= 6 is TC 9..12: the engine refuses the rest.
@@ -495,6 +510,7 @@ impl Adapter {
             self.rxs.remove(&rid);
         }
         self.adsb_pos.retain(|_, t| wall - *t <= 120.0);
+        self.geo_baro.retain(|_, (_, t)| wall - *t <= 120.0);
         self.unmapped.retain(|_, t| wall - *t <= 300.0);
         self.stats.receivers_live.store(live, Ordering::Relaxed);
         self.stats.receivers_probation.store(prob, Ordering::Relaxed);

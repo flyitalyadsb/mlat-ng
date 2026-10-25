@@ -8,6 +8,7 @@
 // wired everywhere; keep the build quiet until they are.
 #![allow(dead_code)]
 
+mod altmodel;
 mod clock;
 mod coverage;
 mod engine;
@@ -308,12 +309,20 @@ fn render_metrics(
     m("modeac_outputs_total", "counter", l(&s.modeac_outputs));
     m("holdout_solved_total", "counter", l(&s.holdout_solved));
     m("holdout_failed_total", "counter", l(&s.holdout_failed));
+    m("alt_geo_corrected_total", "counter", l(&s.alt_geo_corrected));
+    m("alt_geo_fallback_total", "counter", l(&s.alt_geo_fallback));
+    m("sync_refs_geometric_total", "counter", l(&s.sync_refs_geometric));
+    m("groups_bridged_total", "counter", l(&s.groups_bridged));
+    m("bridge_receivers_total", "counter", l(&s.bridge_receivers));
+    m("bridged_copies_total", "counter", l(&s.bridged_copies));
     m("engine_late_ms_max", "gauge", l(&s.loop_late_ms_max));
     let snap = s.snapshot.lock().unwrap().clone();
     m("receivers", "gauge", snap.receivers as f64);
     m("receivers_suspect", "gauge", snap.receivers_suspect as f64);
     m("coverage_maps", "gauge", snap.coverage_maps as f64);
     m("coverage_samples_total", "counter", snap.coverage_samples as f64);
+    m("alt_model_cells", "gauge", snap.alt_model_cells as f64);
+    m("alt_model_samples", "gauge", snap.alt_model_samples as f64);
     m("pairs", "gauge", snap.pairs as f64);
     m("pairs_usable", "gauge", snap.pairs_usable as f64);
     m("sync_entries", "gauge", snap.sync_entries as f64);

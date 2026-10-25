@@ -119,6 +119,7 @@ fn kinds(evs: &[Event]) -> Vec<&'static str> {
             Event::ClockReset { .. } => "reset",
             Event::PositionUpdate { .. } => "moved",
             Event::RateReport { .. } => "rate",
+            Event::GeoBaro { .. } => "geo_baro",
         })
         .collect()
 }

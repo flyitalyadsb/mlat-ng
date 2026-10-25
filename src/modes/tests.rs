@@ -836,3 +836,22 @@ fn never_panics_on_arbitrary_input() {
         let _ = is_false_ac_address(v);
     }
 }
+
+#[test]
+fn geo_minus_baro_from_velocity_messages() {
+    // The 1090MHz Riddle / pyModeS: velocity subtype 1, GNSS 550 ft above baro.
+    assert_eq!(es_geo_minus_baro_ft(&frame("8D485020994409940838175B284F")), Some(550));
+    // Subtype 3 with the field empty: no data.
+    assert_eq!(es_geo_minus_baro_ft(&frame("8DA05F219B06B6AF189400CBC33F")), None);
+    // Sign bit set: geometric below baro.
+    let mut f = frame("8D485020994409940838175B284F");
+    f[10] |= 0x80;
+    let crc = crc_residual(&f) ^ u24(&f[11..14]);
+    f[11..14].copy_from_slice(&crc.to_be_bytes()[1..]);
+    assert_eq!(es_geo_minus_baro_ft(&f), Some(-550));
+    // Not a velocity message, or a corrupted one.
+    assert_eq!(es_geo_minus_baro_ft(&frame("8D40621D58C382D690C8AC2863A7")), None);
+    let mut bad = frame("8D485020994409940838175B284F");
+    bad[6] ^= 1;
+    assert_eq!(es_geo_minus_baro_ft(&bad), None);
+}

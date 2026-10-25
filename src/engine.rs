@@ -17,6 +17,19 @@
 //!   associated with a Mode S track (by squawk or Mode C altitude and
 //!   position), where it becomes one more TDOA update for that aircraft; only
 //!   unassociated, repeatedly consistent solutions become Mode A/C tracks.
+//!
+//! Altitudes are geometric (2026-10-25): every Mode S altitude is barometric,
+//! and the ADS-B sync references and the solver's altitude constraint used to
+//! take it as height above the ellipsoid, ~290 m off at cruise. Both now add
+//! the geometric-minus-baro difference: a sync reference its own (ADS-B TC 19)
+//! when recent, else the regional model's (altmodel.rs); a multilaterated
+//! aircraft the regional model's from OTHER aircraft only (a Mode-S-only
+//! aircraft has no TC 19, so the bench must not use its own), with a wider
+//! sigma and no correction where the model has no data.
+//!
+//! Normalisation may route through up to `MAX_BRIDGES` receivers outside the
+//! group when the group's own clock graph is disconnected (norm.rs explains
+//! why only then).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +39,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nalgebra::DMatrix;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::clock::{band_of, Outcome, PairModel, PAIR_BUDGET};
+use crate::altmodel::{self, AltModel};
+use crate::clock::{band_of, receiver_noise_scale, Outcome, PairModel, PAIR_BUDGET};
 use crate::coverage::{CovId, Coverage};
 use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Llh, C_AIR, FT_TO_M};
 use crate::modes;
@@ -49,6 +63,16 @@ const SYNC_TTL: f64 = 10.0;
 const PAIR_MIN_INTERVAL: f64 = 0.25;
 /// Cap on copies kept per message group.
 const MAX_COPIES: usize = 40;
+/// Receivers outside a disconnected group that its normalisation may route
+/// through (norm.rs, "Bridges"). 2 and 4 performed the same in replays.
+const MAX_BRIDGES: usize = 2;
+/// 1-sigma (m) of a decoded Mode S altitude as a constraint, before the
+/// barometric -> geometric correction's own uncertainty.
+const ALT_SIGMA_M: f64 = 76.0;
+/// An aircraft's own geometric-minus-baro difference is used for its sync
+/// references up to this age (s), and enters the model up to `GEO_SAMPLE_AGE`.
+const GEO_OWN_AGE: f64 = 60.0;
+const GEO_SAMPLE_AGE: f64 = 30.0;
 /// Mode A/C payloads that are shared by too many aircraft at once (VFR,
 /// conspicuity, defaults) or are line noise, as acbridge.py/mlat-client.
 const MODEAC_BLACKLIST: [u16; 20] = [
@@ -139,8 +163,8 @@ impl MsgKey {
 struct Group {
     first_wall: f64,
     copies: Vec<(RxKey, f64)>,
-    /// Ground truth for holdout groups: ADS-B position and altitude (ft).
-    truth: Option<(Ecef, i32)>,
+    /// Ground truth for holdout groups: ADS-B position, altitude (ft), address.
+    truth: Option<(Ecef, i32, u32)>,
 }
 
 #[derive(Default)]
@@ -165,6 +189,8 @@ struct Aircraft {
     adsb_vel: Option<[f64; 3]>,
     /// Time of the last Comm-B ground velocity accepted into the track.
     last_vel_update: f64,
+    /// Own geometric-minus-baro altitude (ft, from ADS-B TC 19) and its time.
+    geo_baro: Option<(f64, f64)>,
 }
 
 struct AcTrack {
@@ -243,6 +269,17 @@ pub struct Stats {
     pub modeac_outputs: AtomicU64,
     pub holdout_solved: AtomicU64,
     pub holdout_failed: AtomicU64,
+    /// Altitude constraints corrected to geometric by the regional model, and
+    /// those left barometric (no model data nearby; wider sigma).
+    pub alt_geo_corrected: AtomicU64,
+    pub alt_geo_fallback: AtomicU64,
+    /// Sync reference pairs placed at geometric height (own TC 19 or model).
+    pub sync_refs_geometric: AtomicU64,
+    /// Groups normalised through bridge receivers, bridges used, and copies
+    /// those groups kept beyond their largest own component.
+    pub groups_bridged: AtomicU64,
+    pub bridge_receivers: AtomicU64,
+    pub bridged_copies: AtomicU64,
     pub loop_late_ms_max: AtomicU64,
     /// Snapshot for /state.json and the gauges, rewritten every second.
     pub snapshot: Mutex<Snapshot>,
@@ -278,6 +315,9 @@ pub struct Snapshot {
     /// Receivers with a coverage map, and ADS-B samples counted into them.
     pub coverage_maps: usize,
     pub coverage_samples: u64,
+    /// Altitude model: 1-degree cells with data, and aircraft samples held.
+    pub alt_model_cells: usize,
+    pub alt_model_samples: usize,
 }
 
 pub struct Engine {
@@ -309,6 +349,8 @@ pub struct Engine {
     /// Where coverage maps are saved (and loaded from at start), if anywhere.
     coverage_file: Option<String>,
     coverage_saved: f64,
+    /// Regional geometric-minus-baro altitude model (altmodel.rs).
+    alt_model: AltModel,
 }
 
 /// A receiver's coverage identity: its UUID key (as the Beast feed keys it)
@@ -356,6 +398,7 @@ impl Engine {
             rx_by_cov: HashMap::new(),
             coverage_file: None,
             coverage_saved: 0.0,
+            alt_model: AltModel::default(),
         }
     }
 
@@ -434,6 +477,9 @@ impl Engine {
             Event::Seen { conn, icao } => self.on_seen(conn, &icao),
             Event::Lost { conn, icao } => self.on_lost(conn, &icao),
             Event::RateReport { .. } => {}
+            Event::GeoBaro { icao, delta_ft } => {
+                self.aircraft.entry(icao).or_default().geo_baro = Some((delta_ft as f64, now));
+            }
             Event::ClockReset { conn, .. } => self.clock_reset(conn),
             Event::PositionUpdate { conn, lat, lon, alt } => {
                 if let Some(k) = self.rx_by_conn.get(&conn).copied() {
@@ -558,7 +604,32 @@ impl Engine {
 
     // ---------------------------------------------------------------- sync --
 
-    fn validate_sync(&self, ma: &[u8], mb: &[u8]) -> Option<(Ecef, Ecef, u32, i32)> {
+    /// Geometric-minus-baro difference (m) for a sync reference: the
+    /// aircraft's own when recent, else the regional model's, else 0.
+    fn sync_geo_m(&self, icao: u32, lat: f64, lon: f64, baro_ft: i32, now: f64) -> Option<f64> {
+        let own = self.aircraft.get(&icao).and_then(|a| a.geo_baro).filter(|&(_, t)| now - t <= GEO_OWN_AGE).map(|(d, _)| d);
+        own.or_else(|| self.alt_model.estimate(lat, lon, baro_ft as f64, now, None)).map(|d| d * FT_TO_M)
+    }
+
+    /// A barometric altitude as a constraint on height above the ellipsoid:
+    /// (height m, 1-sigma m). Corrected to geometric with the regional model
+    /// built from aircraft other than `icao`; without model data nearby it
+    /// stays barometric with the spread of the difference added to sigma.
+    fn geo_constraint(&self, icao: Option<u32>, baro_ft: i32, sigma: f64, at: Llh, now: f64) -> (f64, f64) {
+        let h = baro_ft as f64 * FT_TO_M;
+        match self.alt_model.estimate(at.lat, at.lon, baro_ft as f64, now, icao) {
+            Some(d) => {
+                self.stats.alt_geo_corrected.fetch_add(1, Ordering::Relaxed);
+                (h + d * FT_TO_M, sigma.hypot(altmodel::MODEL_SIGMA_M))
+            }
+            None => {
+                self.stats.alt_geo_fallback.fetch_add(1, Ordering::Relaxed);
+                (h, sigma.hypot(altmodel::fallback_sigma(h)))
+            }
+        }
+    }
+
+    fn validate_sync(&self, ma: &[u8], mb: &[u8], now: f64) -> Option<(Ecef, Ecef, u32, i32)> {
         let a = modes::decode(ma)?;
         let b = modes::decode(mb)?;
         if a.df != 17 || b.df != 17 || a.crc_ok != Some(true) || b.crc_ok != Some(true) || a.address != b.address {
@@ -582,8 +653,15 @@ impl Engine {
                 return None;
             }
         }
-        let pe = llh_to_ecef(Llh { lat: elat, lon: elon, alt: alt_e as f64 * FT_TO_M });
-        let po = llh_to_ecef(Llh { lat: olat, lon: olon, alt: alt_o as f64 * FT_TO_M });
+        // At geometric height: the clock offsets learnt from these positions
+        // are only as good as their geometry.
+        let ge = self.sync_geo_m(a.address, elat, elon, alt_e, now);
+        let go = self.sync_geo_m(a.address, olat, olon, alt_o, now);
+        if ge.is_some() || go.is_some() {
+            self.stats.sync_refs_geometric.fetch_add(1, Ordering::Relaxed);
+        }
+        let pe = llh_to_ecef(Llh { lat: elat, lon: elon, alt: alt_e as f64 * FT_TO_M + ge.unwrap_or(0.0) });
+        let po = llh_to_ecef(Llh { lat: olat, lon: olon, alt: alt_o as f64 * FT_TO_M + go.unwrap_or(0.0) });
         if dist(&pe, &po) > MAX_PAIR_SPREAD {
             return None;
         }
@@ -613,7 +691,7 @@ impl Engine {
         key[..14].copy_from_slice(ma);
         key[14..].copy_from_slice(mb);
         if !self.sync.contains_key(&key) {
-            let valid = self.validate_sync(ma, mb);
+            let valid = self.validate_sync(ma, mb, now);
             if valid.is_none() {
                 self.stats.sync_invalid.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -657,6 +735,13 @@ impl Engine {
             // A validated ADS-B position: who hears this aircraft, and who
             // in range does not, is coverage evidence.
             let llh = ecef_to_llh(pb);
+            // A validated position with a recent own difference: a sample for
+            // the altitude model (at its barometric level).
+            if let Some((d, t)) = ac.geo_baro {
+                if now - t <= GEO_SAMPLE_AGE {
+                    self.alt_model.insert(icao, llh.lat, llh.lon, alt_b as f64, d, now);
+                }
+            }
             let (rxs, by_cov) = (&self.rxs, &self.rx_by_cov);
             self.coverage.observe(icao, llh.lat, llh.lon, alt_b as f64 * 0.3048, now, |id| {
                 by_cov.get(&id).and_then(|k| rxs.get(k)).is_some_and(|r| r.seen.contains(&icao))
@@ -670,7 +755,7 @@ impl Engine {
             if variant.obs.is_empty() {
                 if let Some(mk) = MsgKey::new(mb) {
                     self.holdout_due.push_back((now + 1.5, mk));
-                    self.holdout_groups.insert(mk, Group { first_wall: now, copies: Vec::new(), truth: Some((pb, alt_b)) });
+                    self.holdout_groups.insert(mk, Group { first_wall: now, copies: Vec::new(), truth: Some((pb, alt_b, icao)) });
                 }
             }
             variant.obs.push(obs);
@@ -804,6 +889,28 @@ impl Engine {
         (keys, nodes, copies)
     }
 
+    /// The clock edge between nodes i and j of a group (receiver keys, local
+    /// times of this event), as norm::normalize wants it: (theta, variance)
+    /// with s_j - s_i ~= theta, or None when that pair is not usable.
+    fn edge(&self, keys: &[RxKey], s_of: &[f64], i: usize, j: usize, now: f64) -> Option<(f64, f64)> {
+        let pk = pair_key(keys[i], keys[j]);
+        let m = self.pairs.get(&pk)?;
+        if !m.usable(now) {
+            return None;
+        }
+        let (theta, var) = if keys[i] == pk.0 {
+            m.predict(s_of[i])
+        } else {
+            // model is s_i - s_j at j's time; flip it
+            let (th, v) = m.predict(s_of[j]);
+            (-th, v)
+        };
+        if var.sqrt() > crate::clock::MAX_SIGMA {
+            return None;
+        }
+        Some((theta, var))
+    }
+
     fn normalize(&self, keys: &[RxKey], nodes: &[Node], copies: &[Copy], now: f64) -> Option<norm::Normalized> {
         // Representative local time per node: its first copy.
         let mut s_of = vec![f64::NAN; nodes.len()];
@@ -812,29 +919,72 @@ impl Engine {
                 s_of[c.node] = c.s;
             }
         }
-        norm::normalize(nodes, copies, |i, j| {
-            let pk = pair_key(keys[i], keys[j]);
-            let m = self.pairs.get(&pk)?;
-            if !m.usable(now) {
-                return None;
+        // The members' edges, once: they decide on bridges and feed the solve.
+        let k = keys.len();
+        let mut cache = vec![None; k * k];
+        for i in 0..k {
+            for j in (i + 1)..k {
+                cache[i * k + j] = self.edge(keys, &s_of, i, j, now);
             }
-            let (theta, var) = if keys[i] == pk.0 {
-                m.predict(s_of[i])
-            } else {
-                // model is s_i - s_j at j's time; flip it
-                let (th, v) = m.predict(s_of[j]);
-                (-th, v)
-            };
-            if var.sqrt() > crate::clock::MAX_SIGMA {
-                return None;
+        }
+        // Bridges only when the members' own clock graph is disconnected
+        // (norm.rs, "Bridges"): connected groups take exactly the old path.
+        let comp = norm::member_components(k, |i, j| cache[i * k + j].is_some());
+        let mut links = Vec::new();
+        if comp.iter().any(|&c| c != comp[0]) {
+            for (i, &k) in keys.iter().enumerate() {
+                let Some(r) = self.rxs.get(&k) else { continue };
+                for &p in &r.peers {
+                    if keys.contains(&p) || self.rxs.get(&p).is_none_or(|x| x.suspect) {
+                        continue;
+                    }
+                    if self.pairs.get(&pair_key(k, p)).is_some_and(|m| m.usable(now)) {
+                        links.push((p, i));
+                    }
+                }
             }
-            Some((theta, var))
-        })
+        }
+        let bridges = norm::choose_bridges(&comp, links, MAX_BRIDGES);
+        if bridges.is_empty() {
+            return norm::normalize(nodes, copies, |i, j| cache[i * k + j]);
+        }
+        let mut keys_all = keys.to_vec();
+        let mut nodes_all = nodes.to_vec();
+        for b in bridges {
+            // The bridge's own clock reading at this event, through its pair
+            // with the first member linked to it.
+            let s_b = keys.iter().enumerate().find_map(|(i, &k)| {
+                let pk = pair_key(k, b);
+                let m = self.pairs.get(&pk).filter(|m| m.usable(now))?;
+                Some(if pk.0 == k { s_of[i] + m.predict(s_of[i]).0 } else { m.a_time_at(s_of[i]) })
+            });
+            let (Some(s_b), Some(r)) = (s_b.filter(|v| v.is_finite()), self.rxs.get(&b)) else { continue };
+            keys_all.push(b);
+            // No copies: its jitter is never used.
+            nodes_all.push(Node { pos: r.pos, jitter: 0.0 });
+            s_of.push(s_b);
+        }
+        if keys_all.len() == k {
+            return norm::normalize(nodes, copies, |i, j| cache[i * k + j]);
+        }
+        // normalize asks for i < j only: member pairs are cached.
+        let normd = norm::normalize(&nodes_all, copies, |i, j| if j < k { cache[i * k + j] } else { self.edge(&keys_all, &s_of, i, j, now) })?;
+        let mut per_comp: HashMap<usize, usize> = HashMap::new();
+        for c in copies {
+            *per_comp.entry(comp[c.node]).or_default() += 1;
+        }
+        let own = per_comp.values().copied().max().unwrap_or(0);
+        self.stats.groups_bridged.fetch_add(1, Ordering::Relaxed);
+        self.stats.bridge_receivers.fetch_add((keys_all.len() - k) as u64, Ordering::Relaxed);
+        self.stats.bridged_copies.fetch_add(normd.copies.len().saturating_sub(own) as u64, Ordering::Relaxed);
+        Some(normd)
     }
 
-    fn altitude_for(&self, ac: &Aircraft, decoded_alt: Option<i32>, now: f64) -> Option<(f64, f64)> {
+    /// Altitude constraint (geometric height m, sigma m) for aircraft `icao`
+    /// near `at`, from this frame's altitude or a recent one.
+    fn altitude_for(&self, icao: u32, ac: &Aircraft, decoded_alt: Option<i32>, now: f64, at: Llh) -> Option<(f64, f64)> {
         if let Some(a) = decoded_alt {
-            return Some((a as f64 * FT_TO_M, 76.0));
+            return Some(self.geo_constraint(Some(icao), a, ALT_SIGMA_M, at, now));
         }
         let a = ac.alt_ft?;
         let age = now - ac.alt_t;
@@ -842,7 +992,21 @@ impl Engine {
             return None;
         }
         // 250 ft at report time, degrading at ~70 ft/s (mlat-server's model).
-        Some((a as f64 * FT_TO_M, (250.0 + 70.0 * age) * FT_TO_M))
+        Some(self.geo_constraint(Some(icao), a, (250.0 + 70.0 * age) * FT_TO_M, at, now))
+    }
+
+    /// Roughly where an aircraft is, for the altitude model (whose field is
+    /// smooth over ~100 km): its track, its last fix, else the centroid of
+    /// the receivers that heard it.
+    fn rough_position(ac: &Aircraft, meas: &[Meas], t: f64) -> Llh {
+        if let Some(tr) = ac.track.as_ref().filter(|tr| t - tr.last_update() < 60.0) {
+            return ecef_to_llh(tr.predict(t).0);
+        }
+        if let Some((p, _)) = ac.last_fix.filter(|&(_, ft)| t - ft < 120.0) {
+            return ecef_to_llh(p);
+        }
+        let n = meas.len().max(1) as f64;
+        ecef_to_llh(meas.iter().fold([0.0; 3], |s, m| [s[0] + m.rx[0] / n, s[1] + m.rx[1] / n, s[2] + m.rx[2] / n]))
     }
 
     fn process_group(&mut self, mk: MsgKey, g: Group, now: f64) {
@@ -895,7 +1059,8 @@ impl Engine {
             let t_wall = g.first_wall + (normd.t[cl[0]] - t_first);
             let (meas, cov) = sub_problem(&normd, &cl, &copies, &nodes);
             let ac = self.aircraft.get(&d.address).unwrap();
-            let alt = self.altitude_for(ac, d.altitude_ft, now);
+            let at = Self::rough_position(ac, &meas, t_wall);
+            let alt = self.altitude_for(d.address, ac, d.altitude_ft, now, at);
             let used_keys: Vec<RxKey> = cl.iter().map(|&i| keys[copies[normd.copies[i]].node]).collect();
             let sites = distinct_sites(&meas);
             let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped, sites };
@@ -1214,8 +1379,9 @@ impl Engine {
             // Mode A reading (free altitude, 4+ receivers).
             let mut candidates: Vec<(Fix, bool)> = Vec::new();
             let centroid = self.guesses(None, &meas, None, t);
+            let at = ecef_to_llh(centroid[0]);
             if let Some(ft) = mac.altitude_ft {
-                let alt = Some((ft as f64 * FT_TO_M, 100.0));
+                let alt = Some(self.geo_constraint(None, ft, 100.0, at, now));
                 let mut gs = centroid.clone();
                 gs[0] = {
                     let mut l = ecef_to_llh(gs[0]);
@@ -1261,7 +1427,7 @@ impl Engine {
             }
             if let Some((icao, mode_c)) = assoc {
                 self.stats.modeac_assoc.fetch_add(1, Ordering::Relaxed);
-                let alt = if mode_c { mac.altitude_ft.map(|ft| (ft as f64 * FT_TO_M, 100.0)) } else { None };
+                let alt = if mode_c { mac.altitude_ft.map(|ft| self.geo_constraint(None, ft, 100.0, at, now)) } else { None };
                 let ac = self.aircraft.get_mut(&icao).unwrap();
                 if let Some(tr) = ac.track.as_mut() {
                     if tr.update_tdoa(&meas, &cov, alt, t) == Gate::Accepted {
@@ -1320,7 +1486,7 @@ impl Engine {
     // ------------------------------------------------------------- holdout --
 
     fn process_holdout(&mut self, g: Group, now: f64) {
-        let Some((truth, alt_ft)) = g.truth else { return };
+        let Some((truth, alt_ft, icao)) = g.truth else { return };
         let (keys, nodes, copies) = self.build(&g);
         if keys.len() < 3 {
             return;
@@ -1334,7 +1500,8 @@ impl Engine {
             return;
         };
         let (meas, cov) = sub_problem(&normd, &cl, &copies, &nodes);
-        let alt = Some((alt_ft as f64 * FT_TO_M, 76.0));
+        // Like any multilaterated aircraft: corrected by OTHER aircraft only.
+        let alt = Some(self.geo_constraint(Some(icao), alt_ft, ALT_SIGMA_M, ecef_to_llh(truth), now));
         let guesses = self.guesses(None, &meas, alt, now);
         match solver::solve(&SolveInput { meas: &meas, cov: &cov, alt, guesses: &guesses }) {
             Some(f) => {
@@ -1402,25 +1569,25 @@ impl Engine {
         // Receiver health: a receiver most of whose converged pairs keep
         // rejecting observations has a wrong position or a broken clock; its
         // copies are kept out of multilateration until that changes.
-        let mut rate: HashMap<RxKey, (f64, u32, f64)> = HashMap::new();
+        let mut rate: HashMap<RxKey, (f64, u32, Vec<f64>)> = HashMap::new();
         for ((a, b), m) in &self.pairs {
             if m.updates < crate::clock::MIN_UPDATES {
                 continue;
             }
             for k in [a, b] {
-                let e = rate.entry(*k).or_insert((0.0, 0, 0.0));
+                let e = rate.entry(*k).or_insert((0.0, 0, Vec::new()));
                 e.0 += m.reject_rate;
                 e.1 += 1;
-                e.2 += m.noise_scale();
+                e.2.push(m.noise_scale());
             }
         }
         for (k, r) in self.rxs.iter_mut() {
-            let (sum, n, noise) = rate.get(k).copied().unwrap_or((0.0, 0, 0.0));
+            let (sum, n, noise) = rate.get(k).map(|e| (e.0, e.1, &e.2[..])).unwrap_or((0.0, 0, &[]));
             r.suspect = n >= 4 && sum / n as f64 > 0.35;
-            // A pair's noise mixes both receivers; averaged over all of a
-            // receiver's pairs it mostly reflects the receiver itself.
-            r.noise_scale = if n >= 3 { (noise / n as f64).max(1.0) } else { 1.0 };
+            // Quieter than nominal only as far as its own pairs back it.
+            r.noise_scale = receiver_noise_scale(noise);
         }
+        self.alt_model.expire(now);
         // Tracks.
         self.aircraft.retain(|_, a| {
             if let Some(tr) = &a.track {
@@ -1479,6 +1646,8 @@ impl Engine {
         s.receivers = self.rxs.len();
         s.coverage_maps = self.coverage.receivers();
         s.coverage_samples = self.coverage.samples;
+        s.alt_model_cells = self.alt_model.cells();
+        s.alt_model_samples = self.alt_model.samples();
         s.receivers_suspect = self.rxs.values().filter(|r| r.suspect).count();
         s.pairs = self.pairs.len();
         s.pairs_usable = self.pairs.values().filter(|m| m.usable(now)).count();
@@ -1558,4 +1727,99 @@ pub(crate) fn fxhash(b: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ClockType;
+
+    fn engine() -> Engine {
+        let (out, _) = broadcast::channel(16);
+        Engine::new(EngineConfig { shadow: true, mlat_delay: 1.0, holdout_every: 0 }, Arc::new(Stats::default()), out)
+    }
+
+    fn add_rx(e: &mut Engine, conn: ConnId, lon: f64) -> RxKey {
+        let (tx, _) = mpsc::channel(1);
+        let info = ReceiverInfo {
+            user: format!("rx{conn}"),
+            uuid: None,
+            lat: 45.0,
+            lon,
+            alt: 100.0,
+            clock: ClockType::Dump1090,
+            privacy: false,
+            source_ip: "test".into(),
+            client_version: "test".into(),
+            compress: "none",
+        };
+        e.connect(conn, info, tx, 0.0);
+        e.rx_by_conn[&conn]
+    }
+
+    /// A converged pair between a and b for clock offsets (s_x = tau + off_x).
+    fn add_pair(e: &mut Engine, a: RxKey, b: RxKey, off: &HashMap<RxKey, f64>, now: f64) {
+        let pk = pair_key(a, b);
+        let mut m = PairModel::new(ClockType::Dump1090, ClockType::Dump1090, 0);
+        for i in 0..20 {
+            let tau = 1000.0 + i as f64;
+            m.observe(tau + off[&pk.0], off[&pk.1] - off[&pk.0], now - 10.0 + i as f64 * 0.5);
+        }
+        e.pairs.insert(pk, m);
+        e.rxs.get_mut(&a).unwrap().peers.insert(b);
+        e.rxs.get_mut(&b).unwrap().peers.insert(a);
+    }
+
+    #[test]
+    fn own_geo_baro_corrects_sync_references_but_never_its_own_constraint() {
+        let mut e = engine();
+        let now = 100.0;
+        let at = Llh { lat: 45.2, lon: 9.2, alt: 0.0 };
+        // Aircraft 1 broadcasts +1000 ft and is the only sample in the region.
+        e.aircraft.entry(1).or_default().geo_baro = Some((1000.0, now));
+        e.alt_model.insert(1, 45.2, 9.2, 35_000.0, 1000.0, now);
+        // Its sync references use its own difference...
+        let own = e.sync_geo_m(1, at.lat, at.lon, 35_000, now).unwrap();
+        assert!((own - 1000.0 * FT_TO_M).abs() < 1e-9);
+        // ...its multilateration constraint does not: no other aircraft, so
+        // barometric with the wide fallback sigma.
+        let (h, sigma) = e.geo_constraint(Some(1), 35_000, ALT_SIGMA_M, at, now);
+        assert!((h - 35_000.0 * FT_TO_M).abs() < 1e-9);
+        assert!(sigma > 300.0, "{sigma}");
+        // Four other aircraft saying +600 ft: corrected by theirs alone.
+        for k in 2..6u32 {
+            e.alt_model.insert(k, 45.2 + 0.05 * k as f64, 9.2, 35_000.0, 600.0, now);
+        }
+        let (h, sigma) = e.geo_constraint(Some(1), 35_000, ALT_SIGMA_M, at, now);
+        assert!((h - (35_000.0 + 600.0) * FT_TO_M).abs() < 1.0, "{}", h / FT_TO_M);
+        assert!(sigma < 100.0, "{sigma}");
+        assert_eq!(e.stats.alt_geo_fallback.load(Ordering::Relaxed), 1);
+        assert_eq!(e.stats.alt_geo_corrected.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn bridges_only_when_the_group_is_disconnected() {
+        let mut e = engine();
+        let now = 50.0;
+        let (a, b, c) = (add_rx(&mut e, 1, 9.0), add_rx(&mut e, 2, 9.3), add_rx(&mut e, 3, 9.6));
+        let off: HashMap<RxKey, f64> = [(a, 0.0), (b, 1234.5), (c, -77.25)].into_iter().collect();
+        // a and b heard it; they share no pair, but both have one with c.
+        add_pair(&mut e, a, c, &off, now);
+        add_pair(&mut e, b, c, &off, now);
+        let tau = 1015.0;
+        let g = Group { first_wall: now, copies: vec![(a, tau + off[&a]), (b, tau + off[&b])], truth: None };
+        let (keys, nodes, copies) = e.build(&g);
+        let n = e.normalize(&keys, &nodes, &copies, now).expect("bridged through c");
+        assert_eq!(n.copies.len(), 2);
+        assert!((n.t[0] - n.t[1]).abs() < 1e-6, "{:?}", n.t);
+        assert_eq!(e.stats.groups_bridged.load(Ordering::Relaxed), 1);
+        assert_eq!(e.stats.bridge_receivers.load(Ordering::Relaxed), 1);
+        assert_eq!(e.stats.bridged_copies.load(Ordering::Relaxed), 1);
+        // Once a and b have their own pair the group is connected: no bridge.
+        add_pair(&mut e, a, b, &off, now);
+        let n = e.normalize(&keys, &nodes, &copies, now).unwrap();
+        assert_eq!(n.copies.len(), 2);
+        assert_eq!(n.edges, 1, "only the direct edge");
+        assert_eq!(e.stats.groups_bridged.load(Ordering::Relaxed), 1);
+    }
 }

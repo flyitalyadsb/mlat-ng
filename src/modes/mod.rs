@@ -178,6 +178,25 @@ fn decode_es(d: &mut Decoded, me: &[u8]) {
     d.es = Some(es);
 }
 
+/// Geometric minus barometric altitude (ft) from a DF17/18 airborne velocity
+/// message (TC 19, subtypes 1-4): ME bits 49-56, i.e. frame byte 10, a sign
+/// bit (set = geometric below baro) and (value - 1) x 25 ft; 0 = no data.
+/// The geometric altitude is the GNSS height above the WGS84 ellipsoid
+/// (DO-260A/B). None for anything else; checks the CRC itself.
+pub fn es_geo_minus_baro_ft(f: &[u8]) -> Option<i32> {
+    if f.len() != 14 || !matches!(f[0] >> 3, 17 | 18) || crc_residual(f) != 0 {
+        return None;
+    }
+    if f[4] >> 3 != 19 || !(1..=4).contains(&(f[4] & 7)) {
+        return None;
+    }
+    let v = i32::from(f[10] & 0x7f);
+    if v == 0 {
+        return None;
+    }
+    Some(if f[10] & 0x80 != 0 { -(v - 1) * 25 } else { (v - 1) * 25 })
+}
+
 /// mlat-server's 6-bit character set. Index 0 maps to a space (not the usual
 /// '#') and every unassigned code to '?', so the Comm-B filter can spot them.
 const AIS_CHARSET: &[u8; 64] = b" ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????";

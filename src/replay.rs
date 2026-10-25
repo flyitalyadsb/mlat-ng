@@ -327,6 +327,11 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             "commb_vel_offered": l(&stats.commb_vel_offered), "commb_vel_accepted": l(&stats.commb_vel_accepted),
             "holdout": {"n": snap.holdout_n, "p50_m": snap.holdout_p50.round(), "p90_m": snap.holdout_p90.round()},
             "coverage_maps": snap.coverage_maps, "coverage_samples": snap.coverage_samples,
+            "alt_model": {"cells": snap.alt_model_cells, "samples": snap.alt_model_samples,
+                "corrected": l(&stats.alt_geo_corrected), "fallback": l(&stats.alt_geo_fallback),
+                "sync_refs_geometric": l(&stats.sync_refs_geometric)},
+            "bridging": {"groups": l(&stats.groups_bridged), "receivers": l(&stats.bridge_receivers),
+                "copies_gained": l(&stats.bridged_copies)},
         },
         "bench": {
             "fix_error": quantiles(fix_errs),

@@ -9,6 +9,25 @@
 //! out noise, an inconsistent edge shows up as a large residual and is dropped,
 //! and the solution comes with its covariance, which the solver uses in full:
 //! corrections that share edges have correlated errors.
+//!
+//! Bridges. Receivers whose own clock pairs do not connect them to the rest
+//! of the group used to be dropped: on a 60 s capture (2026-10-25) that was
+//! 14% of all receiver copies, 41% of the 2-receiver groups (the typical
+//! Mode-S-only aircraft) and a quarter of the 4-5 receiver groups fell below
+//! the 4 a fix needs. The graph extends beyond the group, so the engine may
+//! add up to two receivers that did NOT hear the transmission but hold usable
+//! pairs with members in different components (`choose_bridges`): nodes
+//! without copies that only carry clock offsets (2-hop paths). Only when the
+//! group's own graph is disconnected: offered to every group, bridges made
+//! even the already-connected ones worse (matched fixes p50 85 -> 90 m),
+//! because each pair model carries its own small biases (receiver position,
+//! reference geometry) that a direct edge shares with the measurement and a
+//! 2-hop path does not; their predicted variances do not include them. As a
+//! last resort for disconnected groups they recovered +3% fixes and +8.6%
+//! Mode-S-only aircraft on a 10-minute capture, accuracy unchanged.
+
+use std::collections::HashMap;
+use std::hash::Hash;
 
 use nalgebra::DMatrix;
 
@@ -97,15 +116,24 @@ pub fn normalize(
         }
     }
     let mut dropped = 0;
+    // Nodes that heard the transmission: bridge nodes (no copies) must not
+    // make a component look bigger than it is.
+    let mut has_copy = vec![false; n];
+    for c in copies {
+        has_copy[c.node] = true;
+    }
     loop {
         if edges.is_empty() {
             return None;
         }
-        // Largest connected component of the usable-pair graph.
+        // Largest connected component of the usable-pair graph, counted in
+        // nodes that heard the transmission.
         let comp = components(n, &edges);
         let mut size = vec![0usize; n];
-        for &c in &comp {
-            size[c] += 1;
+        for (x, &c) in comp.iter().enumerate() {
+            if has_copy[x] {
+                size[c] += 1;
+            }
         }
         let best = (0..n).max_by_key(|&c| size[c]).unwrap();
         if size[best] < 2 {
@@ -201,6 +229,43 @@ pub fn normalize(
         }
         return Some(Normalized { copies: sel, t, cov, edges: used.len(), dropped });
     }
+}
+
+/// Bridge receivers for a group whose own clock graph is disconnected.
+///
+/// `comp[i]` is the component of member i in the members' own usable-pair
+/// graph; `links` are usable pairs (candidate, member index) with receivers
+/// outside the group. Empty when the members are already connected. Else up
+/// to `max` candidates that join at least two different components, those
+/// joining the most first (then by key, for determinism).
+pub fn choose_bridges<K: std::marker::Copy + Ord + Hash>(comp: &[usize], links: impl IntoIterator<Item = (K, usize)>, max: usize) -> Vec<K> {
+    if max == 0 || comp.iter().all(|&c| c == comp[0]) {
+        return Vec::new();
+    }
+    let mut joined: HashMap<K, Vec<usize>> = HashMap::new();
+    for (k, member) in links {
+        let Some(&c) = comp.get(member) else { continue };
+        let v = joined.entry(k).or_default();
+        if !v.contains(&c) {
+            v.push(c);
+        }
+    }
+    let mut c: Vec<(K, usize)> = joined.into_iter().map(|(k, v)| (k, v.len())).filter(|&(_, n)| n >= 2).collect();
+    c.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    c.into_iter().take(max).map(|(k, _)| k).collect()
+}
+
+/// Components of `n` members under the edges for which `linked(i, j)`.
+pub fn member_components(n: usize, mut linked: impl FnMut(usize, usize) -> bool) -> Vec<usize> {
+    let mut edges = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if linked(i, j) {
+                edges.push(Edge { i, j, theta: 0.0, var: 1.0 });
+            }
+        }
+    }
+    components(n, &edges)
 }
 
 /// Split normalised copies into clusters that can be the same transmission.
@@ -305,6 +370,44 @@ mod tests {
         // 0-1-2 connected, 3 isolated
         let n = normalize(&nodes, &copies, |i, j| if j < 3 { Some((0.0, 1e-13)) } else { None }).unwrap();
         assert_eq!(n.copies, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bridges_only_for_disconnected_groups() {
+        // Connected (one component): never, whatever the candidates.
+        assert!(choose_bridges(&[0, 0, 0], [(10u64, 0), (10, 1), (11, 2)], 2).is_empty());
+        // Two components {0,1} and {2}: a receiver linked to both is chosen,
+        // one linked to a single component is not.
+        let comp = member_components(3, |i, j| (i, j) == (0, 1));
+        assert_ne!(comp[0], comp[2]);
+        let b = choose_bridges(&comp, [(20u64, 0), (20, 2), (21, 0), (21, 1), (22, 1), (22, 2)], 2);
+        assert_eq!(b, vec![20, 22]);
+        // At most `max`, the one joining most components first.
+        let comp = vec![0, 1, 2];
+        let b = choose_bridges(&comp, [(5u64, 0), (5, 1), (6, 0), (6, 1), (6, 2), (7, 1), (7, 2)], 1);
+        assert_eq!(b, vec![6]);
+    }
+
+    #[test]
+    fn a_bridge_node_joins_copies_but_does_not_count_as_one() {
+        // Nodes 0 and 1 heard it but share no pair; node 2 (a bridge, no
+        // copy) has pairs with both. Corrections: c = [0, 1.0, 0.5].
+        let c = [0.0, 1.0, 0.5];
+        let nodes: Vec<Node> = (0..3).map(|i| node(45.0, 9.0 + i as f64 * 0.2)).collect();
+        let copies = vec![Copy { node: 0, s: 10.0 - c[0] }, Copy { node: 1, s: 10.0 - c[1] }];
+        let n = normalize(&nodes, &copies, |i, j| if (i, j) == (0, 1) { None } else { Some((c[i] - c[j], 1e-14)) }).unwrap();
+        assert_eq!(n.copies, vec![0, 1]);
+        assert!((n.t[0] - n.t[1]).abs() < 1e-9, "{:?}", n.t);
+        // Without the bridge the two cannot be normalised together.
+        let alone = normalize(&nodes[..2], &copies, |_, _| None);
+        assert!(alone.is_none());
+        // A component of bridges with a single member never wins over two
+        // members: members 0, 1 linked; member 2 linked to bridges 3, 4.
+        let nodes: Vec<Node> = (0..5).map(|i| node(45.0, 9.0 + i as f64 * 0.2)).collect();
+        let copies: Vec<Copy> = (0..3).map(|i| Copy { node: i, s: 1.0 }).collect();
+        let linked = |i: usize, j: usize| matches!((i, j), (0, 1) | (2, 3) | (2, 4) | (3, 4));
+        let n = normalize(&nodes, &copies, |i, j| linked(i, j).then_some((0.0, 1e-14))).unwrap();
+        assert_eq!(n.copies, vec![0, 1]);
     }
 
     #[test]

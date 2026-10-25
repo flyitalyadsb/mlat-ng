@@ -44,6 +44,7 @@ fn shape(evs: &[Event]) -> Vec<(&'static str, ConnId)> {
             Event::ClockReset { conn, .. } => ("reset", *conn),
             Event::PositionUpdate { conn, .. } => ("position", *conn),
             Event::RateReport { conn, .. } => ("rates", *conn),
+            Event::GeoBaro { .. } => ("geo_baro", 0),
         })
         .collect()
 }

@@ -301,7 +301,7 @@ impl Coverage {
     pub fn map_json(&self, id: CovId, now: f64) -> Option<serde_json::Value> {
         let m = self.maps.get(&id)?;
         let f = m.decay_factor(now);
-        let r1 = |x: f32| (x * 10.0).round() / 10.0;
+        let r1 = |x: f32| (x as f64 * 10.0).round() / 10.0;
         let mut bins = Vec::new();
         let mut samples = 0.0f32;
         for s in 0..SECTORS {
@@ -328,7 +328,7 @@ impl Coverage {
             "bands_m": BANDS_M.iter().enumerate().map(|(i, lo)| {
                 [*lo, BANDS_M.get(i + 1).copied().unwrap_or(13_000.0)]
             }).collect::<Vec<_>>(),
-            "samples": samples.round(),
+            "samples": (samples as f64).round(),
             "bins": bins,
             "today": today,
             "yesterday": yesterday,

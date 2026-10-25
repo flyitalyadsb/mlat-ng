@@ -115,3 +115,127 @@ fn save_and_load_round_trip() {
     assert!(d.near(la, lo).is_empty(), "loaded maps wait for their receivers to be placed");
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn daily_facts_follow_what_each_receiver_heard() {
+    let c = trained();
+    let r1 = &c.maps[&1].today;
+    // Receiver 1 hears up to 140 km (the 10 km grid below 150 km).
+    assert!((r1.far_m - 140_000.0).abs() < 2_000.0, "{}", r1.far_m);
+    assert_eq!(r1.far_alt_m, 10_000.0);
+    assert_eq!(r1.day, day_of(NOW));
+    // Nobody else hears that close to receiver 1: every one is its alone.
+    assert_eq!(r1.unique, 14 * 24);
+    assert_eq!(r1.heard, 14 * 24);
+    assert!(r1.samples > r1.heard, "it also counts the ones it missed");
+    let r2 = &c.maps[&2].today;
+    assert!(r2.far_m < 100_000.0 && r2.far_m > 0.0, "{}", r2.far_m);
+}
+
+#[test]
+fn an_aircraft_counts_once_a_day_as_unique() {
+    let mut c = Coverage::default();
+    c.place(1, 45.0, 9.0, NOW);
+    let (la, lo) = at(50.0, 90.0);
+    c.observe(7, la, lo, 3000.0, NOW, |_| true);
+    c.observe(7, la, lo, 3000.0, NOW + 10.0, |_| true);
+    assert_eq!(c.maps[&1].today.unique, 1);
+    c.place(2, 45.1, 9.0, NOW);
+    c.observe(8, la, lo, 3000.0, NOW + 20.0, |_| true);
+    assert_eq!(c.maps[&1].today.unique, 1, "heard by two receivers: nobody's alone");
+    assert_eq!(c.maps[&2].today.unique, 0);
+    // The farthest one points the right way (east).
+    assert!((c.maps[&1].today.far_az - 90.0).abs() < 1.0, "{}", c.maps[&1].today.far_az);
+}
+
+#[test]
+fn a_new_day_moves_today_to_yesterday() {
+    let mut c = trained();
+    c.count_fix(1, NOW);
+    let before = c.maps[&1].today.clone();
+    assert_eq!(before.fixes, 1);
+    let next = (day_of(NOW) + 1) as f64 * 86_400.0 + 60.0;
+    // Read before anything reaches the map after midnight: already shifted.
+    let v = c.map_json(1, next).unwrap();
+    assert_eq!(v["today"]["fixes"], 0);
+    assert_eq!(v["yesterday"]["fixes"], 1);
+    let (la, lo) = at(50.0, 0.0);
+    c.observe(99_999, la, lo, 10_000.0, next, |id| id == 1);
+    assert_eq!(c.maps[&1].yesterday, before);
+    assert_eq!(c.maps[&1].today.day, day_of(NOW) + 1);
+    assert_eq!(c.maps[&1].today.unique, 1, "unique starts over");
+    // Two days later, yesterday was a day without data.
+    c.count_fix(1, next + 2.0 * 86_400.0);
+    assert_eq!(c.maps[&1].yesterday, DayStats::default());
+    assert_eq!(c.maps[&1].today.fixes, 1);
+}
+
+#[test]
+fn map_json_has_bins_and_facts_but_no_position() {
+    let mut c = trained();
+    c.name(1, "uuid:0123456789abcdef");
+    let v = c.map_json(1, NOW + 100.0).unwrap();
+    assert_eq!(v["who"], "uuid:0123456789abcdef");
+    assert_eq!(v["placed"], true);
+    assert!(v.get("lat").is_none() && v.get("lon").is_none());
+    let bins = v["bins"].as_array().unwrap();
+    assert!(!bins.is_empty());
+    for b in bins {
+        let b = b.as_array().unwrap();
+        assert_eq!(b.len(), 5);
+        assert!(b[3].as_f64().unwrap() >= 0.5);
+        assert!(b[4].as_f64().unwrap() <= b[3].as_f64().unwrap() + 1e-6);
+    }
+    // Cruise band (b = 4), sector 0, ring 2 (50-75 km north): heard.
+    assert!(bins.iter().any(|b| b[0] == 0 && b[1] == 4 && b[2] == 2 && b[4].as_f64().unwrap() > 0.0));
+    assert_eq!(v["bands_m"][4], serde_json::json!([9000.0, 13000.0]));
+    assert!(c.map_json(42, NOW).is_none());
+    // Half a day later the counts have decayed, without touching the map.
+    let w = c.map_json(1, NOW + 12.0 * 3600.0).unwrap();
+    assert!(w["samples"].as_f64().unwrap() < v["samples"].as_f64().unwrap() * 0.75);
+}
+
+#[test]
+fn summary_lists_named_maps_only() {
+    let mut c = trained();
+    c.name(2, "user:Example-1");
+    c.unplace(2);
+    let v = c.summary_json(NOW);
+    let rows = v["receivers"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["who"], "user:Example-1");
+    assert_eq!(rows[0]["placed"], false);
+    assert!(rows[0]["today"]["far_m"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn a_moved_antenna_keeps_its_name_and_day() {
+    let mut c = trained();
+    c.name(1, "user:x");
+    let today = c.maps[&1].today.clone();
+    c.place(1, 46.0, 9.0, NOW + 10.0);
+    assert_eq!(c.maps[&1].who, "user:x");
+    assert_eq!(c.maps[&1].today, today);
+    assert_eq!(c.maps[&1].present.iter().sum::<f32>(), 0.0, "but a fresh map");
+}
+
+#[test]
+fn save_and_load_keep_the_daily_facts() {
+    let mut c = trained();
+    c.name(1, "uuid:00000000000000aa");
+    c.count_fix(1, NOW);
+    let dir = std::env::temp_dir().join(format!("cov-test-days-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("coverage.json.gz");
+    c.save(path.to_str().unwrap()).unwrap();
+    let mut d = Coverage::load(path.to_str().unwrap()).unwrap();
+    assert_eq!(d.maps[&1].who, "uuid:00000000000000aa");
+    assert_eq!(d.maps[&1].today, c.maps[&1].today);
+    // An aircraft counted before the restart is not counted again.
+    d.place(1, 45.0, 9.0, NOW + 100.0);
+    let (la, lo) = at(10.0, 0.0);
+    let before = d.maps[&1].today.unique;
+    d.observe(1, la, lo, 10_000.0, NOW + 100.0, |_| true);
+    assert_eq!(d.maps[&1].today.unique, before);
+    std::fs::remove_dir_all(dir).ok();
+}

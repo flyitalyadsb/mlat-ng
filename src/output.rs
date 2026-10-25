@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::engine::{cov_id_of, CovQuery, CovWhat};
 
 /// Unix seconds -> ("YYYY/MM/DD", "HH:MM:SS.mmm"), UTC, as mlat-server writes.
 pub fn sbs_datetime(t: f64) -> (String, String) {
@@ -111,16 +113,56 @@ pub async fn sbs_server(listener: TcpListener, tx: broadcast::Sender<Arc<str>>) 
     }
 }
 
+/// `%XX` escapes in a path segment (user names may hold spaces and more).
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The coverage question a path asks, if any:
+///   /coverage/uuid/<uuid>     one receiver's map, by its UUID
+///   /coverage/user/<name>     one receiver's map, by its MLAT user name
+///                             (percent-encoded), for receivers without UUID
+///   /coverage/summary.json    every receiver's daily facts
+/// Internal only: the HTTP port is not exposed outside the cluster.
+pub fn coverage_route(path: &str) -> Option<CovWhat> {
+    let rest = path.strip_prefix("/coverage/")?;
+    if rest == "summary.json" {
+        return Some(CovWhat::Summary);
+    }
+    if let Some(u) = rest.strip_prefix("uuid/") {
+        let k = crate::relay::registry::key_of_uuid(&percent_decode(u)?)?;
+        return Some(CovWhat::Map(k));
+    }
+    let user = percent_decode(rest.strip_prefix("user/")?)?;
+    (!user.is_empty()).then(|| CovWhat::Map(cov_id_of(None, &user)))
+}
+
 /// Minimal HTTP/1.0 server: GET /metrics, /healthz, /state.json. The render
 /// callback is called per request on a worker thread (cheap: it formats
-/// counters that the engine publishes once a second).
+/// counters that the engine publishes once a second). /coverage/* is asked
+/// to the engine thread through `queries`, when given.
 pub async fn http_server(
     listener: TcpListener,
     render: Arc<dyn Fn(&str) -> Option<(&'static str, String)> + Send + Sync>,
+    queries: Option<mpsc::Sender<CovQuery>>,
 ) {
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
         let render = render.clone();
+        let queries = queries.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let n = match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
@@ -129,7 +171,11 @@ pub async fn http_server(
             };
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/").to_string();
-            let (status, ctype, body) = match render(&path) {
+            let answer = match (&queries, path.starts_with("/coverage/")) {
+                (Some(q), true) => ask_coverage(q, &path).await,
+                _ => render(&path),
+            };
+            let (status, ctype, body) = match answer {
                 Some((ct, b)) => ("200 OK", ct, b),
                 None => ("404 Not Found", "text/plain", "not found\n".to_string()),
             };
@@ -143,9 +189,35 @@ pub async fn http_server(
     }
 }
 
+async fn ask_coverage(q: &mpsc::Sender<CovQuery>, path: &str) -> Option<(&'static str, String)> {
+    let what = coverage_route(path)?;
+    let (tx, rx) = oneshot::channel();
+    q.send(CovQuery { what, reply: tx }).await.ok()?;
+    let body = tokio::time::timeout(Duration::from_secs(5), rx).await.ok()?.ok()??;
+    Some(("application/json", body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_routes() {
+        assert!(matches!(coverage_route("/coverage/summary.json"), Some(CovWhat::Summary)));
+        match coverage_route("/coverage/uuid/01234567-89ab-cdef-0123-456789abcdef") {
+            Some(CovWhat::Map(k)) => assert_eq!(k, 0x0123_4567_89ab_cdef),
+            _ => panic!("uuid route"),
+        }
+        match coverage_route("/coverage/user/My%20Station-1") {
+            Some(CovWhat::Map(k)) => assert_eq!(k, cov_id_of(None, "My Station-1")),
+            _ => panic!("user route"),
+        }
+        assert!(coverage_route("/coverage/uuid/not-a-uuid").is_none());
+        assert!(coverage_route("/coverage/user/").is_none());
+        assert!(coverage_route("/coverage/user/bad%zz").is_none());
+        assert!(coverage_route("/coverage/other").is_none());
+        assert!(coverage_route("/metrics").is_none());
+    }
 
     #[test]
     fn datetime_matches_known_epochs() {

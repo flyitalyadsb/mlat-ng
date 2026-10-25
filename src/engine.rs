@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nalgebra::DMatrix;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::altmodel::{self, AltModel};
 use crate::clock::{band_of, receiver_noise_scale, Outcome, PairModel, PAIR_BUDGET};
@@ -349,6 +349,8 @@ pub struct Engine {
     /// Where coverage maps are saved (and loaded from at start), if anywhere.
     coverage_file: Option<String>,
     coverage_saved: f64,
+    /// Coverage questions from the HTTP side, answered on this thread.
+    queries: Option<mpsc::Receiver<CovQuery>>,
     /// Regional geometric-minus-baro altitude model (altmodel.rs).
     alt_model: AltModel,
 }
@@ -356,10 +358,41 @@ pub struct Engine {
 /// A receiver's coverage identity: its UUID key (as the Beast feed keys it)
 /// when it has one, else a hash of its user name.
 fn cov_id(info: &ReceiverInfo) -> CovId {
-    info.uuid
-        .as_deref()
-        .and_then(crate::relay::registry::key_of_uuid)
-        .unwrap_or_else(|| fxhash(info.user.as_bytes()) | (1 << 63))
+    cov_id_of(info.uuid.as_deref(), &info.user)
+}
+
+pub fn cov_id_of(uuid: Option<&str>, user: &str) -> CovId {
+    uuid.and_then(crate::relay::registry::key_of_uuid).unwrap_or_else(|| fxhash(user.as_bytes()) | (1 << 63))
+}
+
+/// The same identity as the HTTP side names it: "uuid:<16 hex>" or
+/// "user:<name>".
+fn who_of(info: &ReceiverInfo) -> String {
+    match info.uuid.as_deref().and_then(crate::relay::registry::key_of_uuid) {
+        Some(k) => format!("uuid:{k:016x}"),
+        None => format!("user:{}", info.user),
+    }
+}
+
+/// A question about coverage maps from the HTTP side; the answer is the
+/// JSON body, or None for "no such map".
+pub struct CovQuery {
+    pub what: CovWhat,
+    pub reply: oneshot::Sender<Option<String>>,
+}
+
+pub enum CovWhat {
+    /// One receiver's map, by its coverage identity.
+    Map(CovId),
+    /// Every named map's daily facts.
+    Summary,
+}
+
+async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn pair_key(a: RxKey, b: RxKey) -> (RxKey, RxKey) {
@@ -398,6 +431,7 @@ impl Engine {
             rx_by_cov: HashMap::new(),
             coverage_file: None,
             coverage_saved: 0.0,
+            queries: None,
             alt_model: AltModel::default(),
         }
     }
@@ -421,6 +455,21 @@ impl Engine {
         self
     }
 
+    /// Answer coverage questions arriving on `rx` (see `CovQuery`).
+    pub fn with_queries(mut self, rx: mpsc::Receiver<CovQuery>) -> Engine {
+        self.queries = Some(rx);
+        self
+    }
+
+    fn answer(&self, q: CovQuery) {
+        let now = unix_now();
+        let body = match q.what {
+            CovWhat::Map(id) => self.coverage.map_json(id, now).map(|v| v.to_string()),
+            CovWhat::Summary => Some(self.coverage.summary_json(now).to_string()),
+        };
+        let _ = q.reply.send(body);
+    }
+
     /// Send positions of aircraft that also broadcast ADS-B to `bench`.
     pub fn with_bench_output(mut self, bench: broadcast::Sender<Arc<str>>) -> Engine {
         self.bench_out = Some(bench);
@@ -435,6 +484,7 @@ impl Engine {
         let mut last_tick = Instant::now();
         let mut last_second = Instant::now();
         let mut last_ten = Instant::now();
+        let mut queries = self.queries.take();
         loop {
             tokio::select! {
                 biased;
@@ -458,6 +508,7 @@ impl Engine {
                     Some(ev) => self.handle(ev),
                     None => return,
                 },
+                Some(q) = recv_opt(&mut queries) => self.answer(q),
             }
         }
     }
@@ -522,6 +573,7 @@ impl Engine {
         };
         let cov = cov_id(&r.info);
         self.coverage.place(cov, r.info.lat, r.info.lon, now);
+        self.coverage.name(cov, &who_of(&r.info));
         self.rx_by_cov.insert(cov, key);
         let mut r = r;
         r.cov = cov;
@@ -1226,7 +1278,18 @@ impl Engine {
                     r.used += 1;
                 }
             }
-            self.emit(icao, fix_used.as_ref(), n, t, now)
+            let p = self.emit(icao, fix_used.as_ref(), n, t, now);
+            // Credit the receivers with a position that reached the map
+            // (not the bench copies of ADS-B aircraft), for their page.
+            let to_map = self.bench_out.is_none() || self.aircraft.get(&icao).is_none_or(|ac| now - ac.last_adsb >= 30.0);
+            if p.is_some() && to_map {
+                for k in used {
+                    if let Some(c) = self.rxs.get(k).map(|r| r.cov) {
+                        self.coverage.count_fix(c, now);
+                    }
+                }
+            }
+            p
         } else {
             None
         };

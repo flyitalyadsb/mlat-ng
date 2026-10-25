@@ -137,6 +137,8 @@ fn main() -> anyhow::Result<()> {
     if !args.coverage_file.is_empty() {
         eng = eng.with_coverage_file(&args.coverage_file);
     }
+    let (q_tx, q_rx) = mpsc::channel(64);
+    eng = eng.with_queries(q_rx);
     let feed_cfg = (!cells.is_empty()).then(|| relay::FeedConfig {
         cells: cells.clone(),
         receivers_url: args.feed_receivers_url.clone(),
@@ -208,7 +210,7 @@ fn main() -> anyhow::Result<()> {
                 _ => None,
             }
         });
-        tokio::spawn(output::http_server(http_l, render));
+        tokio::spawn(output::http_server(http_l, render, Some(q_tx)));
 
         let cfg = Arc::new(proto::ListenConfig { shadow: args.shadow, motd: args.motd, source_url: args.source_url });
         tokio::select! {

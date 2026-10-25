@@ -20,8 +20,14 @@
 //! Maps are keyed by a stable receiver identity (UUID key, else the user
 //! name), not by connection, so they survive reconnects; they can be saved
 //! to and reloaded from a gzip'd JSON file.
+//!
+//! Each map also keeps a few daily facts for the receiver's own page
+//! (Lightcone): the farthest aircraft it heard, the aircraft only it heard,
+//! and the MLAT positions it helped publish, for today and yesterday (UTC).
+//! The HTTP side reads them, and the maps, through `map_json` and
+//! `summary_json`, which run on the engine thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +54,35 @@ const MIN_PRESENT: f32 = 4.0;
 /// Index cell size for finding receivers near a point, degrees.
 const INDEX_DEG: f64 = 2.0;
 
+/// One UTC day of a receiver's facts.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+pub struct DayStats {
+    /// Days since the epoch (UTC).
+    pub day: i64,
+    /// Farthest aircraft heard: distance, altitude (m), bearing (deg), when.
+    pub far_m: f32,
+    pub far_alt_m: f32,
+    pub far_az: f32,
+    pub far_t: f64,
+    /// Aircraft that no other placed receiver in range heard.
+    pub unique: u32,
+    /// MLAT positions published with this receiver's data.
+    pub fixes: u32,
+    /// Coverage samples counted ("present") and heard.
+    pub samples: u32,
+    pub heard: u32,
+}
+
+impl DayStats {
+    fn new(day: i64) -> DayStats {
+        DayStats { day, ..Default::default() }
+    }
+}
+
+fn day_of(t: f64) -> i64 {
+    (t / 86_400.0).floor() as i64
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Map {
     lat: f64,
@@ -55,11 +90,45 @@ struct Map {
     present: Vec<f32>,
     heard: Vec<f32>,
     decayed: f64,
+    /// Who this map belongs to, as the HTTP side asks for it:
+    /// "uuid:<16 hex>" or "user:<name>". Empty until the engine names it.
+    who: String,
+    today: DayStats,
+    yesterday: DayStats,
+    /// Aircraft already counted in `today.unique`.
+    unique_seen: HashSet<u32>,
 }
 
 impl Map {
     fn new(lat: f64, lon: f64, now: f64) -> Map {
-        Map { lat, lon, present: vec![0.0; CELLS], heard: vec![0.0; CELLS], decayed: now }
+        Map {
+            lat,
+            lon,
+            present: vec![0.0; CELLS],
+            heard: vec![0.0; CELLS],
+            decayed: now,
+            who: String::new(),
+            today: DayStats::new(day_of(now)),
+            yesterday: DayStats::default(),
+            unique_seen: HashSet::new(),
+        }
+    }
+
+    /// Start a new day if `now` is past the current one.
+    fn roll(&mut self, now: f64) {
+        let d = day_of(now);
+        if d != self.today.day {
+            self.yesterday = if d == self.today.day + 1 { std::mem::take(&mut self.today) } else { DayStats::default() };
+            self.today = DayStats::new(d);
+            self.unique_seen.clear();
+        }
+    }
+
+    /// The decay factor from the last applied decay to `now`, without
+    /// applying it (for readers).
+    fn decay_factor(&self, now: f64) -> f32 {
+        let dt = (now - self.decayed).max(0.0);
+        (-dt * std::f64::consts::LN_2 / HALF_LIFE).exp() as f32
     }
 
     fn decay(&mut self, now: f64) {
@@ -75,16 +144,21 @@ impl Map {
     }
 }
 
+/// Bearing from a receiver to a point, degrees in [0, 360).
+fn bearing(rlat: f64, rlon: f64, lat: f64, lon: f64) -> f64 {
+    let (p1, p2) = (rlat.to_radians(), lat.to_radians());
+    let dl = (lon - rlon).to_radians();
+    let az = (dl.sin() * p2.cos()).atan2(p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos()).to_degrees();
+    (az + 360.0) % 360.0
+}
+
 /// (sector, band, ring) of a point seen from a receiver; None beyond range.
 fn bin(rlat: f64, rlon: f64, lat: f64, lon: f64, alt_m: f64) -> Option<(usize, usize, usize, f64)> {
     let d = haversine_m(rlat, rlon, lat, lon);
     if !d.is_finite() || d >= MAX_RANGE_M {
         return None;
     }
-    let (p1, p2) = (rlat.to_radians(), lat.to_radians());
-    let dl = (lon - rlon).to_radians();
-    let az = (dl.sin() * p2.cos()).atan2(p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos()).to_degrees();
-    let sector = (((az + 360.0) % 360.0) / SECTOR_DEG) as usize % SECTORS;
+    let sector = (bearing(rlat, rlon, lat, lon) / SECTOR_DEG) as usize % SECTORS;
     let band = BANDS_M.iter().rposition(|b| alt_m >= *b).unwrap_or(0);
     Some((sector, band, (d / RING_M) as usize, d))
 }
@@ -109,12 +183,19 @@ fn cell_of(lat: f64, lon: f64) -> (i32, i32) {
 
 impl Coverage {
     /// A receiver is at (lat, lon) and can hear: index it (again, if moved).
-    /// A moved antenna starts a new map.
+    /// A moved antenna starts a new map (its name and daily facts carry over).
     pub fn place(&mut self, id: CovId, lat: f64, lon: f64, now: f64) {
         self.unplace(id);
         let moved = self.maps.get(&id).is_some_and(|m| haversine_m(m.lat, m.lon, lat, lon) > 500.0);
         if moved || !self.maps.contains_key(&id) {
-            self.maps.insert(id, Map::new(lat, lon, now));
+            let mut m = Map::new(lat, lon, now);
+            if let Some(old) = self.maps.remove(&id) {
+                m.who = old.who;
+                m.today = old.today;
+                m.yesterday = old.yesterday;
+                m.unique_seen = old.unique_seen;
+            }
+            self.maps.insert(id, m);
         }
         let c = cell_of(lat, lon);
         self.index.entry(c).or_default().push(id);
@@ -130,8 +211,25 @@ impl Coverage {
         }
     }
 
+    /// Record who a map belongs to (see `Map::who`).
+    pub fn name(&mut self, id: CovId, who: &str) {
+        if let Some(m) = self.maps.get_mut(&id) {
+            if m.who != who {
+                m.who = who.to_string();
+            }
+        }
+    }
+
     pub fn receivers(&self) -> usize {
         self.maps.len()
+    }
+
+    /// An MLAT position was published with this receiver's data.
+    pub fn count_fix(&mut self, id: CovId, now: f64) {
+        if let Some(m) = self.maps.get_mut(&id) {
+            m.roll(now);
+            m.today.fixes += 1;
+        }
     }
 
     /// Placed receivers within `MAX_RANGE_M` of a point.
@@ -163,19 +261,112 @@ impl Coverage {
             return false;
         }
         self.last_sample.insert(icao, now);
+        let mut heard_by: Option<CovId> = None;
+        let mut n_heard = 0usize;
         for id in self.near(lat, lon) {
             let m = self.maps.get_mut(&id).unwrap();
             m.decay(now);
-            if let Some((s, b, r, _)) = bin(m.lat, m.lon, lat, lon, alt_m) {
+            m.roll(now);
+            if let Some((s, b, r, d)) = bin(m.lat, m.lon, lat, lon, alt_m) {
                 let i = idx(s, b, r);
                 m.present[i] += 1.0;
+                m.today.samples += 1;
                 if heard(id) {
                     m.heard[i] += 1.0;
+                    m.today.heard += 1;
+                    n_heard += 1;
+                    heard_by = Some(id);
+                    if d as f32 > m.today.far_m {
+                        m.today.far_m = d as f32;
+                        m.today.far_alt_m = alt_m as f32;
+                        m.today.far_az = bearing(m.lat, m.lon, lat, lon) as f32;
+                        m.today.far_t = now;
+                    }
                 }
+            }
+        }
+        if let (1, Some(id)) = (n_heard, heard_by) {
+            let m = self.maps.get_mut(&id).unwrap();
+            if m.unique_seen.insert(icao) {
+                m.today.unique += 1;
             }
         }
         self.samples += 1;
         true
+    }
+
+    /// One map for the HTTP side: decayed bins with `present >= 0.5`
+    /// as [sector, band, ring, present, heard], and the daily facts.
+    /// Never the position.
+    pub fn map_json(&self, id: CovId, now: f64) -> Option<serde_json::Value> {
+        let m = self.maps.get(&id)?;
+        let f = m.decay_factor(now);
+        let r1 = |x: f32| (x as f64 * 10.0).round() / 10.0;
+        let mut bins = Vec::new();
+        let mut samples = 0.0f32;
+        for s in 0..SECTORS {
+            for b in 0..BANDS_M.len() {
+                for k in 0..RINGS {
+                    let i = idx(s, b, k);
+                    let (p, h) = (m.present[i] * f, m.heard[i] * f);
+                    samples += p;
+                    if p >= 0.5 {
+                        bins.push(serde_json::json!([s, b, k, r1(p), r1(h)]));
+                    }
+                }
+            }
+        }
+        let (today, yesterday) = self.days(m, now);
+        Some(serde_json::json!({
+            "id": format!("{id:016x}"),
+            "who": m.who,
+            "placed": self.placed.contains_key(&id),
+            "updated": now,
+            "half_life_h": HALF_LIFE / 3600.0,
+            "sector_deg": SECTOR_DEG,
+            "ring_km": RING_M / 1000.0,
+            "bands_m": BANDS_M.iter().enumerate().map(|(i, lo)| {
+                [*lo, BANDS_M.get(i + 1).copied().unwrap_or(13_000.0)]
+            }).collect::<Vec<_>>(),
+            "samples": (samples as f64).round(),
+            "bins": bins,
+            "today": today,
+            "yesterday": yesterday,
+        }))
+    }
+
+    /// Every named map's daily facts and whether it is placed now, for the
+    /// hourly snapshot that keeps records and uptime.
+    pub fn summary_json(&self, now: f64) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self
+            .maps
+            .iter()
+            .filter(|(_, m)| !m.who.is_empty())
+            .map(|(id, m)| {
+                let (today, yesterday) = self.days(m, now);
+                serde_json::json!({
+                    "id": format!("{id:016x}"),
+                    "who": m.who,
+                    "placed": self.placed.contains_key(id),
+                    "today": today,
+                    "yesterday": yesterday,
+                })
+            })
+            .collect();
+        serde_json::json!({"now": now, "receivers": rows})
+    }
+
+    /// Today's and yesterday's facts as of `now`, also for a map that has
+    /// not rolled over yet because nothing reached it since midnight.
+    fn days(&self, m: &Map, now: f64) -> (DayStats, DayStats) {
+        let d = day_of(now);
+        if m.today.day == d {
+            (m.today.clone(), m.yesterday.clone())
+        } else if m.today.day == d - 1 {
+            (DayStats::new(d), m.today.clone())
+        } else {
+            (DayStats::new(d), DayStats::default())
+        }
     }
 
     /// P(the receiver hears an aircraft at this point), or None without a
@@ -231,12 +422,16 @@ impl Coverage {
     /// Save every map (gzip'd JSON). Only non-empty bins are written.
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         #[derive(Serialize)]
-        struct Out {
+        struct Out<'a> {
             id: String,
             lat: f64,
             lon: f64,
             decayed: f64,
             bins: Vec<(u32, f32, f32)>,
+            who: &'a str,
+            today: &'a DayStats,
+            yesterday: &'a DayStats,
+            unique_seen: Vec<u32>,
         }
         let maps: Vec<Out> = self
             .maps
@@ -247,6 +442,10 @@ impl Coverage {
                 lon: m.lon,
                 decayed: m.decayed,
                 bins: (0..CELLS).filter(|&i| m.present[i] > 0.0).map(|i| (i as u32, m.present[i], m.heard[i])).collect(),
+                who: &m.who,
+                today: &m.today,
+                yesterday: &m.yesterday,
+                unique_seen: m.unique_seen.iter().copied().collect(),
             })
             .collect();
         let tmp = format!("{path}.tmp");
@@ -260,6 +459,8 @@ impl Coverage {
 
     /// Load maps saved by `save`; receivers are placed again when they connect.
     pub fn load(path: &str) -> anyhow::Result<Coverage> {
+        // The daily facts came later (2026-10-26): files from before have
+        // none, and load with empty ones.
         #[derive(Deserialize)]
         struct In {
             id: String,
@@ -267,6 +468,14 @@ impl Coverage {
             lon: f64,
             decayed: f64,
             bins: Vec<(u32, f32, f32)>,
+            #[serde(default)]
+            who: String,
+            #[serde(default)]
+            today: DayStats,
+            #[serde(default)]
+            yesterday: DayStats,
+            #[serde(default)]
+            unique_seen: Vec<u32>,
         }
         #[derive(Deserialize)]
         struct Doc {
@@ -279,6 +488,12 @@ impl Coverage {
         for m in doc.maps {
             let Ok(id) = u64::from_str_radix(&m.id, 16) else { continue };
             let mut map = Map::new(m.lat, m.lon, m.decayed);
+            map.who = m.who;
+            if m.today.day != 0 {
+                map.today = m.today;
+                map.yesterday = m.yesterday;
+                map.unique_seen = m.unique_seen.into_iter().collect();
+            }
             for (i, p, h) in m.bins {
                 if (i as usize) < CELLS {
                     map.present[i as usize] = p;

@@ -12,6 +12,8 @@
 #[cfg(test)]
 mod tests;
 
+pub mod commb;
+
 /// Downlink formats we decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EsKind {

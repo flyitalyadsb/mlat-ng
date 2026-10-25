@@ -261,6 +261,7 @@ pub fn render_metrics(o: &mut String, s: &FeedStats, service: &str) {
         ("feed_adapter_frames_total", l(&a.frames)),
         ("feed_frames_modeac_total", l(&a.frames_modeac)),
         ("feed_frames_zero_ts_total", l(&a.frames_zero_ts)),
+        ("feed_frames_magic_ts_total", l(&a.frames_magic_ts)),
         ("feed_frames_unmapped_total", l(&a.frames_unmapped)),
         ("feed_frames_not_live_total", l(&a.frames_not_live)),
         ("feed_sync_events_total", l(&a.ev_sync)),

@@ -283,15 +283,15 @@ fn a_live_receiver_that_turns_multi_clock_is_disconnected_then_retried() {
     live(&mut a, &[1], &mut evs);
     evs.clear();
     let t0 = 1_000_000 + 22 * 12_000_000u64;
-    // one restart: a reset, still live
-    a.on_frame(&frame(1, 5, &df11(0x3C0001)), 1022.0, &mut evs);
+    // one restart (counter back near zero, past the frame-start shift): a reset, still live
+    a.on_frame(&frame(1, 5_000, &df11(0x3C0001)), 1022.0, &mut evs);
     assert_eq!(kinds(&evs)[0], "reset");
     assert_eq!(ld(&st.clock_resets), 1);
     evs.clear();
     // then a second clock appears: jumps pile up
     for i in 0..4u64 {
         a.on_frame(&frame(1, t0 + i * 12_000_000, &df11(0x3C0001)), 1023.0 + i as f64, &mut evs);
-        a.on_frame(&frame(1, 5 + (i + 1) * 12_000_000, &df11(0x3C0001)), 1023.2 + i as f64, &mut evs);
+        a.on_frame(&frame(1, 5_000 + (i + 1) * 12_000_000, &df11(0x3C0001)), 1023.2 + i as f64, &mut evs);
     }
     assert!(kinds(&evs).contains(&"disconnect"), "{:?}", kinds(&evs));
     // the restart and the next jump each reset; the third makes it multi-clock: no reset storm
@@ -300,7 +300,7 @@ fn a_live_receiver_that_turns_multi_clock_is_disconnected_then_retried() {
     assert_eq!(ld(&st.receivers_multi_clock), 1);
     evs.clear();
     // the duplicate goes away; after 10 calm minutes and a probation it is back
-    let base = 5 + 5 * 12_000_000u64;
+    let base = 5_000 + 5 * 12_000_000u64;
     for s in 0..=640u64 {
         a.on_frame(&frame(1, base + s * 12_000_000, &df11(0x3C0001)), 1027.2 + s as f64, &mut evs);
     }
@@ -335,4 +335,41 @@ fn late_delivery_is_not_a_clock_jump() {
     assert_eq!(ld(&st.late_deliveries), 3);
     a.tick(wall, &mut evs);
     assert_eq!(ld(&st.receivers_live), 1);
+}
+
+#[test]
+fn readsb_marker_timestamps_are_not_clock_jumps() {
+    let (mut a, st) = adapter(AdapterConfig::default(), &[(1, ClockType::Dump1090)]);
+    let mut evs = Vec::new();
+    let ld = |x: &std::sync::atomic::AtomicU64| x.load(std::sync::atomic::Ordering::Relaxed);
+    live(&mut a, &[1], &mut evs);
+    evs.clear();
+    // A US feeder forwards UAT (and MLAT results) between its own frames,
+    // stamped with readsb's markers instead of a receive time.
+    for (i, ts) in [0xFF00_4D4C_4155u64, 0xFF00_4D4C_4154, 0xFF00_4D4C_4160, 0xFFFF_FFFF_FFFF].iter().enumerate() {
+        a.on_frame(&frame(1, *ts, &df11(0x3C0001)), 1022.0 + i as f64 * 0.1, &mut evs);
+        a.on_frame(&frame(1, 1_000_000 + (22 * 12_000_000) + i as u64 * 1_200_000, &df11(0x3C0001)), 1022.05 + i as f64 * 0.1, &mut evs);
+    }
+    a.tick(1023.0, &mut evs);
+    assert!(!kinds(&evs).contains(&"reset"), "{:?}", kinds(&evs));
+    assert!(!kinds(&evs).contains(&"disconnect"));
+    assert_eq!(ld(&st.clock_jumps), 0);
+    assert_eq!(ld(&st.frames_magic_ts), 4);
+    assert_eq!(ld(&st.receivers_live), 1);
+}
+
+#[test]
+fn mode_s_times_are_frame_start_like_mlat_client() {
+    let (mut a, _) = adapter(AdapterConfig::default(), &[(1, ClockType::Dump1090)]);
+    let mut evs = Vec::new();
+    live(&mut a, &[1], &mut evs);
+    evs.clear();
+    // A Mode-S-only aircraft's DF11 (no ADS-B anywhere): an Mlat event.
+    let ts = 1_000_000 + 22 * 12_000_000;
+    a.on_frame(&frame(1, ts, &df11(0x3C0002)), 1022.0, &mut evs);
+    let t = evs.iter().find_map(|e| match e {
+        Event::Mlat { t, .. } => Some(*t),
+        _ => None,
+    });
+    assert_eq!(t, Some((ts - 768) as f64), "{:?}", kinds(&evs));
 }

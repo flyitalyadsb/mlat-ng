@@ -51,6 +51,14 @@ const MULTI_CALM: f64 = 600.0;
 /// forward them in their Beast output. Read as times they look like clock
 /// jumps: on 2026-10-24 they were 23 of 48 "multi-clock" exclusions.
 const MAGIC_TS_MIN: u64 = 0xFF00_0000_0000;
+/// mlat-client reports Mode S frames at the START of the frame: readsb's
+/// 12 MHz timestamp minus 768 ticks (8 us preamble + 56 us; modes_reader.c).
+/// The feed carries readsb's own value. Alone, a shift common to every
+/// receiver cancels out; merged with the same feeder's mlat-client
+/// (src/hybrid.rs) the two must agree, or one receiver alternates between
+/// clocks 64 us (19 km) apart: on 2026-10-25 that made the hybrid's pair
+/// rejects 35x mlat-ng's and its holdout p90 31 km.
+const FRAME_START_TICKS: u64 = 768;
 
 #[derive(Debug, Clone)]
 pub struct AdapterConfig {
@@ -200,6 +208,17 @@ impl Adapter {
         }
         if f.ts >= MAGIC_TS_MIN {
             self.stats.frames_magic_ts.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let at_start;
+        let f = if f.kind == b'2' || f.kind == b'3' {
+            at_start = Frame { ts: f.ts.saturating_sub(FRAME_START_TICKS), ..*f };
+            &at_start
+        } else {
+            f
+        };
+        if f.ts == 0 {
+            self.stats.frames_zero_ts.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let twelve_mhz = match self.registry.get(&f.rid) {

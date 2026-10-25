@@ -11,6 +11,7 @@
 mod clock;
 mod engine;
 mod geo;
+mod hybrid;
 mod modes;
 mod norm;
 mod output;
@@ -83,6 +84,11 @@ struct Args {
     /// ADS-B); empty = they go to the main SBS output like any other.
     #[arg(long, default_value = "", env = "MLAT_NG_BENCH_SBS_LISTEN")]
     bench_sbs_listen: String,
+    /// Merge each feeder's mlat-client connection and its Beast feed receiver
+    /// into one engine receiver (src/hybrid.rs). Needs --feed; point
+    /// --feed-receivers-url at this instance's own /receivers.json.
+    #[arg(long, default_value_t = false, env = "MLAT_NG_HYBRID")]
+    hybrid: bool,
 }
 
 fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -133,6 +139,8 @@ fn main() -> anyhow::Result<()> {
         },
     });
     let feed_stats = feed_cfg.as_ref().map(|c| Arc::new(relay::FeedStats::new(c)));
+    anyhow::ensure!(!args.hybrid || feed_cfg.is_some(), "--hybrid needs --feed");
+    let hybrid_stats = args.hybrid.then(|| Arc::new(hybrid::RouterStats::default()));
     let engine_thread = std::thread::Builder::new().name("engine".into()).spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("engine runtime");
         rt.block_on(eng.run(ev_rx));
@@ -151,20 +159,33 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(bench_sbs = %args.bench_sbs_listen, "bench output listening");
             tokio::spawn(output::sbs_server(bench_l, bench_tx));
         }
+        // In hybrid mode both inputs go through the router; otherwise each
+        // writes to the engine directly.
+        let (client_tx, feed_tx) = match &hybrid_stats {
+            Some(hs) => {
+                let (ctx, crx) = mpsc::channel(args.queue);
+                let (ftx, frx) = mpsc::channel(args.queue);
+                tokio::spawn(hybrid::run(crx, frx, ev_tx.clone(), hs.clone()));
+                tracing::info!("hybrid input: mlat-client and feed merged per receiver");
+                (ctx, ftx)
+            }
+            None => (ev_tx.clone(), ev_tx.clone()),
+        };
         if let (Some(fc), Some(fs)) = (feed_cfg.clone(), feed_stats.clone()) {
             tracing::info!(cells = ?fc.cells, receivers = %fc.receivers_url, "feed input enabled");
-            tokio::spawn(relay::run(fc, fs, ev_tx.clone()));
+            tokio::spawn(relay::run(fc, fs, feed_tx));
         }
         let render_stats = stats.clone();
         let render_counters = counters.clone();
         let render_feed = feed_stats.clone();
+        let render_hybrid = hybrid_stats.clone();
         let service = args.service.clone();
         let render: Arc<dyn Fn(&str) -> Option<(&'static str, String)> + Send + Sync> = Arc::new(move |path: &str| {
             match path {
                 "/healthz" => Some(("text/plain", "ok\n".into())),
                 "/metrics" => Some((
                     "text/plain; version=0.0.4",
-                    render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref()),
+                    render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref(), render_hybrid.as_deref()),
                 )),
                 "/receivers.json" => Some(("application/json", render_stats.registry_json.lock().unwrap().clone())),
                 "/debug.json" => {
@@ -182,7 +203,7 @@ fn main() -> anyhow::Result<()> {
 
         let cfg = Arc::new(proto::ListenConfig { shadow: args.shadow, motd: args.motd, source_url: args.source_url });
         tokio::select! {
-            r = proto::serve(client_l, cfg, ev_tx, counters) => r,
+            r = proto::serve(client_l, cfg, client_tx, counters) => r,
             _ = tokio::signal::ctrl_c() => { tracing::info!("SIGINT"); Ok(()) }
             _ = sigterm() => { tracing::info!("SIGTERM"); Ok(()) }
         }
@@ -223,7 +244,13 @@ fn proc_self() -> (f64, f64) {
     (cpu, rss)
 }
 
-fn render_metrics(s: &engine::Stats, c: &proto::Counters, service: &str, feed: Option<&relay::FeedStats>) -> String {
+fn render_metrics(
+    s: &engine::Stats,
+    c: &proto::Counters,
+    service: &str,
+    feed: Option<&relay::FeedStats>,
+    hybrid: Option<&hybrid::RouterStats>,
+) -> String {
     let mut o = String::with_capacity(4096);
     let mut m = |name: &str, kind: &str, v: f64| {
         let _ = writeln!(o, "# TYPE mlat_ng_{name} {kind}\nmlat_ng_{name} {v}");
@@ -315,6 +342,9 @@ fn render_metrics(s: &engine::Stats, c: &proto::Counters, service: &str, feed: O
     let _ = writeln!(o, "nesso_useful_work_max_age_seconds{{service=\"{service}\",work=\"positions\"}} 300");
     if let Some(f) = feed {
         relay::render_metrics(&mut o, f, service);
+    }
+    if let Some(h) = hybrid {
+        hybrid::render_metrics(&mut o, h);
     }
     o
 }

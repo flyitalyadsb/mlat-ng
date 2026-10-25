@@ -21,7 +21,8 @@ use flate2::read::GzDecoder;
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use crate::engine::{Engine, EngineConfig, Stats};
+use crate::engine::{fxhash, Engine, EngineConfig, Stats};
+use crate::hybrid::{Router, RouterStats, Src};
 use crate::relay::adapter::{Adapter, AdapterConfig, AdapterStats};
 use crate::relay::beast::{Frame, Parser};
 use crate::relay::registry;
@@ -53,6 +54,15 @@ pub struct ReplayArgs {
     /// Write every Mode-S-only (main output) SBS line here.
     #[arg(long)]
     dump_sbs: Option<String>,
+    /// Hybrid test: this share of receivers (by id hash) also gets a stand-in
+    /// mlat-client (a second adapter on its frames) through the hybrid router.
+    #[arg(long, default_value_t = 0.0)]
+    hybrid_clients: f64,
+    /// dup: those receivers on both inputs; split: only via the stand-in
+    /// client (their feed frames withheld); drop: on neither (the baseline
+    /// for what the client path brings back).
+    #[arg(long, default_value = "dup")]
+    hybrid_mode: String,
 }
 
 struct Counting<R> {
@@ -148,9 +158,23 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         probation: a.probation,
         ..AdapterConfig::default()
     };
-    let mut ad = Adapter::new(acfg, astats.clone());
+    let mut ad = Adapter::new(acfg.clone(), astats.clone());
     let mut evs = Vec::new();
-    ad.set_registry(reg, &mut evs);
+    ad.set_registry(reg.clone(), &mut evs);
+    // Hybrid test: stand-in mlat-clients for a share of receivers.
+    anyhow::ensure!(["dup", "split", "drop"].contains(&a.hybrid_mode.as_str()), "--hybrid-mode: dup|split|drop");
+    let hyb = a.hybrid_clients > 0.0;
+    let in_clients = |rid: u64| fxhash(&rid.to_be_bytes()) % 1000 < (a.hybrid_clients * 1000.0) as u64;
+    let feed_takes = |rid: u64| !hyb || a.hybrid_mode == "dup" || !in_clients(rid);
+    let emu_on = hyb && a.hybrid_mode != "drop";
+    let emu_stats = Arc::new(AdapterStats::default());
+    let mut emu = Adapter::new(acfg, emu_stats.clone()).with_conn_base(1 << 61);
+    let mut emu_evs = Vec::new();
+    emu.set_registry(reg, &mut emu_evs);
+    let rstats = Arc::new(RouterStats::default());
+    let mut router = Router::new(rstats.clone());
+    let mut routed: Vec<crate::types::Event> = Vec::new();
+    let mut client_rids = HashSet::new();
 
     let (mut main_lines, mut bench_lines) = (0usize, 0usize);
     let (mut main_ac, mut bench_ac) = (HashSet::new(), HashSet::new());
@@ -192,10 +216,25 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             }
             if next_tick >= next_second {
                 ad.tick(next_tick, &mut evs);
+                if emu_on {
+                    emu.tick(next_tick, &mut emu_evs);
+                }
                 next_second += 1.0;
                 drain(&mut out_rx, &mut bench_rx);
             }
             for ev in evs.drain(..) {
+                // Without stand-in clients the router stays out of the way:
+                // the baseline is exactly the production feed path.
+                if hyb {
+                    router.on_event(Src::Feed, ev, &mut routed);
+                } else {
+                    routed.push(ev);
+                }
+            }
+            for ev in emu_evs.drain(..) {
+                router.on_event(Src::Client, ev, &mut routed);
+            }
+            for ev in routed.drain(..) {
                 events += 1;
                 eng.handle_at(ev, next_tick);
             }
@@ -203,9 +242,25 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         }
         for f in &chunk {
             frames += 1;
-            ad.on_frame(f, wall, &mut evs);
+            if feed_takes(f.rid) {
+                ad.on_frame(f, wall, &mut evs);
+            }
+            if emu_on && in_clients(f.rid) {
+                client_rids.insert(f.rid);
+                emu.on_frame(f, wall, &mut emu_evs);
+            }
         }
         for ev in evs.drain(..) {
+            if hyb {
+                router.on_event(Src::Feed, ev, &mut routed);
+            } else {
+                routed.push(ev);
+            }
+        }
+        for ev in emu_evs.drain(..) {
+            router.on_event(Src::Client, ev, &mut routed);
+        }
+        for ev in routed.drain(..) {
             events += 1;
             eng.handle_at(ev, wall);
         }
@@ -272,6 +327,13 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             "positions": bench_lines, "aircraft": bench_ac.len(),
         },
         "modes_only": {"positions": main_lines, "aircraft": main_ac.len()},
+        "hybrid": {
+            "clients_share": a.hybrid_clients, "mode": a.hybrid_mode, "client_receivers": client_rids.len(),
+            "stand_in_clients_live": l(&emu_stats.receivers_live),
+            "merged": l(&rstats.merged), "owner_client": l(&rstats.owner_client), "owner_feed": l(&rstats.owner_feed),
+            "remapped": l(&rstats.remapped), "dup_mlat": l(&rstats.dup_mlat), "dup_sync": l(&rstats.dup_sync),
+            "secondary_dropped": l(&rstats.secondary_dropped), "handovers": l(&rstats.handovers),
+        },
     });
     let text = serde_json::to_string_pretty(&summary)?;
     println!("{text}");

@@ -27,6 +27,7 @@ use nalgebra::DMatrix;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::clock::{band_of, Outcome, PairModel, PAIR_BUDGET};
+use crate::coverage::{CovId, Coverage};
 use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Llh, C_AIR, FT_TO_M};
 use crate::modes;
 use crate::norm::{self, Copy, Node};
@@ -38,6 +39,8 @@ use crate::types::{ConnId, Event, ReceiverInfo, ToClient};
 /// Aircraft-to-receiver range beyond which a sync point is not used (radio
 /// horizon at FL450 is ~480 km).
 const MAX_RANGE: f64 = 500e3;
+/// Coverage maps are saved this often (seconds) when a file is configured.
+const COVERAGE_SAVE_EVERY: f64 = 1800.0;
 /// Maximum distance between the even and odd positions of a sync pair.
 const MAX_PAIR_SPREAD: f64 = 10e3;
 const SYNC_TTL: f64 = 10.0;
@@ -87,6 +90,8 @@ struct Rx {
     /// Timestamp noise relative to its clock type's nominal jitter, from the
     /// noise its clock pairs observe (1 = as specified).
     noise_scale: f64,
+    /// Stable identity for its coverage map (survives reconnects).
+    cov: CovId,
 }
 
 #[derive(Clone, Copy)]
@@ -265,6 +270,9 @@ pub struct Snapshot {
     /// receivers per update: (bucket, count, fix p50, fix p90, out p50, out p90).
     pub adsb_check: Vec<(String, usize, f64, f64, f64, f64)>,
     pub started: f64,
+    /// Receivers with a coverage map, and ADS-B samples counted into them.
+    pub coverage_maps: usize,
+    pub coverage_samples: u64,
 }
 
 pub struct Engine {
@@ -291,6 +299,20 @@ pub struct Engine {
     /// (time, receivers, fix error, published error) of ADS-B-checked updates
     adsb_err: VecDeque<(f64, usize, Option<f64>, Option<f64>)>,
     diag_bad: VecDeque<Diag>,
+    coverage: Coverage,
+    rx_by_cov: HashMap<CovId, RxKey>,
+    /// Where coverage maps are saved (and loaded from at start), if anywhere.
+    coverage_file: Option<String>,
+    coverage_saved: f64,
+}
+
+/// A receiver's coverage identity: its UUID key (as the Beast feed keys it)
+/// when it has one, else a hash of its user name.
+fn cov_id(info: &ReceiverInfo) -> CovId {
+    info.uuid
+        .as_deref()
+        .and_then(crate::relay::registry::key_of_uuid)
+        .unwrap_or_else(|| fxhash(info.user.as_bytes()) | (1 << 63))
 }
 
 fn pair_key(a: RxKey, b: RxKey) -> (RxKey, RxKey) {
@@ -325,7 +347,30 @@ impl Engine {
             holdout_err: VecDeque::new(),
             adsb_err: VecDeque::new(),
             diag_bad: VecDeque::new(),
+            coverage: Coverage::default(),
+            rx_by_cov: HashMap::new(),
+            coverage_file: None,
+            coverage_saved: 0.0,
         }
+    }
+
+    /// Save the coverage maps now (replay calls this at the end).
+    pub fn save_coverage(&self, path: &str) -> anyhow::Result<()> {
+        self.coverage.save(path)
+    }
+
+    /// Keep receiver coverage maps in `path` (gzip'd JSON): loaded now if it
+    /// exists, saved every `COVERAGE_SAVE_EVERY` seconds.
+    pub fn with_coverage_file(mut self, path: &str) -> Engine {
+        match Coverage::load(path) {
+            Ok(c) => {
+                tracing::info!(path, maps = c.receivers(), "coverage maps loaded");
+                self.coverage = c;
+            }
+            Err(e) => tracing::info!(path, error = %e, "no coverage maps loaded: starting empty"),
+        }
+        self.coverage_file = Some(path.to_string());
+        self
     }
 
     /// Send positions of aircraft that also broadcast ADS-B to `bench`.
@@ -394,6 +439,7 @@ impl Engine {
                         r.info.lon = lon;
                         r.info.alt = alt;
                         r.pos = llh_to_ecef(Llh { lat, lon, alt });
+                        self.coverage.place(r.cov, lat, lon, now);
                     }
                 }
             }
@@ -421,7 +467,13 @@ impl Engine {
             mlat_msgs: 0,
             used: 0,
             noise_scale: 1.0,
+            cov: 0,
         };
+        let cov = cov_id(&r.info);
+        self.coverage.place(cov, r.info.lat, r.info.lon, now);
+        self.rx_by_cov.insert(cov, key);
+        let mut r = r;
+        r.cov = cov;
         self.rx_by_conn.insert(conn, key);
         self.rxs.insert(key, r);
     }
@@ -448,6 +500,10 @@ impl Engine {
         let Some(k) = self.rx_by_conn.remove(&conn) else { return };
         self.drop_pairs(k);
         if let Some(r) = self.rxs.remove(&k) {
+            if self.rx_by_cov.get(&r.cov) == Some(&k) {
+                self.rx_by_cov.remove(&r.cov);
+                self.coverage.unplace(r.cov);
+            }
             for icao in r.seen {
                 if let Some(a) = self.aircraft.get_mut(&icao) {
                     a.tracking = a.tracking.saturating_sub(1);
@@ -593,6 +649,13 @@ impl Engine {
             if ac.adsb.map(|(_, t0)| now - t0 > 0.5).unwrap_or(true) {
                 ac.adsb = Some((pb, now));
             }
+            // A validated ADS-B position: who hears this aircraft, and who
+            // in range does not, is coverage evidence.
+            let llh = ecef_to_llh(pb);
+            let (rxs, by_cov) = (&self.rxs, &self.rx_by_cov);
+            self.coverage.observe(icao, llh.lat, llh.lon, alt_b as f64 * 0.3048, now, |id| {
+                by_cov.get(&id).and_then(|k| rxs.get(k)).is_some_and(|r| r.seen.contains(&icao))
+            });
         }
         let variant = &mut entry.variants[vi];
         if variant.obs.iter().any(|o| o.rx == k) {
@@ -1264,6 +1327,14 @@ impl Engine {
     }
 
     fn housekeeping(&mut self, now: f64) {
+        if let Some(path) = &self.coverage_file {
+            if now - self.coverage_saved >= COVERAGE_SAVE_EVERY {
+                self.coverage_saved = now;
+                if let Err(e) = self.coverage.save(path) {
+                    tracing::warn!(path, error = %e, "coverage maps not saved");
+                }
+            }
+        }
         // Pairs not updated for 3x their usable age are dropped.
         let stale: Vec<(RxKey, RxKey)> = self
             .pairs
@@ -1359,6 +1430,8 @@ impl Engine {
         let q = |p: f64| if errs.is_empty() { 0.0 } else { errs[((errs.len() - 1) as f64 * p) as usize] };
         let mut s = self.stats.snapshot.lock().unwrap();
         s.receivers = self.rxs.len();
+        s.coverage_maps = self.coverage.receivers();
+        s.coverage_samples = self.coverage.samples;
         s.receivers_suspect = self.rxs.values().filter(|r| r.suspect).count();
         s.pairs = self.pairs.len();
         s.pairs_usable = self.pairs.values().filter(|m| m.usable(now)).count();

@@ -63,6 +63,9 @@ pub struct ReplayArgs {
     /// for what the client path brings back).
     #[arg(long, default_value = "dup")]
     hybrid_mode: String,
+    /// Save the receiver coverage maps built during the replay here.
+    #[arg(long)]
+    coverage_file: Option<String>,
 }
 
 struct Counting<R> {
@@ -276,6 +279,9 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     drain(&mut out_rx, &mut bench_rx);
     eng.publish_at(0, t);
     let wall_s = started.elapsed().as_secs_f64();
+    if let Some(p) = &a.coverage_file {
+        eng.save_coverage(p)?;
+    }
 
     let errs = eng.adsb_errors();
     let fix_errs: Vec<f64> = errs.iter().filter_map(|e| e.1).collect();
@@ -319,6 +325,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             "solves": l(&stats.solves), "fixes": l(&stats.fixes), "tracks_born": l(&stats.tracks_born),
             "track_tdoa_updates": l(&stats.track_tdoa_updates),
             "holdout": {"n": snap.holdout_n, "p50_m": snap.holdout_p50.round(), "p90_m": snap.holdout_p90.round()},
+            "coverage_maps": snap.coverage_maps, "coverage_samples": snap.coverage_samples,
         },
         "bench": {
             "fix_error": quantiles(fix_errs),

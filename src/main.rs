@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod clock;
+mod coverage;
 mod engine;
 mod geo;
 mod hybrid;
@@ -89,6 +90,10 @@ struct Args {
     /// --feed-receivers-url at this instance's own /receivers.json.
     #[arg(long, default_value_t = false, env = "MLAT_NG_HYBRID")]
     hybrid: bool,
+    /// Keep receiver coverage maps in this file (gzip'd JSON, src/coverage.rs):
+    /// loaded at start, saved every 30 min. Empty = in memory only.
+    #[arg(long, default_value = "", env = "MLAT_NG_COVERAGE_FILE")]
+    coverage_file: String,
 }
 
 fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -127,6 +132,9 @@ fn main() -> anyhow::Result<()> {
     let mut eng = engine::Engine::new(ecfg, stats.clone(), sbs_tx.clone());
     if !args.bench_sbs_listen.is_empty() {
         eng = eng.with_bench_output(bench_tx.clone());
+    }
+    if !args.coverage_file.is_empty() {
+        eng = eng.with_coverage_file(&args.coverage_file);
     }
     let feed_cfg = (!cells.is_empty()).then(|| relay::FeedConfig {
         cells: cells.clone(),
@@ -302,6 +310,8 @@ fn render_metrics(
     let snap = s.snapshot.lock().unwrap().clone();
     m("receivers", "gauge", snap.receivers as f64);
     m("receivers_suspect", "gauge", snap.receivers_suspect as f64);
+    m("coverage_maps", "gauge", snap.coverage_maps as f64);
+    m("coverage_samples_total", "counter", snap.coverage_samples as f64);
     m("pairs", "gauge", snap.pairs as f64);
     m("pairs_usable", "gauge", snap.pairs_usable as f64);
     m("sync_entries", "gauge", snap.sync_entries as f64);

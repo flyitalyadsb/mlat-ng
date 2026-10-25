@@ -158,6 +158,13 @@ impl Adapter {
         }
     }
 
+    /// Number connections from `base` instead of `CONN_BASE` (replay runs a
+    /// second adapter as stand-in mlat-clients).
+    pub fn with_conn_base(mut self, base: ConnId) -> Adapter {
+        self.next_conn = base;
+        self
+    }
+
     pub fn registry_len(&self) -> usize {
         self.registry.len()
     }
@@ -299,7 +306,9 @@ impl Adapter {
                     conn,
                     info: ReceiverInfo {
                         user: format!("{}~feed", reg.user),
-                        uuid: None,
+                        // The receiver id as a 16-digit key: the hybrid router
+                        // matches it to the same feeder's mlat-client.
+                        uuid: Some(format!("{:016x}", f.rid)),
                         lat: reg.lat,
                         lon: reg.lon,
                         alt: reg.alt,

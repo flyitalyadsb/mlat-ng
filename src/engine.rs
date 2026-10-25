@@ -36,18 +36,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, Matrix3, Vector3};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::altmodel::{self, AltModel};
 use crate::clock::{band_of, receiver_noise_scale, Outcome, PairModel, PAIR_BUDGET};
 use crate::coverage::{CovId, Coverage};
-use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Llh, C_AIR, FT_TO_M};
+use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Enu, Llh, C_AIR, FT_TO_M};
 use crate::modes;
 use crate::norm::{self, Copy, Node};
 use crate::output::{sbs_line, SbsFix};
 use crate::solver::{self, Fix, Meas, SolveInput};
 use crate::track::{Gate, Track};
+use crate::twosite::{self, Rec2};
 use crate::types::{ConnId, Event, ReceiverInfo, ToClient};
 
 /// Aircraft-to-receiver range beyond which a sync point is not used (radio
@@ -191,7 +192,63 @@ struct Aircraft {
     last_vel_update: f64,
     /// Own geometric-minus-baro altitude (ft, from ADS-B TC 19) and its time.
     geo_baro: Option<(f64, f64)>,
+    /// Last unambiguous Comm-B BDS 5,0 ground velocity (east, north m/s) and
+    /// its time, kept also without a track: the 2-site path needs it.
+    commb_vel: Option<([f64; 2], f64)>,
+    /// The same over the last TWO_SITE_WINDOW + 60 s, oldest first, to follow
+    /// turns across the 2-site window.
+    commb_hist: VecDeque<([f64; 2], f64)>,
+    /// 2-site TDOAs of the last TWO_SITE_WINDOW seconds, the coverage ids of
+    /// the receivers in them, and when a solve was last tried.
+    two: VecDeque<Rec2>,
+    two_heard: Vec<CovId>,
+    two_tried: f64,
+    /// Replay bench: the one pair of receivers this aircraft keeps.
+    bench_pair: Option<(RxKey, RxKey)>,
 }
+
+/// What the engine does with aircraft that only two sites hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoSite {
+    /// TDOA updates of existing tracks only (as before).
+    Off,
+    /// Solve them from motion + coverage, but only aircraft that also send
+    /// ADS-B get the result (to the bench output, where it is judged).
+    Bench,
+    /// Solve them and publish what passes the checks.
+    Publish,
+}
+
+impl std::str::FromStr for TwoSite {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(TwoSite::Off),
+            "bench" => Ok(TwoSite::Bench),
+            "publish" => Ok(TwoSite::Publish),
+            _ => Err(format!("two-site mode must be off|bench|publish, not {s}")),
+        }
+    }
+}
+
+/// 2-site path: window of TDOAs, minimum records and span, solve interval,
+/// age of the Comm-B velocity, and the checks a solution must pass.
+const TWO_SITE_WINDOW: f64 = 240.0;
+const TWO_SITE_MIN_RECS: usize = 8;
+const TWO_SITE_MIN_SPAN: f64 = 60.0;
+const TWO_SITE_MAX_RECS: usize = 48;
+const TWO_SITE_EVERY: f64 = 10.0;
+const TWO_SITE_VEL_AGE: f64 = 30.0;
+// Chosen on the 2026-10-24 capture with ADS-B aircraft cut to two sites
+// (replay --bench-two-sites, 4,277 solutions): these keep 202, p50 340 m,
+// p90 0.8 km, none over 5 km; without them p50 1.8 km, p90 70 km, 32% over
+// 5 km. A low own error estimate is the strongest single sign of the right
+// basin. One 10-minute capture: to be confirmed live in Bench mode.
+const TWO_SITE_MAX_RMS: f64 = 1.3;
+const TWO_SITE_MAX_ERR: f64 = 150.0;
+const TWO_SITE_MIN_MARGIN: f64 = 8.0;
+/// Silent receivers count as this many independent misses (offline study).
+const TWO_SITE_N_EFF: f64 = 8.0;
 
 struct AcTrack {
     code: u16,
@@ -255,6 +312,14 @@ pub struct Stats {
     /// Comm-B BDS 5,0 ground velocities offered to tracks / accepted.
     pub commb_vel_offered: AtomicU64,
     pub commb_vel_accepted: AtomicU64,
+    /// 2-site path: solves tried, solutions found, solutions that passed the
+    /// checks, and of those how many fed a track.
+    pub two_site_tries: AtomicU64,
+    pub two_site_solved: AtomicU64,
+    pub two_site_accepted: AtomicU64,
+    pub two_site_tracked: AtomicU64,
+    /// Engine-thread microseconds spent in 2-site solves.
+    pub two_site_us: AtomicU64,
     pub track_rejects: AtomicU64,
     pub outputs: AtomicU64,
     /// Positions of aircraft that also broadcast ADS-B, sent to the bench
@@ -308,6 +373,11 @@ pub struct Snapshot {
     pub holdout_p50: f64,
     pub holdout_p90: f64,
     pub holdout_p99: f64,
+    /// 2-site solutions of aircraft with ADS-B in the last 10 minutes:
+    /// (count, p50 m, p90 m) for all solutions and for the accepted ones.
+    pub two_site_all: (usize, f64, f64),
+    pub two_site_ok: (usize, f64, f64),
+    pub two_site_pub: (usize, f64, f64),
     /// MLAT vs ADS-B for aircraft that broadcast both, last 10 minutes, by
     /// receivers per update: (bucket, count, fix p50, fix p90, out p50, out p90).
     pub adsb_check: Vec<(String, usize, f64, f64, f64, f64)>,
@@ -351,6 +421,15 @@ pub struct Engine {
     coverage_saved: f64,
     /// Coverage questions from the HTTP side, answered on this thread.
     queries: Option<mpsc::Receiver<CovQuery>>,
+    two_site: TwoSite,
+    /// Replay bench: aircraft with ADS-B keep one pair of receivers only.
+    bench_two_sites: bool,
+    /// (time, error m vs own ADS-B, accepted) of 2-site solutions.
+    two_site_err: VecDeque<(f64, f64, bool)>,
+    /// (time, error m vs own ADS-B) of positions published after a 2-site fix.
+    two_site_pub: VecDeque<(f64, f64)>,
+    /// Replay: every 2-site solution of an aircraft with ADS-B, as JSON lines.
+    two_site_dump: Option<std::io::BufWriter<std::fs::File>>,
     /// Regional geometric-minus-baro altitude model (altmodel.rs).
     alt_model: AltModel,
 }
@@ -432,8 +511,41 @@ impl Engine {
             coverage_file: None,
             coverage_saved: 0.0,
             queries: None,
+            two_site: TwoSite::Off,
+            bench_two_sites: false,
+            two_site_err: VecDeque::new(),
+            two_site_pub: VecDeque::new(),
+            two_site_dump: None,
             alt_model: AltModel::default(),
         }
+    }
+
+    /// Start from the coverage maps in `path`, without saving there (replay).
+    pub fn load_coverage(mut self, path: &str) -> anyhow::Result<Engine> {
+        self.coverage = Coverage::load(path)?;
+        Ok(self)
+    }
+
+    /// Write every 2-site solution of an aircraft with ADS-B to `path`.
+    pub fn with_two_site_dump(mut self, path: &str) -> std::io::Result<Engine> {
+        self.two_site_dump = Some(std::io::BufWriter::new(std::fs::File::create(path)?));
+        Ok(self)
+    }
+
+    pub fn flush_two_site_dump(&mut self) {
+        if let Some(w) = self.two_site_dump.as_mut() {
+            let _ = std::io::Write::flush(w);
+        }
+    }
+
+    /// (time, error m vs own ADS-B, accepted) of the 2-site solutions so far.
+    pub fn two_site_errors(&self) -> Vec<(f64, f64, bool)> {
+        self.two_site_err.iter().copied().collect()
+    }
+
+    /// (time, error m vs own ADS-B) of the positions published after them.
+    pub fn two_site_published(&self) -> Vec<(f64, f64)> {
+        self.two_site_pub.iter().copied().collect()
     }
 
     /// Save the coverage maps now (replay calls this at the end).
@@ -452,6 +564,18 @@ impl Engine {
             Err(e) => tracing::info!(path, error = %e, "no coverage maps loaded: starting empty"),
         }
         self.coverage_file = Some(path.to_string());
+        self
+    }
+
+    pub fn with_two_site(mut self, mode: TwoSite) -> Engine {
+        self.two_site = mode;
+        self
+    }
+
+    /// Replay bench of the 2-site path: aircraft with ADS-B keep the copies
+    /// of one pair of receivers only, so the bench scores 2-site positions.
+    pub fn with_bench_two_sites(mut self, on: bool) -> Engine {
+        self.bench_two_sites = on;
         self
     }
 
@@ -1061,7 +1185,7 @@ impl Engine {
         ecef_to_llh(meas.iter().fold([0.0; 3], |s, m| [s[0] + m.rx[0] / n, s[1] + m.rx[1] / n, s[2] + m.rx[2] / n]))
     }
 
-    fn process_group(&mut self, mk: MsgKey, g: Group, now: f64) {
+    fn process_group(&mut self, mk: MsgKey, mut g: Group, now: f64) {
         self.stats.groups.fetch_add(1, Ordering::Relaxed);
         let bytes = mk.bytes().to_vec();
         if let Some(ac) = modes::false_ac(&bytes) {
@@ -1092,6 +1216,29 @@ impl Engine {
             }
             if d.callsign.is_some() {
                 ac.callsign = d.callsign.clone();
+            }
+        }
+        if self.bench_two_sites {
+            let ac = self.aircraft.get_mut(&d.address).unwrap();
+            if now - ac.last_adsb < 30.0 {
+                if ac.bench_pair.is_none() {
+                    let mut first: Option<(RxKey, Ecef)> = None;
+                    for (k, _) in &g.copies {
+                        let Some(r) = self.rxs.get(k) else { continue };
+                        match first {
+                            None => first = Some((*k, r.pos)),
+                            Some((a, pa)) if dist(&pa, &r.pos) >= 1000.0 => {
+                                ac.bench_pair = Some((a, *k));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                match ac.bench_pair {
+                    Some((a, b)) => g.copies.retain(|(k, _)| *k == a || *k == b),
+                    None => g.copies.clear(),
+                }
             }
         }
         let (keys, nodes, copies) = self.build(&g);
@@ -1127,16 +1274,19 @@ impl Engine {
     /// 1.7 km without). Ambiguous 5,0/6,0 readings are taken as 5,0 only when
     /// they agree with the track's own speed; the track's gate rejects the rest.
     fn commb_velocity(&mut self, icao: u32, msg: &[u8], t: f64) {
+        let keep = self.two_site != TwoSite::Off;
         let Some(ac) = self.aircraft.get_mut(&icao) else { return };
-        let Some(tr) = ac.track.as_mut() else { return };
-        if t - tr.last_update() > 60.0 {
+        let tracked = ac.track.as_ref().is_some_and(|tr| t - tr.last_update() <= 60.0);
+        if !tracked && !keep {
             return;
         }
         let mut mb = [0u8; 7];
         mb.copy_from_slice(&msg[4..11]);
         let b50 = match modes::commb::infer_kinematics(&mb, ac.alt_ft) {
             Some(modes::commb::Kinematics::Bds50(b)) => b,
-            Some(modes::commb::Kinematics::Ambiguous(b, _)) => {
+            // Ambiguous with BDS 6,0: only a track can tell them apart.
+            Some(modes::commb::Kinematics::Ambiguous(b, _)) if tracked => {
+                let tr = ac.track.as_ref().unwrap();
                 let agrees = b.gs_kt.is_some_and(|gs| (gs - tr.ground_speed_kt()).abs() < 40.0)
                     && b.true_track_deg.is_some_and(|trk| ((trk - tr.track_deg() + 540.0) % 360.0 - 180.0).abs() < 20.0);
                 if !agrees {
@@ -1147,6 +1297,16 @@ impl Engine {
             _ => return,
         };
         let Some((ve, vn)) = b50.ground_velocity_en() else { return };
+        if keep {
+            ac.commb_vel = Some(([ve, vn], t));
+            if ac.commb_hist.back().is_none_or(|x| t >= x.1) {
+                ac.commb_hist.push_back(([ve, vn], t));
+            }
+            while ac.commb_hist.front().is_some_and(|x| t - x.1 > TWO_SITE_WINDOW + 60.0) {
+                ac.commb_hist.pop_front();
+            }
+        }
+        let Some(tr) = ac.track.as_mut().filter(|_| tracked) else { return };
         self.stats.commb_vel_offered.fetch_add(1, Ordering::Relaxed);
         // 2 kt and 0.18 deg resolution plus reporting latency: ~1.5 m/s.
         let t = t.max(tr.last_update());
@@ -1252,6 +1412,9 @@ impl Engine {
                 }
             }
         } else if n >= 2 && ctx.sites >= 2 {
+            if self.two_site != TwoSite::Off && ctx.sites == 2 && n == 2 {
+                self.two_site_record(icao, meas, cov, alt, t, used);
+            }
             let ac = self.aircraft.get_mut(&icao).unwrap();
             if let Some(tr) = ac.track.as_mut() {
                 if t - tr.last_update() < 30.0 {
@@ -1294,6 +1457,160 @@ impl Engine {
             None
         };
         self.check_adsb(icao, n, t, now, fix_used.as_ref(), published, accepted, used, ctx);
+        if self.two_site != TwoSite::Off && !can_fix {
+            self.two_site_try(icao, t, now);
+        }
+    }
+
+    /// Keep a 2-site TDOA (and who heard it) for the motion + coverage solve.
+    fn two_site_record(&mut self, icao: u32, meas: &[Meas], cov: &DMatrix<f64>, alt: Option<(f64, f64)>, t: f64, used: &[RxKey]) {
+        let Some((h, _)) = alt else { return };
+        let var = cov[(0, 0)] + cov[(1, 1)] - 2.0 * cov[(0, 1)];
+        let sd = (var.max(0.0).sqrt() * C_AIR).max(30.0);
+        let rec = Rec2 { t, off: [0.0; 2], ra: meas[0].rx, rb: meas[1].rx, d: (meas[1].t - meas[0].t) * C_AIR, sd, h };
+        let covs: Vec<CovId> = used.iter().filter_map(|k| self.rxs.get(k).map(|r| r.cov)).collect();
+        let ac = self.aircraft.get_mut(&icao).unwrap();
+        ac.two.push_back(rec);
+        while ac.two.front().is_some_and(|r| t - r.t > TWO_SITE_WINDOW) {
+            ac.two.pop_front();
+        }
+        for c in covs {
+            if !ac.two_heard.contains(&c) {
+                ac.two_heard.push(c);
+            }
+        }
+    }
+
+    /// Solve an aircraft that only two sites hear, from its recent 2-site
+    /// TDOAs, its Comm-B velocity and the coverage maps (twosite.rs). What
+    /// passes the checks becomes a fix for its track, which is published by
+    /// the usual rules (confirmed, anchored by a fix in the last 10 s); in
+    /// Bench mode only aircraft that also send ADS-B, to the bench output.
+    fn two_site_try(&mut self, icao: u32, t: f64, now: f64) {
+        let Some(ac) = self.aircraft.get(&icao) else { return };
+        if t - ac.two_tried < TWO_SITE_EVERY || t - ac.last_fix_update < 30.0 || ac.two.len() < TWO_SITE_MIN_RECS {
+            return;
+        }
+        // Study knobs (replay): the velocity source and the window length.
+        let oracle = std::env::var("MLAT_NG_TWO_SITE_VEL").is_ok_and(|v| v == "adsb");
+        let window = std::env::var("MLAT_NG_TWO_SITE_WINDOW").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(TWO_SITE_WINDOW);
+        let (vel, vt) = if oracle {
+            let (Some(v), Some((p, ta))) = (ac.adsb_vel, ac.adsb) else { return };
+            let f = Enu::at(p);
+            let l = f.to_enu(&[p[0] + v[0], p[1] + v[1], p[2] + v[2]]);
+            ([l[0], l[1]], ta)
+        } else {
+            let Some(cv) = ac.commb_vel else { return };
+            cv
+        };
+        if t - vt > TWO_SITE_VEL_AGE {
+            return;
+        }
+        let has_adsb = now - ac.last_adsb < 30.0;
+        if self.two_site == TwoSite::Bench && !has_adsb {
+            return;
+        }
+        let span = ac.two.back().unwrap().t - ac.two.front().unwrap().t.max(t - window);
+        if span < TWO_SITE_MIN_SPAN {
+            return;
+        }
+        let in_window: Vec<&Rec2> = ac.two.iter().filter(|r| t - r.t <= window).collect();
+        if in_window.len() < TWO_SITE_MIN_RECS {
+            return;
+        }
+        let step = in_window.len().div_ceil(TWO_SITE_MAX_RECS);
+        let mut recs: Vec<Rec2> = in_window.iter().rev().step_by(step).map(|r| (*r).clone()).collect();
+        recs.reverse();
+        // Where the aircraft went from each record to the last: its velocity
+        // history integrated (the oracle study knob: one ADS-B velocity).
+        let hist: Vec<([f64; 2], f64)> = if oracle { vec![(vel, vt)] } else { ac.commb_hist.iter().copied().collect() };
+        let t_last = recs.last().unwrap().t;
+        let ts: Vec<f64> = recs.iter().map(|r| r.t).collect();
+        for (r, off) in recs.iter_mut().zip(twosite::offsets(&ts, &hist, t_last)) {
+            r.off = off;
+        }
+        let heard = ac.two_heard.clone();
+        let truth = ac.adsb.filter(|(_, ta)| now - ta < 5.0).map(|(p, ta)| {
+            let v = ac.adsb_vel.unwrap_or([0.0; 3]);
+            let dt = t - ta;
+            [p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt]
+        });
+        let last = recs.last().unwrap().clone();
+        let mid = ecef_to_llh([(last.ra[0] + last.rb[0]) / 2.0, (last.ra[1] + last.rb[1]) / 2.0, (last.ra[2] + last.rb[2]) / 2.0]);
+        let silent: Vec<CovId> = self
+            .coverage
+            .near(mid.lat, mid.lon)
+            .into_iter()
+            .filter(|id| {
+                !heard.contains(id)
+                    && !self.rx_by_cov.get(id).and_then(|k| self.rxs.get(k)).is_some_and(|r| r.seen.contains(&icao))
+            })
+            .collect();
+        self.stats.two_site_tries.fetch_add(1, Ordering::Relaxed);
+        let coverage = &self.coverage;
+        // Study knob (replay): which coverage evidence the solve uses.
+        let mode = std::env::var("MLAT_NG_TWO_SITE_COV").unwrap_or_default();
+        let none: Vec<CovId> = Vec::new();
+        let (h_ids, s_ids) = match mode.as_str() {
+            "none" => (&none, &none),
+            "heard" => (&heard, &none),
+            _ => (&heard, &silent),
+        };
+        let cov_cost = |lat: f64, lon: f64| -coverage.log_lik(h_ids, s_ids, lat, lon, last.h, TWO_SITE_N_EFF);
+        let t0 = Instant::now();
+        let sol = twosite::solve(&recs, &cov_cost);
+        self.stats.two_site_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.aircraft.get_mut(&icao).unwrap().two_tried = t;
+        let Some(sol) = sol else { return };
+        self.stats.two_site_solved.fetch_add(1, Ordering::Relaxed);
+        let ok = sol.rms <= TWO_SITE_MAX_RMS && sol.err_h <= TWO_SITE_MAX_ERR && sol.margin >= TWO_SITE_MIN_MARGIN;
+        if let Some(p) = truth {
+            self.two_site_err.push_back((now, dist(&p, &sol.pos), ok));
+            if let Some(w) = self.two_site_dump.as_mut() {
+                let mid = [(last.ra[0] + last.rb[0]) / 2.0, (last.ra[1] + last.rb[1]) / 2.0, (last.ra[2] + last.rb[2]) / 2.0];
+                let line = serde_json::json!({
+                    "t": t, "icao": format!("{icao:06x}"), "err_m": dist(&p, &sol.pos), "ok": ok,
+                    "rms": sol.rms, "err_h": sol.err_h, "margin": sol.margin, "n": sol.n, "span": sol.span,
+                    "baseline_m": dist(&last.ra, &last.rb), "range_m": dist(&mid, &p), "h": last.h,
+                    "speed": (vel[0] * vel[0] + vel[1] * vel[1]).sqrt(),
+                    "heard": heard.len(), "silent": silent.len(),
+                    "pairs": recs.iter().map(|r| (r.ra[0] as i64, r.rb[0] as i64)).collect::<std::collections::HashSet<_>>().len(),
+                });
+                let _ = std::io::Write::write_all(w, format!("{line}\n").as_bytes());
+            }
+        }
+        if !ok {
+            return;
+        }
+        self.stats.two_site_accepted.fetch_add(1, Ordering::Relaxed);
+        // The fix: the solution with its horizontal error, the altitude as
+        // the constraint it came from.
+        let frame = Enu::at(sol.pos);
+        let rot = Matrix3::from_fn(|i, j| frame.r[i][j]);
+        let var_h = sol.err_h * sol.err_h / 2.0;
+        let cov = rot.transpose() * Matrix3::from_diagonal(&Vector3::new(var_h, var_h, 100.0 * 100.0)) * rot;
+        let fix = Fix { pos: sol.pos, cov, t0: 0.0, chi2: sol.rms * sol.rms, dof: 0, err_h: sol.err_h, gdop: 0.0, used: Vec::new() };
+        let ac = self.aircraft.get_mut(&icao).unwrap();
+        let fed = match ac.track.as_mut() {
+            Some(tr) if t - tr.last_update() < 60.0 => tr.update_fix(&fix, t) == Gate::Accepted,
+            _ => {
+                ac.track = Some(Track::new(&fix, t));
+                ac.track_rejects = 0;
+                true
+            }
+        };
+        if !fed {
+            return;
+        }
+        if let Some(tr) = ac.track.as_mut() {
+            tr.update_velocity(vel[0], vel[1], 1.5, t);
+        }
+        ac.last_fix_update = t;
+        ac.last_vel_update = t;
+        self.stats.two_site_tracked.fetch_add(1, Ordering::Relaxed);
+        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t, now), truth) {
+            self.two_site_pub.push_back((now, dist(&p, &pos)));
+        }
     }
 
     /// Compare this update with the aircraft's own ADS-B position, when it has
@@ -1582,6 +1899,12 @@ impl Engine {
     // --------------------------------------------------------- maintenance --
 
     fn expire(&mut self, now: f64) {
+        while self.two_site_err.front().is_some_and(|x| now - x.0 >= 600.0) {
+            self.two_site_err.pop_front();
+        }
+        while self.two_site_pub.front().is_some_and(|x| now - x.0 >= 600.0) {
+            self.two_site_pub.pop_front();
+        }
         while let Some(&(t, key)) = self.sync_expiry.front() {
             if now - t < SYNC_TTL {
                 break;
@@ -1725,6 +2048,14 @@ impl Engine {
         s.holdout_p50 = q(0.5);
         s.holdout_p90 = q(0.9);
         s.holdout_p99 = q(0.99);
+        let pct = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            let at = |p: f64| if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p) as usize] };
+            (v.len(), at(0.5), at(0.9))
+        };
+        s.two_site_all = pct(self.two_site_err.iter().filter(|x| now - x.0 < 600.0).map(|x| x.1).collect());
+        s.two_site_ok = pct(self.two_site_err.iter().filter(|x| now - x.0 < 600.0 && x.2).map(|x| x.1).collect());
+        s.two_site_pub = pct(self.two_site_pub.iter().filter(|x| now - x.0 < 600.0).map(|x| x.1).collect());
         let qv = |v: &mut Vec<f64>, p: f64| {
             if v.is_empty() {
                 return 0.0;

@@ -19,6 +19,7 @@ mod interest;
 mod modes;
 mod norm;
 mod output;
+mod persist;
 mod proto;
 mod relay;
 mod replay;
@@ -123,6 +124,11 @@ struct Args {
     /// loaded at start, saved every 30 min. Empty = in memory only.
     #[arg(long, default_value = "", env = "MLAT_NG_COVERAGE_FILE")]
     coverage_file: String,
+    /// Keep the receiver position survey and the corrections applied from
+    /// it here (gzip'd JSON): loaded at start, saved every 10 minutes and
+    /// at shutdown. Empty = in memory only.
+    #[arg(long, default_value = "", env = "MLAT_NG_SURVEY_FILE")]
+    survey_file: String,
     /// Aircraft heard by only two sites (twosite.rs): off, bench (solve, but
     /// only aircraft with ADS-B get the result, on the bench output) or
     /// publish.
@@ -170,6 +176,9 @@ fn main() -> anyhow::Result<()> {
     if !args.coverage_file.is_empty() {
         eng = eng.with_coverage_file(&args.coverage_file);
     }
+    if !args.survey_file.is_empty() {
+        eng = eng.with_survey_file(&args.survey_file);
+    }
     eng = eng.with_two_site(args.two_site);
     eng = eng.with_served_output_only(args.served_output_only);
     eng = eng.with_survey_apply(args.survey_apply.then(|| survey::ApplyCfg { min_m: args.survey_apply_min_m, ..Default::default() }));
@@ -193,13 +202,17 @@ fn main() -> anyhow::Result<()> {
     let feed_stats = feed_cfg.as_ref().map(|c| Arc::new(relay::FeedStats::new(c)));
     anyhow::ensure!(!args.hybrid || feed_cfg.is_some(), "--hybrid needs --feed");
     let hybrid_stats = args.hybrid.then(|| Arc::new(hybrid::RouterStats::default()));
+    // The engine returns when every event sender is gone, after saving its
+    // state; main waits for that (bounded) before exiting.
+    let (engine_done, engine_done_rx) = std::sync::mpsc::channel::<()>();
     let engine_thread = std::thread::Builder::new().name("engine".into()).spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("engine runtime");
         rt.block_on(eng.run(ev_rx));
+        let _ = engine_done.send(());
     })?;
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("net").build()?;
-    rt.block_on(async move {
+    let served = rt.block_on(async move {
         let client_l = TcpListener::bind(&args.listen).await?;
         let sbs_l = TcpListener::bind(&args.sbs_listen).await?;
         let http_l = TcpListener::bind(&args.http_listen).await?;
@@ -271,9 +284,16 @@ fn main() -> anyhow::Result<()> {
             _ = tokio::signal::ctrl_c() => { tracing::info!("SIGINT"); Ok(()) }
             _ = sigterm() => { tracing::info!("SIGTERM"); Ok(()) }
         }
-    })?;
+    });
+    // Stop the network side: its tasks hold the engine's event senders, so
+    // the engine sees its input close, saves and returns.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    match engine_done_rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(()) => tracing::info!("engine stopped, state saved"),
+        Err(_) => tracing::warn!("engine did not stop within 20 s: exiting without waiting"),
+    }
     drop(engine_thread);
-    Ok(())
+    served
 }
 
 async fn sigterm() {

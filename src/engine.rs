@@ -58,6 +58,9 @@ use crate::types::{ConnId, Event, ReceiverInfo, ResultFormat, ToClient};
 const MAX_RANGE: f64 = 500e3;
 /// Coverage maps are saved this often (seconds) when a file is configured.
 const COVERAGE_SAVE_EVERY: f64 = 1800.0;
+/// The survey and its corrections, likewise (corrections change every 10
+/// minutes).
+const SURVEY_SAVE_EVERY: f64 = 600.0;
 /// Maximum distance between the even and odd positions of a sync pair.
 const MAX_PAIR_SPREAD: f64 = 10e3;
 const SYNC_TTL: f64 = 10.0;
@@ -533,6 +536,11 @@ pub struct Engine {
     /// Where coverage maps are saved (and loaded from at start), if anywhere.
     coverage_file: Option<String>,
     coverage_saved: f64,
+    /// Where the survey and the applied corrections are kept, if anywhere.
+    survey_file: Option<String>,
+    survey_saved: f64,
+    cov_writer: crate::persist::Writer,
+    survey_writer: crate::persist::Writer,
     /// Coverage questions from the HTTP side, answered on this thread.
     queries: Option<mpsc::Receiver<CovQuery>>,
     two_site: TwoSite,
@@ -643,6 +651,10 @@ impl Engine {
             rx_by_cov: HashMap::new(),
             coverage_file: None,
             coverage_saved: 0.0,
+            survey_file: None,
+            survey_saved: 0.0,
+            cov_writer: crate::persist::Writer::default(),
+            survey_writer: crate::persist::Writer::default(),
             queries: None,
             two_site: TwoSite::Off,
             bench_two_sites: false,
@@ -706,6 +718,48 @@ impl Engine {
         }
         self.coverage_file = Some(path.to_string());
         self
+    }
+
+    /// Keep the survey and the applied corrections in `path` (gzip'd JSON):
+    /// loaded now if it exists, saved every `SURVEY_SAVE_EVERY` seconds and
+    /// when the engine stops. Without it a restart starts the survey over
+    /// (an hour before estimates are reliable again) and forgets every
+    /// correction.
+    pub fn with_survey_file(mut self, path: &str) -> Engine {
+        match load_survey(path) {
+            Ok((sv, applied)) => {
+                tracing::info!(path, receivers = sv.receivers().count(), applied = applied.len(), "survey loaded");
+                self.survey = sv;
+                self.applied = applied;
+            }
+            Err(e) => tracing::info!(path, error = %e, "no survey loaded: starting empty"),
+        }
+        self.survey_file = Some(path.to_string());
+        self
+    }
+
+    fn encode_survey(&self) -> anyhow::Result<Vec<u8>> {
+        let applied: Vec<(String, [f64; 3])> = self.applied.iter().map(|(k, d)| (format!("{k:016x}"), *d)).collect();
+        let doc = serde_json::json!({"version": 1, "survey": self.survey.to_json(), "applied": applied});
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, serde_json::to_string(&doc)?.as_bytes())?;
+        Ok(gz.finish()?)
+    }
+
+    /// Save everything that has a file, now, on this thread (shutdown).
+    fn save_state_now(&self) {
+        if let Some(path) = &self.coverage_file {
+            match self.coverage.encode().and_then(|b| crate::persist::write_atomic(path, &b)) {
+                Ok(()) => tracing::info!(path, "coverage maps saved"),
+                Err(e) => tracing::warn!(path, error = %e, "coverage maps not saved"),
+            }
+        }
+        if let Some(path) = &self.survey_file {
+            match self.encode_survey().and_then(|b| crate::persist::write_atomic(path, &b)) {
+                Ok(()) => tracing::info!(path, "survey saved"),
+                Err(e) => tracing::warn!(path, error = %e, "survey not saved"),
+            }
+        }
     }
 
     /// Move receivers to their reliable survey estimates (survey::ApplyCfg).
@@ -789,7 +843,11 @@ impl Engine {
                 }
                 ev = rx.recv() => match ev {
                     Some(ev) => self.handle(ev),
-                    None => return,
+                    // Every sender gone: the process is stopping.
+                    None => {
+                        self.save_state_now();
+                        return;
+                    }
                 },
                 Some(q) = recv_opt(&mut queries) => self.answer(q),
             }
@@ -2504,11 +2562,23 @@ impl Engine {
             a.sync_bad *= 0.8;
         }
         self.send_serve_stats(now);
+        // Encoded here, written by another thread: a slow volume must not
+        // hold up the engine (persist.rs).
         if let Some(path) = &self.coverage_file {
             if now - self.coverage_saved >= COVERAGE_SAVE_EVERY {
                 self.coverage_saved = now;
-                if let Err(e) = self.coverage.save(path) {
-                    tracing::warn!(path, error = %e, "coverage maps not saved");
+                match self.coverage.encode() {
+                    Ok(b) => self.cov_writer.spawn(path.clone(), b),
+                    Err(e) => tracing::warn!(path, error = %e, "coverage maps not encoded"),
+                }
+            }
+        }
+        if let Some(path) = &self.survey_file {
+            if now - self.survey_saved >= SURVEY_SAVE_EVERY {
+                self.survey_saved = now;
+                match self.encode_survey() {
+                    Ok(b) => self.survey_writer.spawn(path.clone(), b),
+                    Err(e) => tracing::warn!(path, error = %e, "survey not encoded"),
                 }
             }
         }
@@ -2734,6 +2804,19 @@ fn adsb_at(h: &VecDeque<(Ecef, f64)>, t: f64) -> Option<Ecef> {
         .filter(|(_, tj)| (tj - t).abs() <= 1.0)
         .min_by(|a, b| (a.1 - t).abs().total_cmp(&(b.1 - t).abs()))
         .map(|(p, _)| p)
+}
+
+/// A survey file written by `encode_survey`: (the survey's sums, applied
+/// corrections).
+fn load_survey(path: &str) -> anyhow::Result<(Survey, HashMap<CovId, [f64; 3]>)> {
+    let mut txt = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(std::fs::File::open(path)?), &mut txt)?;
+    let doc: serde_json::Value = serde_json::from_str(&txt)?;
+    let mut sv = Survey::default();
+    sv.load_json(&doc["survey"]);
+    let applied: Vec<(String, [f64; 3])> = serde_json::from_value(doc["applied"].clone()).unwrap_or_default();
+    let applied = applied.into_iter().filter_map(|(k, d)| u64::from_str_radix(&k, 16).ok().map(|k| (k, d))).collect();
+    Ok((sv, applied))
 }
 
 /// The declared position (`enu`'s origin) moved by `d` (east, north, up m).
@@ -3015,5 +3098,31 @@ mod tests {
         let p = corrected(&enu, &[100.0, 200.0, 0.0]);
         let l = enu.to_enu(&p);
         assert!((l[0] - 100.0).abs() < 1e-6 && (l[1] - 200.0).abs() < 1e-6 && l[2].abs() < 1e-6, "{l:?}");
+    }
+
+    #[test]
+    fn survey_and_corrections_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("mlat-ng-survey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("survey.json.gz").to_string_lossy().to_string();
+        let mut e = engine().with_survey_file(&path);
+        // A receiver with closed windows, and a correction.
+        for w in 0..3 {
+            for i in 0..20 {
+                let t = w as f64 * 70.0 + i as f64;
+                let az = (i * 37 % 360) as f64;
+                let u = [az.to_radians().sin() * 0.99, az.to_radians().cos() * 0.99, 0.1];
+                e.survey.observe(42, 7, t, t, 5.0e14 + 10.0 * t + u[0] * 150.0, u);
+            }
+        }
+        e.survey.sweep(1000.0);
+        e.applied.insert(42, [120.0, -80.0, 0.0]);
+        let before = e.survey.estimate(42).unwrap();
+        e.save_state_now();
+        let e2 = engine().with_survey_file(&path);
+        let after = e2.survey.estimate(42).unwrap();
+        assert_eq!(e2.applied.get(&42), Some(&[120.0, -80.0, 0.0]));
+        assert!((after.d[0] - before.d[0]).abs() < 1e-9 && after.windows == before.windows, "{before:?} {after:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -421,6 +421,12 @@ impl Coverage {
 
     /// Save every map (gzip'd JSON). Only non-empty bins are written.
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
+        crate::persist::write_atomic(path, &self.encode()?)
+    }
+
+    /// The maps as `save` writes them, in memory (the engine encodes on its
+    /// thread and leaves the disk to another one).
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Out<'a> {
             id: String,
@@ -448,13 +454,9 @@ impl Coverage {
                 unique_seen: m.unique_seen.iter().copied().collect(),
             })
             .collect();
-        let tmp = format!("{path}.tmp");
-        let f = std::fs::File::create(&tmp)?;
-        let mut gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(serde_json::to_string(&serde_json::json!({"version": 1, "maps": maps}))?.as_bytes())?;
-        gz.finish()?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        Ok(gz.finish()?)
     }
 
     /// Load maps saved by `save`; receivers are placed again when they connect.

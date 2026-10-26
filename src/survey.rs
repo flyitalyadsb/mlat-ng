@@ -79,7 +79,7 @@ struct Win {
     sxz: [f64; 3],
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct Acc {
     n: [[f64; 3]; 3],
     b: [f64; 3],
@@ -248,6 +248,23 @@ impl Survey {
 
     pub fn receivers(&self) -> impl Iterator<Item = RxKey> + '_ {
         self.acc.keys().copied()
+    }
+
+    /// The accumulated sums (open windows are not kept: at most a minute of
+    /// observations is lost).
+    pub fn to_json(&self) -> serde_json::Value {
+        let acc: Vec<(String, &Acc)> = self.acc.iter().map(|(k, a)| (format!("{k:016x}"), a)).collect();
+        serde_json::json!(acc)
+    }
+
+    pub fn load_json(&mut self, v: &serde_json::Value) -> usize {
+        let Ok(acc) = serde_json::from_value::<Vec<(String, Acc)>>(v.clone()) else { return 0 };
+        for (k, a) in acc {
+            if let Ok(k) = u64::from_str_radix(&k, 16) {
+                self.acc.insert(k, a);
+            }
+        }
+        self.acc.len()
     }
 }
 

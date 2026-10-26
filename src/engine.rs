@@ -78,6 +78,8 @@ const GEO_OWN_AGE: f64 = 60.0;
 const GEO_SAMPLE_AGE: f64 = 30.0;
 /// Mode A/C payloads that are shared by too many aircraft at once (VFR,
 /// conspicuity, defaults) or are line noise, as acbridge.py/mlat-client.
+/// Seconds of clock-dated ADS-B positions kept per aircraft (adsb_hist).
+const ADSB_HIST_S: f64 = 30.0;
 /// WallMap: bucket length (s; the minimum covers one to two buckets) and the
 /// deliveries needed before it maps.
 const WALLMAP_BUCKET: f64 = 30.0;
@@ -262,9 +264,12 @@ struct Aircraft {
     /// diagnose multilateration of aircraft that also broadcast ADS-B.
     adsb: Option<(Ecef, f64)>,
     adsb_vel: Option<[f64; 3]>,
-    /// The same, dated by the receiving receiver's clock (WallMap).
-    adsb_rx: Option<(Ecef, f64)>,
-    adsb_rx_vel: Option<[f64; 3]>,
+    /// The last `ADSB_HIST_S` seconds of its ADS-B positions, dated by the
+    /// receiving receivers' clocks (WallMap): the 2-site check interpolates
+    /// in them. A velocity from consecutive positions is no good for that:
+    /// they come from different receivers whose datings differ by up to a
+    /// second, and live it put the "truth" ~2.4 km off (2026-10-26).
+    adsb_hist: VecDeque<(Ecef, f64)>,
     /// Time of the last Comm-B ground velocity accepted into the track.
     last_vel_update: f64,
     /// Own geometric-minus-baro altitude (ft, from ADS-B TC 19) and its time.
@@ -1243,14 +1248,15 @@ impl Engine {
                         let _ = std::io::Write::write_all(w, format!("{line}\n").as_bytes());
                     }
                 }
-                if let Some((p0, t0)) = ac.adsb_rx {
-                    let dt = tw - t0;
-                    if dt > 0.5 && dt < 15.0 {
-                        ac.adsb_rx_vel = Some([(pb[0] - p0[0]) / dt, (pb[1] - p0[1]) / dt, (pb[2] - p0[2]) / dt]);
-                    }
+                let h = &mut ac.adsb_hist;
+                if h.iter().all(|(_, t0)| (tw - t0).abs() > 0.2) {
+                    // Datings from different receivers can arrive out of
+                    // order: keep the history sorted.
+                    let i = h.partition_point(|(_, t0)| *t0 < tw);
+                    h.insert(i, (pb, tw));
                 }
-                if ac.adsb_rx.map(|(_, t0)| tw - t0 > 0.5).unwrap_or(true) {
-                    ac.adsb_rx = Some((pb, tw));
+                while h.back().is_some_and(|(_, tl)| h.front().is_some_and(|(_, t0)| tl - t0 > ADSB_HIST_S)) {
+                    h.pop_front();
                 }
             }
             // A validated ADS-B position: who hears this aircraft, and who
@@ -1973,22 +1979,9 @@ impl Engine {
             r.off = off;
         }
         let heard = ac.two_heard.clone();
-        // The aircraft's own ADS-B, dated by the receivers' clocks like the
-        // solution (arrival-dated ADS-B moved the "truth" km away in the
-        // hybrid: two paths, two delays).
-        let (adsb, adsb_vel) = match ac.adsb_rx {
-            Some(x) => (Some(x), ac.adsb_rx_vel),
-            None => (ac.adsb, ac.adsb_vel),
-        };
-        let truth_at = |tt: f64| {
-            adsb.filter(|(_, ta)| now - ta < 5.0).map(|(p, ta)| {
-                let v = adsb_vel.unwrap_or([0.0; 3]);
-                let dt = tt - ta;
-                [p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt]
-            })
-        };
-        let truth = truth_at(t);
-        let truth_arr = truth_at(t_arr);
+        // The aircraft's own ADS-B at the solution's time, both dated by the
+        // receivers' clocks: interpolated, never extrapolated (adsb_hist).
+        let truth = adsb_at(&ac.adsb_hist, t);
         let last = recs.last().unwrap().clone();
         let mid = ecef_to_llh([(last.ra[0] + last.rb[0]) / 2.0, (last.ra[1] + last.rb[1]) / 2.0, (last.ra[2] + last.rb[2]) / 2.0]);
         let silent: Vec<CovId> = self
@@ -2068,8 +2061,10 @@ impl Engine {
         ac.last_fix_update = t_arr;
         ac.last_vel_update = t_arr;
         self.stats.two_site_tracked.fetch_add(1, Ordering::Relaxed);
-        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t_arr, now, &[]), truth_arr) {
-            self.two_site_pub.push_back((now, dist(&p, &pos)));
+        // The published position, taken back to the solution's time.
+        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t_arr, now, &[]), truth) {
+            let back = [pos[0] - shift[0], pos[1] - shift[1], pos[2] - shift[2]];
+            self.two_site_pub.push_back((now, dist(&p, &back)));
         }
     }
 
@@ -2651,6 +2646,27 @@ fn sync_bad_share(a: &Aircraft) -> f64 {
     }
 }
 
+/// An aircraft's ADS-B position at time `t` from its clock-dated history:
+/// interpolated between the positions either side (at most 3 s apart), or
+/// the nearest one within 1 s; None otherwise.
+fn adsb_at(h: &VecDeque<(Ecef, f64)>, t: f64) -> Option<Ecef> {
+    let i = h.partition_point(|(_, ti)| *ti < t);
+    if i > 0 && i < h.len() {
+        let ((p0, t0), (p1, t1)) = (h[i - 1], h[i]);
+        if t1 - t0 <= 3.0 {
+            let k = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+            return Some([p0[0] + k * (p1[0] - p0[0]), p0[1] + k * (p1[1] - p0[1]), p0[2] + k * (p1[2] - p0[2])]);
+        }
+    }
+    [i.checked_sub(1), (i < h.len()).then_some(i)]
+        .into_iter()
+        .flatten()
+        .map(|j| h[j])
+        .filter(|(_, tj)| (tj - t).abs() <= 1.0)
+        .min_by(|a, b| (a.1 - t).abs().total_cmp(&(b.1 - t).abs()))
+        .map(|(p, _)| p)
+}
+
 pub(crate) fn fxhash(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &x in b {
@@ -2872,5 +2888,17 @@ mod tests {
         }
         let t = m.map(5300.0, 6301.0).unwrap();
         assert!((t - 6300.9).abs() < 1e-9, "{t}");
+    }
+
+    #[test]
+    fn adsb_truth_is_interpolated_never_extrapolated() {
+        let h: VecDeque<(Ecef, f64)> = [([0.0, 0.0, 0.0], 10.0), ([200.0, 0.0, 0.0], 11.0), ([1000.0, 0.0, 0.0], 20.0)].into_iter().collect();
+        assert_eq!(adsb_at(&h, 10.5).unwrap(), [100.0, 0.0, 0.0]);
+        // A 9 s gap: only a position within 1 s counts.
+        assert_eq!(adsb_at(&h, 11.8).unwrap(), [200.0, 0.0, 0.0]);
+        assert!(adsb_at(&h, 15.0).is_none());
+        assert_eq!(adsb_at(&h, 20.6).unwrap(), [1000.0, 0.0, 0.0]);
+        assert!(adsb_at(&h, 22.0).is_none());
+        assert!(adsb_at(&VecDeque::new(), 1.0).is_none());
     }
 }

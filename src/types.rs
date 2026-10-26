@@ -104,6 +104,26 @@ pub struct ReceiverInfo {
     pub client_version: String,
     /// Negotiated compression: "zlib2" | "zlib" | "none".
     pub compress: &'static str,
+    /// Set when this server is the receiver's real server (serve mode): the
+    /// engine then chooses its traffic and answers it. None = shadow, or an
+    /// input that is not an mlat-client (the Beast feed).
+    pub serve: Option<ServeOpts>,
+}
+
+/// What a served client asked for in its handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeOpts {
+    pub results: ResultFormat,
+    /// `return_stats`: a `{"stats": ...}` line every 15 s.
+    pub stats: bool,
+}
+
+/// mlat-server's two result layouts (`report_mlat_position_old` / `_ecef`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultFormat {
+    None,
+    Old,
+    Ecef,
 }
 
 /// What the engine may ask a connection to do. Only used in serve mode: in
@@ -114,6 +134,8 @@ pub enum ToClient {
     StopSending(Vec<u32>),
     /// A pre-serialised `{"result": ...}` line (without the newline).
     ResultLine(String),
+    /// A pre-serialised `{"stats": ...}` line (without the newline).
+    StatsLine(String),
     /// Close the connection after flushing.
     Close,
 }

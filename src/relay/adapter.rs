@@ -356,6 +356,7 @@ impl Adapter {
                         source_ip: "feed".into(),
                         client_version: "feed".into(),
                         compress: "none",
+                        serve: None,
                     },
                     tx: self.tx.clone(),
                 });

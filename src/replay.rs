@@ -21,6 +21,7 @@ use flate2::read::GzDecoder;
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::clientsim::ClientSim;
 use crate::engine::{fxhash, Engine, EngineConfig, Stats};
 use crate::hybrid::{Router, RouterStats, Src};
 use crate::relay::adapter::{Adapter, AdapterConfig, AdapterStats};
@@ -80,6 +81,107 @@ pub struct ReplayArgs {
     /// pair of receivers only, so the bench scores 2-site positions.
     #[arg(long, default_value_t = false)]
     bench_two_sites: bool,
+    /// Serve mode: every receiver in the registry becomes an emulated
+    /// mlat-client (clientsim.rs) instead of the feed adapter. `select`: the
+    /// engine chooses what each client sends; `all`: every client sends
+    /// everything (the no-selection baseline). `off`: the feed path.
+    #[arg(long, default_value = "off")]
+    serve_sim: String,
+    /// Serve selection: seconds without ADS-B before multilaterating.
+    #[arg(long, default_value_t = 120.0)]
+    serve_no_adsb_s: f64,
+    #[arg(long, default_value_t = 12.0)]
+    serve_max_sync_rate: f64,
+    /// Instead of replaying: write the frames of receivers within
+    /// `--extract-km` of `--extract-near LAT,LON` into this directory, one
+    /// file per receiver of (arrival time, plain Beast frame) records, for
+    /// feeding real mlat-clients. Stops after `--extract-seconds` of capture.
+    #[arg(long)]
+    extract_dir: Option<String>,
+    #[arg(long, default_value = "45.46,9.19")]
+    extract_near: String,
+    #[arg(long, default_value_t = 120.0)]
+    extract_km: f64,
+    #[arg(long, default_value_t = 300.0)]
+    extract_seconds: f64,
+}
+
+/// Plain Beast (`0x1A '2'|'3'` + 6-byte timestamp + signal + payload, 0x1A
+/// doubled), the format mlat-client reads with `--input-type beast`.
+fn beast_plain(f: &Frame, out: &mut Vec<u8>) {
+    out.push(0x1A);
+    out.push(f.kind);
+    let mut push = |b: u8| {
+        out.push(b);
+        if b == 0x1A {
+            out.push(0x1A);
+        }
+    };
+    for i in (0..6).rev() {
+        push((f.ts >> (8 * i)) as u8);
+    }
+    push(f.sig);
+    for &b in f.bytes() {
+        push(b);
+    }
+}
+
+fn extract(a: &ReplayArgs, dir: &str, reg: &HashMap<u64, registry::Receiver>) -> anyhow::Result<()> {
+    use std::io::Write;
+    let p: Vec<f64> = a.extract_near.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?;
+    anyhow::ensure!(p.len() == 2, "--extract-near LAT,LON");
+    let hav = |lat: f64, lon: f64| {
+        let (la1, la2) = (p[0].to_radians(), lat.to_radians());
+        let x = ((la2 - la1) / 2.0).sin().powi(2) + la1.cos() * la2.cos() * ((lon - p[1]).to_radians() / 2.0).sin().powi(2);
+        12_742.0 * x.sqrt().asin()
+    };
+    std::fs::create_dir_all(dir)?;
+    let mut files: HashMap<u64, (std::io::BufWriter<File>, u64)> = HashMap::new();
+    let mut buf = Vec::new();
+    for spec in &a.captures {
+        let mut src = Source::open(spec)?;
+        let end = src.start + a.extract_seconds;
+        while let Some((wall, frames)) = src.next()? {
+            if wall > end {
+                break;
+            }
+            for f in &frames {
+                if f.kind == b'1' {
+                    continue;
+                }
+                let Some(r) = reg.get(&f.rid) else { continue };
+                if hav(r.lat, r.lon) > a.extract_km {
+                    continue;
+                }
+                let e = match files.get_mut(&f.rid) {
+                    Some(e) => e,
+                    None => {
+                        let w = std::io::BufWriter::new(File::create(format!("{dir}/{:016x}.rec", f.rid))?);
+                        files.entry(f.rid).or_insert((w, 0))
+                    }
+                };
+                // Record: arrival wall time (f64 LE), length (u16 LE), then
+                // the frame as plain Beast; the test server paces by the
+                // wall time so every receiver's stream stays aligned.
+                buf.clear();
+                beast_plain(f, &mut buf);
+                e.0.write_all(&wall.to_le_bytes())?;
+                e.0.write_all(&(buf.len() as u16).to_le_bytes())?;
+                e.0.write_all(&buf)?;
+                e.1 += 1;
+            }
+        }
+    }
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    for (rid, (mut w, n)) in files {
+        w.flush()?;
+        let r = &reg[&rid];
+        list.push(json!({"rid": format!("{rid:016x}"), "frames": n, "user": r.user, "lat": r.lat, "lon": r.lon, "alt": r.alt, "clock": r.clock.as_str()}));
+    }
+    list.sort_by_key(|v| std::cmp::Reverse(v["frames"].as_u64().unwrap_or(0)));
+    std::fs::write(format!("{dir}/receivers.json"), serde_json::to_string_pretty(&list)?)?;
+    eprintln!("extracted {} receivers into {dir}", list.len());
+    Ok(())
 }
 
 struct Counting<R> {
@@ -158,6 +260,9 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let a = ReplayArgs::parse_from(argv);
     let doc: registry::Doc = serde_json::from_reader(File::open(&a.receivers)?)?;
     let reg = registry::parse(&doc);
+    if let Some(dir) = &a.extract_dir {
+        return extract(&a, dir, &reg);
+    }
     let mut srcs: Vec<Source> = a.captures.iter().map(|c| Source::open(c)).collect::<anyhow::Result<_>>()?;
     let t0 = srcs.iter().map(|s| s.start).fold(f64::INFINITY, f64::min);
     let t_end = srcs.iter().map(|s| s.start + s.dur).fold(f64::NEG_INFINITY, f64::max);
@@ -169,7 +274,12 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let mut eng = Engine::new(ecfg, stats.clone(), out)
         .with_bench_output(bench)
         .with_two_site(a.two_site)
-        .with_bench_two_sites(a.bench_two_sites);
+        .with_bench_two_sites(a.bench_two_sites)
+        .with_serve_params(crate::interest::Params {
+            no_adsb_mlat_s: a.serve_no_adsb_s,
+            max_sync_rate: a.serve_max_sync_rate,
+            ..crate::interest::Params::default()
+        });
     if let Some(p) = &a.coverage_from {
         eng = eng.load_coverage(p)?;
     }
@@ -184,9 +294,16 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         probation: a.probation,
         ..AdapterConfig::default()
     };
+    anyhow::ensure!(["off", "select", "all"].contains(&a.serve_sim.as_str()), "--serve-sim: off|select|all");
+    let serve_sim = a.serve_sim != "off";
+    let mut csim = ClientSim::new(a.serve_sim == "select");
+    let mut cs_evs = Vec::new();
+    let sim_reg = reg.clone();
     let mut ad = Adapter::new(acfg.clone(), astats.clone());
     let mut evs = Vec::new();
-    ad.set_registry(reg.clone(), &mut evs);
+    if !serve_sim {
+        ad.set_registry(reg.clone(), &mut evs);
+    }
     // Hybrid test: stand-in mlat-clients for a share of receivers.
     anyhow::ensure!(["dup", "split", "drop"].contains(&a.hybrid_mode.as_str()), "--hybrid-mode: dup|split|drop");
     let hyb = a.hybrid_clients > 0.0;
@@ -260,6 +377,10 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             for ev in emu_evs.drain(..) {
                 router.on_event(Src::Client, ev, &mut routed);
             }
+            if serve_sim {
+                csim.tick(next_tick, &mut cs_evs);
+                routed.append(&mut cs_evs);
+            }
             for ev in routed.drain(..) {
                 events += 1;
                 eng.handle_at(ev, next_tick);
@@ -268,6 +389,10 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         }
         for f in &chunk {
             frames += 1;
+            if serve_sim {
+                csim.on_frame(f, wall, &sim_reg, 1 << 60, &mut cs_evs);
+                continue;
+            }
             if feed_takes(f.rid) {
                 ad.on_frame(f, wall, &mut evs);
             }
@@ -286,6 +411,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         for ev in emu_evs.drain(..) {
             router.on_event(Src::Client, ev, &mut routed);
         }
+        routed.append(&mut cs_evs);
         for ev in routed.drain(..) {
             events += 1;
             eng.handle_at(ev, wall);
@@ -343,7 +469,31 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     }
     let l = |x: &AtomicU64| x.load(Ordering::Relaxed);
     let snap = stats.snapshot.lock().unwrap().clone();
+    let (sent, req_mean) = csim.totals();
+    let secs = (t_end - t0).max(1.0);
+    let n_cl = csim.len().max(1) as f64;
+    let per_client: Vec<f64> = csim.per_client().into_iter().map(|n| n as f64 / secs).collect();
+    let pc = {
+        let mut v = per_client;
+        v.sort_by(|a, b| a.total_cmp(b));
+        let q = |p: f64| if v.is_empty() { 0.0 } else { (v[((v.len() - 1) as f64 * p) as usize] * 100.0).round() / 100.0 };
+        json!({"p50": q(0.5), "p90": q(0.9), "p99": q(0.99), "max": q(1.0)})
+    };
+    let serve = json!({
+        "mode": a.serve_sim,
+        "clients": csim.len(),
+        "msgs_per_s_per_client": pc,
+        "sync_per_s_per_client": ((sent.sync as f64 / secs / n_cl) * 100.0).round() / 100.0,
+        "mlat_per_s_per_client": ((sent.mlat as f64 / secs / n_cl) * 100.0).round() / 100.0,
+        "sync_total": sent.sync, "mlat_total": sent.mlat,
+        "results_to_clients": sent.results,
+        "start_lines": sent.start_lines, "stop_lines": sent.stop_lines,
+        "requested_peak_mean": (req_mean * 10.0).round() / 10.0,
+        "engine_requested_sync": snap.serve_requested_sync, "engine_requested_mlat": snap.serve_requested_mlat,
+        "engine_mlat_wanted": snap.serve_mlat_wanted,
+    });
     let summary = json!({
+        "serve_sim": serve,
         "two_site": two_site,
         "sim_seconds": t_end - t0,
         "processing_seconds": (wall_s * 10.0).round() / 10.0,
@@ -383,7 +533,10 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             "fix_error_by_receivers": by_rx.into_iter().map(|(k, v)| (k.to_string(), quantiles(v))).collect::<HashMap<_, _>>(),
             "positions": bench_lines, "aircraft": bench_ac.len(),
         },
-        "modes_only": {"positions": main_lines, "aircraft": main_ac.len()},
+        // Aircraft on the main output that never showed up on the bench (no
+        // ADS-B position during the whole run): the truly Mode-S-only ones.
+        "modes_only": {"positions": main_lines, "aircraft": main_ac.len(),
+            "aircraft_never_adsb": main_ac.difference(&bench_ac).count()},
         "hybrid": {
             "clients_share": a.hybrid_clients, "mode": a.hybrid_mode, "client_receivers": client_rids.len(),
             "stand_in_clients_live": l(&emu_stats.receivers_live),

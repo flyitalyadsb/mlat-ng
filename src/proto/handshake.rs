@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use super::py::{self, PyErr};
 use super::ListenConfig;
-use crate::types::ClockType;
+use crate::types::{ClockType, ResultFormat};
 
 /// Note PR #14 adds to the motd of a client sending the sample-.env uuid.
 const PLACEHOLDER_NOTE: &str = "Your MLAT client sends the placeholder uuid of the sample .env (XXXXXXXX-...). \
@@ -41,6 +41,8 @@ pub(crate) struct Accepted {
     pub client_version: String,
     pub compress: &'static str,
     pub return_results: bool,
+    /// The layout results go out in when `return_results` (default "old").
+    pub result_format: ResultFormat,
     /// `hs.get('return_stats', False)`, echoed back verbatim like mlat-server.
     pub return_stats: Value,
     /// Extra motd paragraphs (PR #14's placeholder-uuid note).
@@ -164,15 +166,16 @@ fn check(hs: &Value) -> Result<Accepted, Refusal> {
     let clock_type = hs.get("clock_type").map_or_else(|| "dump1090".to_string(), py::str);
 
     let return_results = py::truthy(hs.get("return_results"));
+    let mut result_format = ResultFormat::None;
     if return_results {
-        let ok = match hs.get("return_result_format") {
-            None => true, // defaults to 'old'
-            Some(Value::String(f)) => f == "old" || f == "ecef",
-            Some(_) => false,
+        result_format = match hs.get("return_result_format") {
+            None => ResultFormat::Old, // defaults to 'old'
+            Some(Value::String(f)) if f == "old" => ResultFormat::Old,
+            Some(Value::String(f)) if f == "ecef" => ResultFormat::Ecef,
+            Some(_) => {
+                return Err(Refusal::Value("invalid return_result_format, should be one of \"old\" or \"ecef\"".into()));
+            }
         };
-        if !ok {
-            return Err(Refusal::Value("invalid return_result_format, should be one of \"old\" or \"ecef\"".into()));
-        }
     }
     let return_stats = hs.get("return_stats").cloned().unwrap_or(Value::Bool(false));
     let privacy = py::truthy(hs.get("privacy"));
@@ -193,6 +196,7 @@ fn check(hs: &Value) -> Result<Accepted, Refusal> {
         client_version,
         compress,
         return_results,
+        result_format,
         return_stats,
         notes,
     })

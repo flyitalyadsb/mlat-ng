@@ -43,13 +43,14 @@ use crate::altmodel::{self, AltModel};
 use crate::clock::{band_of, receiver_noise_scale, Outcome, PairModel, PAIR_BUDGET};
 use crate::coverage::{CovId, Coverage};
 use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Enu, Llh, C_AIR, FT_TO_M};
+use crate::interest::{self, AcMeta, AcState, Interest};
 use crate::modes;
 use crate::norm::{self, Copy, Node};
-use crate::output::{sbs_line, SbsFix};
+use crate::output::{result_ecef, result_old, sbs_line, ClientResult, SbsFix};
 use crate::solver::{self, Fix, Meas, SolveInput};
 use crate::track::{Gate, Track};
 use crate::twosite::{self, Rec2};
-use crate::types::{ConnId, Event, ReceiverInfo, ToClient};
+use crate::types::{ConnId, Event, ReceiverInfo, ResultFormat, ToClient};
 
 /// Aircraft-to-receiver range beyond which a sync point is not used (radio
 /// horizon at FL450 is ~480 km).
@@ -76,6 +77,10 @@ const GEO_OWN_AGE: f64 = 60.0;
 const GEO_SAMPLE_AGE: f64 = 30.0;
 /// Mode A/C payloads that are shared by too many aircraft at once (VFR,
 /// conspicuity, defaults) or are line noise, as acbridge.py/mlat-client.
+/// Serve mode: `{"stats": ...}` to clients that asked, this often (s); the
+/// sync-point share of an aircraft is judged over this many observations.
+const SERVE_STATS_EVERY: f64 = 15.0;
+const SYNC_QUALITY_MIN_OBS: f32 = 20.0;
 const MODEAC_BLACKLIST: [u16; 20] = [
     0x1200, 0x7000, 0x2000, 0x0000, 0x1000, 0x0002, 0x0004, 0x0006, 0x0040, 0x0060, 0x0020, 0x0030, 0x0010, 0x0410,
     0x0430, 0x0420, 0x0460, 0x0440, 0x0640, 0x0660,
@@ -117,6 +122,12 @@ struct Rx {
     noise_scale: f64,
     /// Stable identity for its coverage map (survives reconnects).
     cov: CovId,
+    /// Serve mode: its last rate report (None = it never sent one), what it
+    /// is currently asked for, and how that splits into sync and mlat.
+    rate: Option<HashMap<u32, f32>>,
+    requested: HashSet<u32>,
+    want_sync: usize,
+    want_mlat: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +182,12 @@ struct Group {
 #[derive(Default)]
 struct Aircraft {
     tracking: u32,
+    /// The receivers counted in `tracking` (serve mode's rate pairs).
+    seen_by: HashSet<RxKey>,
+    /// Sync observations of this aircraft accepted / rejected by clock
+    /// pairs, decayed: a share of rejects marks bad ADS-B positions.
+    sync_ok: f32,
+    sync_bad: f32,
     alt_ft: Option<i32>,
     alt_t: f64,
     squawk: Option<u16>,
@@ -346,6 +363,18 @@ pub struct Stats {
     pub bridge_receivers: AtomicU64,
     pub bridged_copies: AtomicU64,
     pub loop_late_ms_max: AtomicU64,
+    /// Serve mode: start_sending / stop_sending lines, result and stats lines
+    /// sent, and engine lines dropped on a full connection queue.
+    pub serve_start_lines: AtomicU64,
+    pub serve_stop_lines: AtomicU64,
+    pub serve_results: AtomicU64,
+    pub serve_stats_lines: AtomicU64,
+    pub serve_send_full: AtomicU64,
+    /// Aircraft asked for the moment they became wanted (beyond mlat-server).
+    pub serve_fast_starts: AtomicU64,
+    /// Positions kept off the output because no served receiver contributed
+    /// (served-output-only).
+    pub outputs_not_served: AtomicU64,
     /// Snapshot for /state.json and the gauges, rewritten every second.
     pub snapshot: Mutex<Snapshot>,
     /// Worst recent ADS-B-checked updates, for /debug.json.
@@ -388,6 +417,12 @@ pub struct Snapshot {
     /// Altitude model: 1-degree cells with data, and aircraft samples held.
     pub alt_model_cells: usize,
     pub alt_model_samples: usize,
+    /// Serve mode: served receivers, the aircraft they are asked for in
+    /// total (sync / mlat), and the mlat-wanted aircraft.
+    pub serve_receivers: usize,
+    pub serve_requested_sync: usize,
+    pub serve_requested_mlat: usize,
+    pub serve_mlat_wanted: usize,
 }
 
 pub struct Engine {
@@ -432,6 +467,15 @@ pub struct Engine {
     two_site_dump: Option<std::io::BufWriter<std::fs::File>>,
     /// Regional geometric-minus-baro altitude model (altmodel.rs).
     alt_model: AltModel,
+    /// Serve mode: traffic selection, and when stats last went out.
+    interest: Interest,
+    serve_stats_at: f64,
+    /// Served receivers connected (no serve work at all while 0).
+    served_n: usize,
+    /// Publish only positions some served receiver contributed to: the
+    /// output then covers what a production shard for the served region
+    /// would, while the shadow input still helps every fix.
+    served_output_only: bool,
 }
 
 /// A receiver's coverage identity: its UUID key (as the Beast feed keys it)
@@ -517,6 +561,10 @@ impl Engine {
             two_site_pub: VecDeque::new(),
             two_site_dump: None,
             alt_model: AltModel::default(),
+            interest: Interest::new(interest::Params::default(), 0x5e7e),
+            serve_stats_at: 0.0,
+            served_n: 0,
+            served_output_only: false,
         }
     }
 
@@ -564,6 +612,17 @@ impl Engine {
             Err(e) => tracing::info!(path, error = %e, "no coverage maps loaded: starting empty"),
         }
         self.coverage_file = Some(path.to_string());
+        self
+    }
+
+    pub fn with_served_output_only(mut self, on: bool) -> Engine {
+        self.served_output_only = on;
+        self
+    }
+
+    /// Serve mode's selection parameters (interest.rs).
+    pub fn with_serve_params(mut self, p: interest::Params) -> Engine {
+        self.interest = Interest::new(p, 0x5e7e);
         self
     }
 
@@ -620,6 +679,7 @@ impl Engine {
                     self.process_due(now);
                     if last_second.elapsed() >= Duration::from_secs(1) {
                         last_second = Instant::now();
+                        self.serve_refresh(now);
                         self.expire(now);
                         self.publish(rx.len());
                     }
@@ -649,9 +709,9 @@ impl Engine {
             Event::Disconnect { conn } => self.disconnect(conn),
             Event::Sync { conn, et, ot, em, om } => self.on_sync(conn, et, ot, &em, &om, now),
             Event::Mlat { conn, t, msg, rx } => self.on_mlat(conn, t, &msg, rx.min(now)),
-            Event::Seen { conn, icao } => self.on_seen(conn, &icao),
-            Event::Lost { conn, icao } => self.on_lost(conn, &icao),
-            Event::RateReport { .. } => {}
+            Event::Seen { conn, icao } => self.on_seen(conn, &icao, now),
+            Event::Lost { conn, icao } => self.on_lost(conn, &icao, now),
+            Event::RateReport { conn, rates } => self.on_rate_report(conn, rates, now),
             Event::GeoBaro { icao, delta_ft } => {
                 self.aircraft.entry(icao).or_default().geo_baro = Some((delta_ft as f64, now));
             }
@@ -694,6 +754,10 @@ impl Engine {
             used: 0,
             noise_scale: 1.0,
             cov: 0,
+            rate: None,
+            requested: HashSet::new(),
+            want_sync: 0,
+            want_mlat: 0,
         };
         let cov = cov_id(&r.info);
         self.coverage.place(cov, r.info.lat, r.info.lon, now);
@@ -702,6 +766,9 @@ impl Engine {
         let mut r = r;
         r.cov = cov;
         self.rx_by_conn.insert(conn, key);
+        if r.info.serve.is_some() {
+            self.served_n += 1;
+        }
         self.rxs.insert(key, r);
     }
 
@@ -727,6 +794,9 @@ impl Engine {
         let Some(k) = self.rx_by_conn.remove(&conn) else { return };
         self.drop_pairs(k);
         if let Some(r) = self.rxs.remove(&k) {
+            if r.info.serve.is_some() {
+                self.served_n -= 1;
+            }
             if self.rx_by_cov.get(&r.cov) == Some(&k) {
                 self.rx_by_cov.remove(&r.cov);
                 self.coverage.unplace(r.cov);
@@ -734,6 +804,7 @@ impl Engine {
             for icao in r.seen {
                 if let Some(a) = self.aircraft.get_mut(&icao) {
                     a.tracking = a.tracking.saturating_sub(1);
+                    a.seen_by.remove(&k);
                 }
             }
         }
@@ -749,31 +820,200 @@ impl Engine {
         }
     }
 
-    fn on_seen(&mut self, conn: ConnId, icao: &[u32]) {
+    fn on_seen(&mut self, conn: ConnId, icao: &[u32], now: f64) {
         let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
         let Some(r) = self.rxs.get_mut(&k) else { return };
-        let mut start = Vec::new();
+        let mut fresh = Vec::new();
         for &a in icao {
             if r.seen.insert(a) {
-                self.aircraft.entry(a).or_default().tracking += 1;
-                start.push(a);
+                let ac = self.aircraft.entry(a).or_default();
+                ac.tracking += 1;
+                ac.seen_by.insert(k);
+                fresh.push(a);
             }
         }
-        if !self.cfg.shadow && !start.is_empty() {
-            // Serve mode (experimental): ask for every aircraft the receiver
-            // hears. Never used in shadow mode, where the primary decides.
-            let _ = r.tx.try_send(ToClient::StartSending(start));
+        let (served, legacy) = (r.info.serve.is_some(), r.rate.is_none());
+        // A client without rate reports is re-steered on what it sees
+        // (coordinator.py receiver_tracking_add).
+        if served && legacy {
+            self.update_interest(k, now);
+            return;
+        }
+        if self.served_n == 0 || fresh.is_empty() {
+            return;
+        }
+        // Beyond mlat-server: a second receiver seeing an aircraft can make it
+        // wanted, and a receiver newly seeing a wanted aircraft is asked for
+        // it now, not at its next rate report (~18 s): aircraft crossing the
+        // edge of coverage get multilaterated before they are gone.
+        self.serve_refresh(now);
+        if served {
+            let mine: Vec<u32> = fresh.into_iter().filter(|a| self.interest.wanted().contains(a)).collect();
+            self.push_mlat(&mine);
         }
     }
 
-    fn on_lost(&mut self, conn: ConnId, icao: &[u32]) {
+    /// Serve mode: recompute the mlat-wanted set (rate-limited) and ask the
+    /// served receivers that see a newly wanted aircraft for it at once.
+    fn serve_refresh(&mut self, now: f64) {
+        if self.served_n == 0 {
+            return;
+        }
+        let newly = self.interest.refresh_wanted(
+            now,
+            self.aircraft.iter().filter(|(_, a)| a.tracking > 0).map(|(&icao, a)| AcState {
+                icao,
+                tracking: a.tracking as usize,
+                last_adsb: a.last_adsb,
+                sync_bad: sync_bad_share(a),
+            }),
+        );
+        if !newly.is_empty() {
+            self.push_mlat(&newly);
+        }
+    }
+
+    /// Ask every served receiver that sees one of `icaos` (and is not
+    /// distrusted, nor already asked) for it.
+    fn push_mlat(&mut self, icaos: &[u32]) {
+        let mut by_rx: HashMap<RxKey, Vec<u32>> = HashMap::new();
+        for &a in icaos {
+            let Some(ac) = self.aircraft.get(&a) else { continue };
+            for &k in &ac.seen_by {
+                if let Some(r) = self.rxs.get(&k) {
+                    if r.info.serve.is_some() && !r.suspect && !r.requested.contains(&a) {
+                        by_rx.entry(k).or_default().push(a);
+                    }
+                }
+            }
+        }
+        for (k, mut list) in by_rx {
+            let Some(r) = self.rxs.get_mut(&k) else { continue };
+            list.sort_unstable();
+            if r.tx.try_send(ToClient::StartSending(list.clone())).is_ok() {
+                self.stats.serve_start_lines.fetch_add(1, Ordering::Relaxed);
+                self.stats.serve_fast_starts.fetch_add(list.len() as u64, Ordering::Relaxed);
+                r.want_mlat += list.len();
+                r.requested.extend(list);
+            } else {
+                self.stats.serve_send_full.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn on_lost(&mut self, conn: ConnId, icao: &[u32], now: f64) {
         let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
         let Some(r) = self.rxs.get_mut(&k) else { return };
         for &a in icao {
             if r.seen.remove(&a) {
                 if let Some(ac) = self.aircraft.get_mut(&a) {
                     ac.tracking = ac.tracking.saturating_sub(1);
+                    ac.seen_by.remove(&k);
                 }
+            }
+        }
+        if r.info.serve.is_some() && r.rate.is_none() {
+            self.update_interest(k, now);
+        }
+    }
+
+    /// Every receiver's rate report is kept (a served receiver's peers may be
+    /// shadow receivers: their rates still score the pairs); a served
+    /// receiver is re-steered on its own (coordinator.py
+    /// receiver_rate_report).
+    fn on_rate_report(&mut self, conn: ConnId, rates: Vec<(u32, f32)>, now: f64) {
+        let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
+        let Some(r) = self.rxs.get_mut(&k) else { return };
+        r.rate = Some(rates.into_iter().collect());
+        if r.info.serve.is_some() {
+            self.update_interest(k, now);
+        }
+    }
+
+    /// Serve mode: choose what receiver `k` is asked for and send the change
+    /// (interest.rs).
+    fn update_interest(&mut self, k: RxKey, now: f64) {
+        self.serve_refresh(now);
+        let (interest, aircraft, rxs) = (&mut self.interest, &self.aircraft, &self.rxs);
+        let Some(r) = rxs.get(&k) else { return };
+        let peers = |icao: u32| -> Vec<(interest::RxKey, f32)> {
+            let Some(a) = aircraft.get(&icao) else { return Vec::new() };
+            a.seen_by
+                .iter()
+                .filter(|&&p| p != k)
+                .filter_map(|p| rxs.get(p))
+                .map(|p| (p.key, p.rate.as_ref().map_or(0.8, |m| m.get(&icao).copied().unwrap_or(0.0))))
+                .collect()
+        };
+        let dont_use = interest.p.sync_bad_dont_use;
+        let meta = |icao: u32| -> Option<AcMeta> {
+            let a = aircraft.get(&icao)?;
+            Some(AcMeta { alt_ft: a.alt_ft, sync_dont_use: sync_bad_share(a) > dont_use })
+        };
+        let (sync, mlat) = interest.select(r.suspect, r.rate.as_ref(), &r.seen, peers, meta);
+        let wanted: HashSet<u32> = sync.union(&mlat).copied().collect();
+        let (start, stop) = interest::diff(&r.requested, &wanted);
+        let tx = r.tx.clone();
+        let (n_sync, n_mlat) = (sync.len(), mlat.len());
+        let mut requested = r.requested.clone();
+        if !start.is_empty() {
+            if tx.try_send(ToClient::StartSending(start.clone())).is_ok() {
+                self.stats.serve_start_lines.fetch_add(1, Ordering::Relaxed);
+                requested.extend(start);
+            } else {
+                self.stats.serve_send_full.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !stop.is_empty() {
+            if tx.try_send(ToClient::StopSending(stop.clone())).is_ok() {
+                self.stats.serve_stop_lines.fetch_add(1, Ordering::Relaxed);
+                for a in stop {
+                    requested.remove(&a);
+                }
+            } else {
+                self.stats.serve_send_full.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if let Some(r) = self.rxs.get_mut(&k) {
+            r.requested = requested;
+            r.want_sync = n_sync;
+            r.want_mlat = n_mlat;
+        }
+    }
+
+    /// Serve mode: `{"stats": ...}` to served clients that asked, like
+    /// mlat-server's every_15: sync peers, a bad-sync timeout while the
+    /// receiver's clock is distrusted, and its pairs' reject share.
+    fn send_serve_stats(&mut self, now: f64) {
+        if now - self.serve_stats_at < SERVE_STATS_EVERY {
+            return;
+        }
+        self.serve_stats_at = now;
+        let mut reject: HashMap<RxKey, (f64, u32)> = HashMap::new();
+        for ((a, b), m) in &self.pairs {
+            if m.updates < crate::clock::MIN_UPDATES {
+                continue;
+            }
+            for k in [a, b] {
+                let e = reject.entry(*k).or_insert((0.0, 0));
+                e.0 += m.reject_rate;
+                e.1 += 1;
+            }
+        }
+        for r in self.rxs.values() {
+            if !r.info.serve.is_some_and(|o| o.stats) {
+                continue;
+            }
+            let (sum, n) = reject.get(&r.key).copied().unwrap_or((0.0, 0));
+            let outlier = if n > 0 { (1000.0 * sum / n as f64).round() / 10.0 } else { 0.0 };
+            let line = format!(
+                "{{\"stats\":{{\"peer_count\":{},\"bad_sync_timeout\":{},\"outlier_percent\":{}}}}}",
+                r.peers.len(),
+                if r.suspect { 150 } else { 0 },
+                outlier
+            );
+            if r.tx.try_send(ToClient::StatsLine(line)).is_ok() {
+                self.stats.serve_stats_lines.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -946,21 +1186,31 @@ impl Engine {
         }
         let previous: Vec<SyncObs> = variant.obs.clone();
         variant.obs.push(obs);
+        let (mut ok, mut bad) = (0, 0);
         for q in previous {
-            self.pair_update(k, &obs, q, now);
+            let (o, b) = self.pair_update(k, &obs, q, now);
+            ok += o;
+            bad += b;
+        }
+        if ok + bad > 0 {
+            if let Some(ac) = self.aircraft.get_mut(&icao) {
+                ac.sync_ok += ok as f32;
+                ac.sync_bad += bad as f32;
+            }
         }
     }
 
-    fn pair_update(&mut self, k: RxKey, o: &SyncObs, q: SyncObs, now: f64) {
+    /// Returns the observations the pair (accepted, rejected).
+    fn pair_update(&mut self, k: RxKey, o: &SyncObs, q: SyncObs, now: f64) -> (u32, u32) {
         let pk = pair_key(k, q.rx);
         if !self.pairs.contains_key(&pk) {
-            let (Some(r1), Some(r2)) = (self.rxs.get(&k), self.rxs.get(&q.rx)) else { return };
+            let (Some(r1), Some(r2)) = (self.rxs.get(&k), self.rxs.get(&q.rx)) else { return (0, 0) };
             let band = band_of(dist(&r1.pos, &r2.pos));
             let b = band as usize;
             let (c1, c2) = (r1.band_count[b], r2.band_count[b]);
             if (c1 >= PAIR_BUDGET[b] && c2 >= PAIR_BUDGET[b]) || c1 >= 2 * PAIR_BUDGET[b] || c2 >= 2 * PAIR_BUDGET[b] {
                 self.stats.pair_budget_refused.fetch_add(1, Ordering::Relaxed);
-                return;
+                return (0, 0);
             }
             let m = PairModel::new(r1.info.clock, r2.info.clock, band);
             self.pairs.insert(pk, m);
@@ -973,18 +1223,26 @@ impl Engine {
         }
         let m = self.pairs.get_mut(&pk).unwrap();
         if m.updates >= 30 && now - m.updated_wall < PAIR_MIN_INTERVAL {
-            return;
+            return (0, 0);
         }
         // Orientation: the model is theta = s_b - s_a with a = the lower key.
         let (a, b) = if k == pk.0 { (o, &q) } else { (&q, o) };
+        let (mut ok, mut bad) = (0, 0);
         for (sa, sb) in [(a.tda, b.tda), (a.tdb, b.tdb)] {
             match m.observe(sa, sb - sa, now) {
-                Outcome::Accepted => self.stats.pair_updates.fetch_add(1, Ordering::Relaxed),
-                Outcome::Rejected => self.stats.pair_rejects.fetch_add(1, Ordering::Relaxed),
+                Outcome::Accepted => {
+                    ok += 1;
+                    self.stats.pair_updates.fetch_add(1, Ordering::Relaxed)
+                }
+                Outcome::Rejected => {
+                    bad += 1;
+                    self.stats.pair_rejects.fetch_add(1, Ordering::Relaxed)
+                }
                 Outcome::Reset => self.stats.pair_resets.fetch_add(1, Ordering::Relaxed),
                 Outcome::ResetDrift => self.stats.pair_resets_drift.fetch_add(1, Ordering::Relaxed),
             };
         }
+        (ok, bad)
     }
 
     // ---------------------------------------------------------------- mlat --
@@ -1014,6 +1272,7 @@ impl Engine {
 
     /// Everything the periodic tick does, at wall time `now` (for tests).
     pub(crate) fn tick_at(&mut self, now: f64, housekeeping: bool) {
+        self.serve_refresh(now);
         self.process_due(now);
         self.expire(now);
         if housekeeping {
@@ -1441,7 +1700,7 @@ impl Engine {
                     r.used += 1;
                 }
             }
-            let p = self.emit(icao, fix_used.as_ref(), n, t, now);
+            let p = self.emit(icao, fix_used.as_ref(), n, t, now, used);
             // Credit the receivers with a position that reached the map
             // (not the bench copies of ADS-B aircraft), for their page.
             let to_map = self.bench_out.is_none() || self.aircraft.get(&icao).is_none_or(|ac| now - ac.last_adsb >= 30.0);
@@ -1608,7 +1867,7 @@ impl Engine {
         ac.last_fix_update = t;
         ac.last_vel_update = t;
         self.stats.two_site_tracked.fetch_add(1, Ordering::Relaxed);
-        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t, now), truth) {
+        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t, now, &[]), truth) {
             self.two_site_pub.push_back((now, dist(&p, &pos)));
         }
     }
@@ -1677,7 +1936,10 @@ impl Engine {
     }
 
     /// Publish the aircraft's position; returns what was published.
-    fn emit(&mut self, icao: u32, fix: Option<&Fix>, n: usize, t: f64, now: f64) -> Option<Ecef> {
+    /// Publish the aircraft's position; served receivers in `to` (the ones
+    /// whose copies made it) also get it back as a result line.
+    fn emit(&mut self, icao: u32, fix: Option<&Fix>, n: usize, t: f64, now: f64, to: &[RxKey]) -> Option<Ecef> {
+        let publish = !self.served_output_only || to.iter().any(|k| self.rxs.get(k).is_some_and(|r| r.info.serve.is_some()));
         let ac = self.aircraft.get_mut(&icao).unwrap();
         if t - ac.last_out < 0.5 {
             return None;
@@ -1693,10 +1955,11 @@ impl Engine {
         // the last 15 s holding the along-curve position, and a tight track.
         let anchored = t - ac.last_fix_update <= 10.0
             || (t - ac.last_fix_update <= 300.0 && t - ac.last_vel_update <= 15.0 && tr.err_h() < 1500.0);
-        let (pos, err, vel) = if tr.confirmed() && anchored {
-            (tr.predict(t).0, tr.err_h(), true)
+        let (pos, err, vel, cov) = if tr.confirmed() && anchored {
+            let (p, c) = tr.predict(t);
+            (p, tr.err_h(), true, c)
         } else if let Some(f) = fix.filter(|f| f.dof >= 1 && f.err_h < 1000.0) {
-            (f.pos, f.err_h, false)
+            (f.pos, f.err_h, false, f.cov)
         } else {
             if tr.confirmed() {
                 self.stats.outputs_held_no_fix.fetch_add(1, Ordering::Relaxed);
@@ -1722,7 +1985,48 @@ impl Engine {
             err_m: Some(err),
         });
         ac.last_out = t;
+        let result = (!to.is_empty()).then(|| {
+            let (gs, trk) = (tr.ground_speed_kt(), tr.track_deg().to_radians());
+            ClientResult {
+                addr: icao,
+                t,
+                ecef: [pos[0], pos[1], pos[2]],
+                lat: l.lat,
+                lon: l.lon,
+                alt_m: l.alt,
+                cov: Some([[cov[(0, 0)], cov[(0, 1)], cov[(0, 2)]], [cov[(1, 0)], cov[(1, 1)], cov[(1, 2)]], [cov[(2, 0)], cov[(2, 1)], cov[(2, 2)]]]),
+                receivers: n,
+                distinct: n,
+                vel_kt: vel.then(|| (gs * trk.cos(), gs * trk.sin())),
+                vrate_fpm: vel.then(|| tr.vrate_fpm()),
+                callsign: None,
+                squawk: ac.squawk,
+            }
+        });
+        let callsign = ac.callsign.clone();
+        if let Some(mut res) = result {
+            res.callsign = callsign.as_deref();
+            let (mut old, mut ecef): (Option<String>, Option<String>) = (None, None);
+            for k in to {
+                let Some(r) = self.rxs.get(k) else { continue };
+                let Some(opts) = r.info.serve else { continue };
+                let line = match opts.results {
+                    ResultFormat::None => continue,
+                    ResultFormat::Old => old.get_or_insert_with(|| result_old(&res)).clone(),
+                    ResultFormat::Ecef => ecef.get_or_insert_with(|| result_ecef(&res)).clone(),
+                };
+                if r.tx.try_send(ToClient::ResultLine(line)).is_ok() {
+                    self.stats.serve_results.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.stats.serve_send_full.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         self.stats.last_output_ms.store((now * 1000.0) as u64, Ordering::Relaxed);
+        if !publish {
+            self.stats.outputs_not_served.fetch_add(1, Ordering::Relaxed);
+            return Some(pos);
+        }
         match &self.bench_out {
             Some(bench) if now - ac.last_adsb < 30.0 => {
                 self.stats.bench_outputs.fetch_add(1, Ordering::Relaxed);
@@ -1927,6 +2231,12 @@ impl Engine {
     }
 
     fn housekeeping(&mut self, now: f64) {
+        // Sync quality per aircraft over roughly the last minute.
+        for a in self.aircraft.values_mut() {
+            a.sync_ok *= 0.8;
+            a.sync_bad *= 0.8;
+        }
+        self.send_serve_stats(now);
         if let Some(path) = &self.coverage_file {
             if now - self.coverage_saved >= COVERAGE_SAVE_EVERY {
                 self.coverage_saved = now;
@@ -2034,6 +2344,17 @@ impl Engine {
         s.coverage_samples = self.coverage.samples;
         s.alt_model_cells = self.alt_model.cells();
         s.alt_model_samples = self.alt_model.samples();
+        let served = self.rxs.values().filter(|r| r.info.serve.is_some());
+        let (mut n, mut ws, mut wm) = (0, 0, 0);
+        for r in served {
+            n += 1;
+            ws += r.want_sync;
+            wm += r.want_mlat;
+        }
+        s.serve_receivers = n;
+        s.serve_requested_sync = ws;
+        s.serve_requested_mlat = wm;
+        s.serve_mlat_wanted = self.interest.wanted().len();
         s.receivers_suspect = self.rxs.values().filter(|r| r.suspect).count();
         s.pairs = self.pairs.len();
         s.pairs_usable = self.pairs.values().filter(|m| m.usable(now)).count();
@@ -2114,6 +2435,17 @@ fn sub_problem(normd: &norm::Normalized, cl: &[usize], copies: &[Copy], nodes: &
 }
 
 /// FNV-1a: a stable hash for the holdout selection (same choice on restart).
+/// Share of an aircraft's recent sync observations its clock pairs rejected
+/// (0 until there are enough of them).
+fn sync_bad_share(a: &Aircraft) -> f64 {
+    let n = a.sync_ok + a.sync_bad;
+    if n < SYNC_QUALITY_MIN_OBS {
+        0.0
+    } else {
+        (a.sync_bad / n) as f64
+    }
+}
+
 pub(crate) fn fxhash(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &x in b {
@@ -2146,6 +2478,7 @@ mod tests {
             source_ip: "test".into(),
             client_version: "test".into(),
             compress: "none",
+            serve: None,
         };
         e.connect(conn, info, tx, 0.0);
         e.rx_by_conn[&conn]
@@ -2215,5 +2548,98 @@ mod tests {
         assert_eq!(n.copies.len(), 2);
         assert_eq!(n.edges, 1, "only the direct edge");
         assert_eq!(e.stats.groups_bridged.load(Ordering::Relaxed), 1);
+    }
+
+    /// A receiver in serve mode, with the receiving end of its connection.
+    fn add_served(e: &mut Engine, conn: ConnId, lon: f64, now: f64) -> (RxKey, mpsc::Receiver<ToClient>) {
+        let (tx, rx) = mpsc::channel(64);
+        let info = ReceiverInfo {
+            user: format!("srv{conn}"),
+            uuid: None,
+            lat: 45.0,
+            lon,
+            alt: 100.0,
+            clock: ClockType::Dump1090,
+            privacy: false,
+            source_ip: "test".into(),
+            client_version: "test".into(),
+            compress: "none",
+            serve: Some(crate::types::ServeOpts { results: ResultFormat::Ecef, stats: true }),
+        };
+        e.connect(conn, info, tx, now);
+        (e.rx_by_conn[&conn], rx)
+    }
+
+    fn started(rx: &mut mpsc::Receiver<ToClient>) -> Vec<u32> {
+        let mut v = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ToClient::StartSending(a) = m {
+                v.extend(a);
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn served_receivers_are_asked_shadow_ones_never() {
+        let mut e = engine();
+        let now = 10_000.0;
+        let (_, mut rx1) = add_served(&mut e, 1, 9.0, now);
+        let (_, mut rx2) = add_served(&mut e, 2, 9.5, now);
+        let (tx3, mut rx3) = mpsc::channel(64);
+        let info3 = ReceiverInfo { serve: None, ..e.rxs[&e.rx_by_conn[&1]].info.clone() };
+        e.connect(3, info3, tx3, now);
+        // 0x111111 has no ADS-B: once two receivers see it, it is wanted.
+        for c in [1, 2, 3] {
+            e.handle_at(Event::Seen { conn: c, icao: vec![0x111111, 0x222222] }, now);
+        }
+        e.aircraft.get_mut(&0x222222).unwrap().last_adsb = now;
+        // mlat-client's empty first rate report, then the real ones.
+        for c in [1, 2, 3] {
+            e.handle_at(Event::RateReport { conn: c, rates: vec![] }, now + 1.0);
+        }
+        e.handle_at(Event::RateReport { conn: 1, rates: vec![(0x222222, 1.5)] }, now + 2.0);
+        e.handle_at(Event::RateReport { conn: 2, rates: vec![(0x222222, 1.5)] }, now + 2.2);
+        let (a1, a2) = (started(&mut rx1), started(&mut rx2));
+        assert!(a1.contains(&0x111111) && a2.contains(&0x111111), "{a1:x?} {a2:x?}");
+        assert!(a2.contains(&0x222222), "sync aircraft shared with a peer: {a2:x?}");
+        assert!(rx3.try_recv().is_err(), "a shadow connection is never asked");
+        assert!(e.stats.serve_start_lines.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn newly_wanted_aircraft_are_asked_at_once() {
+        let mut e = engine();
+        let now = 10_000.0;
+        let (_, mut rx1) = add_served(&mut e, 1, 9.0, now);
+        let (_, mut rx2) = add_served(&mut e, 2, 9.5, now);
+        for c in [1, 2] {
+            e.handle_at(Event::RateReport { conn: c, rates: vec![] }, now);
+        }
+        let _ = (started(&mut rx1), started(&mut rx2));
+        // Seen by one receiver: not wanted yet. The second one makes it
+        // wanted, and both are asked without waiting for a rate report.
+        e.handle_at(Event::Seen { conn: 1, icao: vec![0x333333] }, now + 1.0);
+        assert!(started(&mut rx1).is_empty());
+        e.handle_at(Event::Seen { conn: 2, icao: vec![0x333333] }, now + 2.0);
+        assert_eq!(started(&mut rx1), vec![0x333333]);
+        assert_eq!(started(&mut rx2), vec![0x333333]);
+        assert_eq!(e.stats.serve_fast_starts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stats_lines_go_to_served_clients_that_asked() {
+        let mut e = engine();
+        let (_, mut rx1) = add_served(&mut e, 1, 9.0, 0.0);
+        e.send_serve_stats(100.0);
+        let Ok(ToClient::StatsLine(l)) = rx1.try_recv() else { panic!("no stats line") };
+        let v: serde_json::Value = serde_json::from_str(&l).unwrap();
+        assert_eq!(v["stats"]["peer_count"], 0);
+        assert_eq!(v["stats"]["bad_sync_timeout"], 0);
+        assert!(v["stats"]["outlier_percent"].is_number());
+        // Not again before 15 s.
+        e.send_serve_stats(110.0);
+        assert!(rx1.try_recv().is_err());
     }
 }

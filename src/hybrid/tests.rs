@@ -15,6 +15,7 @@ fn info(uuid: Option<&str>) -> ReceiverInfo {
         source_ip: "x".into(),
         client_version: "x".into(),
         compress: "none",
+        serve: None,
     }
 }
 

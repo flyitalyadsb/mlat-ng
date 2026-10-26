@@ -17,9 +17,10 @@ use tracing::{debug, info};
 use super::framing::{FrameError, InBuf, Inflater};
 use super::handshake::{self, Accepted, Outcome};
 use super::messages::{self, Msg};
+use super::py;
 use super::writer::{self, WriterCfg};
 use super::{Counters, Limits, ListenConfig};
-use crate::types::{ConnId, Event, ReceiverInfo};
+use crate::types::{ConnId, Event, ReceiverInfo, ServeOpts};
 
 /// How the message phase ended (for the disconnect log line).
 #[derive(Debug)]
@@ -78,6 +79,7 @@ pub(super) async fn run(
         source_ip,
         client_version: a.client_version.clone(),
         compress: a.compress,
+        serve: (!cfg.shadow).then(|| ServeOpts { results: a.result_format, stats: py::truthy(Some(&a.return_stats)) }),
     };
     Counters::inc(&counters.handshake_ok);
     info!(conn, user = %info.user, source = %info.source_ip, compress = a.compress, clock = info.clock.as_str(), version = %info.client_version, "handshake accepted");
@@ -90,7 +92,12 @@ pub(super) async fn run(
     let mut reply = handshake::accept_line(&a, &cfg).into_bytes();
     reply.push(b'\n');
     let (close_tx, close_rx) = oneshot::channel();
-    let wcfg = WriterCfg { zlib2: a.compress == "zlib2", shadow: cfg.shadow, return_results: a.return_results };
+    let wcfg = WriterCfg {
+        zlib2: a.compress == "zlib2",
+        shadow: cfg.shadow,
+        return_results: a.return_results,
+        return_stats: py::truthy(Some(&a.return_stats)),
+    };
     let writer = tokio::spawn(writer::run(wr, rx, close_tx, reply, wcfg, limits.clone()));
 
     let mut sink = Sink { conn, engine: &engine, n: Local::default(), rx_time: 0.0 };

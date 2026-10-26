@@ -230,6 +230,7 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> 
                     source_ip: "127.0.0.1".into(),
                     client_version: "sim".into(),
                     compress: "none",
+                    serve: None,
                 },
                 tx: tx.clone(),
             },

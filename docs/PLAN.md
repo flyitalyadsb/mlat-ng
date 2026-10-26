@@ -175,9 +175,46 @@ transport (production listens TCP-only), and a per-aircraft cap on how many
 receivers are asked (mlat-server asks all of them; EU aircraft can be seen by
 80).
 
+## Receiver position calibration (survey)
+
+Added 2026-10-26, diagnostic only (nothing moves a receiver). `src/survey.rs`:
+every sync observation is an ADS-B transmission from a known place heard by
+two receivers; a receiver declared d metres away from its real antenna sees
+every observation shifted by the projection of d on the direction of the
+aircraft. Each pair's clock offset and drift is a line inside 60 s windows,
+projected out in closed form against the receiver's own clock (as in the
+2026-10-25 prototype); what is left is linear least squares in d, kept as
+sums (a few dozen additions per observation, a 3x3 solve per question),
+forgotten over an hour, windows that fit badly dropped whole. Height has a
+tight prior (barely observable), the horizontal a weak one. Keyed by the
+receiver's coverage identity (its UUID), so reconnects keep the estimate.
+
+Replay of the 10-minute cap3 capture (`--perturb-share`, `--positions-from`):
+
+| | holdout p50 / p90 | published p99 |
+|---|---|---|
+| declared positions | 50 / 1132 m | 989 m |
+| 964 reliable estimates applied | 42 / 862 m | 970 m |
+| 10% of receivers declared 300 m off | 60 / 1580 m | 1311 m |
+| ... then their estimates applied | 45 / 1010 m | 1138 m |
+
+The 300 m moves came back to 23 m p50 / 64 m p90 for estimates with >= 200
+windows and a weakest horizontal sigma < 5 m ("reliable"; 81 of 87 within
+100 m). Estimated and scored on the same capture, so optimistic; live
+estimates would be applied out of sample. 77 of 877 reliable unmoved
+receivers come out > 100 m from their declared position (rounded
+coordinates?).
+
+Live: `/survey.json` (cluster-internal: identities and corrections, never an
+absolute position) and the gauges `survey_receivers`, `survey_reliable`,
+`survey_reliable_over_100m`. Not yet: applying corrections in the engine
+(it means re-converging the receiver's clock pairs), partners' own errors
+(modelled as noise today), placing Beast-only receivers with no declared
+position (needs the prototype's grid search, not a linearisation).
+
 ## Open items for v0.2
 
-- Per-receiver bias learning (antenna position errors) from holdout residuals.
+- Apply survey corrections live (see above), once its live numbers are in.
 - Mode A/C: the feed carries none today (only `0000` heartbeats); it needs
   readsb to forward Mode A/C on reduced output when asked (`1J`) and
   `--modeac-auto` on feeders.

@@ -10,10 +10,12 @@
 
 mod altmodel;
 mod clock;
+mod clientsim;
 mod coverage;
 mod engine;
 mod geo;
 mod hybrid;
+mod interest;
 mod modes;
 mod norm;
 mod output;
@@ -51,6 +53,24 @@ struct Args {
     /// feeders' streams arrive duplicated by mlat-proxy.
     #[arg(long, default_value_t = false, env = "MLAT_NG_SHADOW")]
     shadow: bool,
+    /// A second mlat-client listener in serve mode, whatever --shadow says:
+    /// feeders routed here (mlat-proxy's region map) get their traffic chosen
+    /// by this engine and its results, while --listen keeps receiving the
+    /// shadow copy of everyone else. Empty = off.
+    #[arg(long, default_value = "", env = "MLAT_NG_SERVE_LISTEN")]
+    serve_listen: String,
+    /// Serve mode: seconds without an ADS-B position before an aircraft is
+    /// multilaterated (mlat-server's MLAT_SERVER_NO_ADSB_MLAT_SECONDS).
+    #[arg(long, default_value_t = 120.0, env = "MLAT_NG_SERVE_NO_ADSB_S")]
+    serve_no_adsb_s: f64,
+    /// Serve mode: ADS-B positions per second a receiver is asked for sync
+    /// (MLAT_SERVER_MAX_SYNC_RATE).
+    #[arg(long, default_value_t = 12.0, env = "MLAT_NG_SERVE_MAX_SYNC_RATE")]
+    serve_max_sync_rate: f64,
+    /// Publish only positions a served receiver contributed to (a region's
+    /// rollout: the map gets what that region's shard would have produced).
+    #[arg(long, default_value_t = false, env = "MLAT_NG_SERVED_OUTPUT_ONLY")]
+    served_output_only: bool,
     #[arg(long, default_value = "flyitalyadsb MLAT [mlat-ng]", env = "MLAT_NG_MOTD")]
     motd: String,
     #[arg(long, default_value = "https://github.com/nesso-labs/mlat-ng", env = "MLAT_NG_SOURCE_URL")]
@@ -144,6 +164,12 @@ fn main() -> anyhow::Result<()> {
         eng = eng.with_coverage_file(&args.coverage_file);
     }
     eng = eng.with_two_site(args.two_site);
+    eng = eng.with_served_output_only(args.served_output_only);
+    eng = eng.with_serve_params(interest::Params {
+        no_adsb_mlat_s: args.serve_no_adsb_s,
+        max_sync_rate: args.serve_max_sync_rate,
+        ..interest::Params::default()
+    });
     let (q_tx, q_rx) = mpsc::channel(64);
     eng = eng.with_queries(q_rx);
     let feed_cfg = (!cells.is_empty()).then(|| relay::FeedConfig {
@@ -219,6 +245,17 @@ fn main() -> anyhow::Result<()> {
         });
         tokio::spawn(output::http_server(http_l, render, Some(q_tx)));
 
+        if !args.serve_listen.is_empty() {
+            let serve_l = TcpListener::bind(&args.serve_listen).await?;
+            tracing::info!(serve = %args.serve_listen, "serve listener: feeders here are served by this engine");
+            let scfg = Arc::new(proto::ListenConfig { shadow: false, motd: args.motd.clone(), source_url: args.source_url.clone() });
+            let (stx, sc) = (client_tx.clone(), counters.clone());
+            tokio::spawn(async move {
+                if let Err(e) = proto::serve(serve_l, scfg, stx, sc).await {
+                    tracing::error!(error = %e, "serve listener stopped");
+                }
+            });
+        }
         let cfg = Arc::new(proto::ListenConfig { shadow: args.shadow, motd: args.motd, source_url: args.source_url });
         tokio::select! {
             r = proto::serve(client_l, cfg, client_tx, counters) => r,
@@ -345,6 +382,17 @@ fn render_metrics(
     m("holdout_error_p50_m", "gauge", snap.holdout_p50);
     m("holdout_error_p90_m", "gauge", snap.holdout_p90);
     m("holdout_error_p99_m", "gauge", snap.holdout_p99);
+    m("serve_receivers", "gauge", snap.serve_receivers as f64);
+    m("serve_requested_sync", "gauge", snap.serve_requested_sync as f64);
+    m("serve_requested_mlat", "gauge", snap.serve_requested_mlat as f64);
+    m("serve_mlat_wanted", "gauge", snap.serve_mlat_wanted as f64);
+    m("serve_start_lines_total", "counter", l(&s.serve_start_lines));
+    m("serve_stop_lines_total", "counter", l(&s.serve_stop_lines));
+    m("serve_results_total", "counter", l(&s.serve_results));
+    m("serve_stats_lines_total", "counter", l(&s.serve_stats_lines));
+    m("serve_send_full_total", "counter", l(&s.serve_send_full));
+    m("serve_fast_starts_total", "counter", l(&s.serve_fast_starts));
+    m("outputs_not_served_total", "counter", l(&s.outputs_not_served));
     m("two_site_tries_total", "counter", l(&s.two_site_tries));
     m("two_site_solved_total", "counter", l(&s.two_site_solved));
     m("two_site_accepted_total", "counter", l(&s.two_site_accepted));

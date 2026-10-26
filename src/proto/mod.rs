@@ -50,6 +50,8 @@
 //!   start_sending/stop_sending/result. Nobody reads them, but a correct reply
 //!   keeps the code path identical to serve mode.
 //! - In serve mode: forward `ToClient` messages from the engine to the socket.
+//!   A listener is in serve mode when its `ListenConfig::shadow` is false
+//!   (main.rs: `--serve-listen`); its connections carry `ReceiverInfo::serve`.
 //! - Must never panic on any input; fuzz-style tests over random bytes.
 //!
 //! Where this module knowingly differs from mlat-server (none of these change
@@ -71,8 +73,9 @@
 //! - position_update becomes an event (mlat-server ignores it; mlat-client
 //!   never sends it over JSON). No UDP transport is offered: the production
 //!   shards listen TCP-only (`--client-listen=30100`).
-//! - A ResultLine is dropped for a client that did not ask for results; the
-//!   result format it asked for ("old" / "ecef") is not in `ReceiverInfo`.
+//! - A ResultLine is dropped for a client that did not ask for results, and a
+//!   StatsLine for one that did not ask for stats; the result layout it asked
+//!   for ("old" / "ecef") is in `ReceiverInfo::serve` for the engine to use.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

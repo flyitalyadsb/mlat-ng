@@ -51,6 +51,75 @@ pub struct SbsFix<'a> {
     pub err_m: Option<f64>,
 }
 
+/// A position as mlat-server sends it back to the receivers that heard it
+/// (jsonclient.py report_mlat_position_old / _ecef).
+pub struct ClientResult<'a> {
+    pub addr: u32,
+    /// Wall time of the multilaterated message, unix seconds.
+    pub t: f64,
+    pub ecef: [f64; 3],
+    pub lat: f64,
+    pub lon: f64,
+    /// Height above the ellipsoid, metres.
+    pub alt_m: f64,
+    /// ECEF position covariance, m^2.
+    pub cov: Option<[[f64; 3]; 3]>,
+    pub receivers: usize,
+    pub distinct: usize,
+    /// North / east ground velocity, knots, from a track.
+    pub vel_kt: Option<(f64, f64)>,
+    pub vrate_fpm: Option<f64>,
+    pub callsign: Option<&'a str>,
+    pub squawk: Option<u16>,
+}
+
+fn round_to(x: f64, d: i32) -> f64 {
+    let m = 10f64.powi(d);
+    (x * m).round() / m
+}
+
+/// `{"result": {...}}` in the "old" layout (lat/lon/alt in feet, dops 0).
+pub fn result_old(r: &ClientResult) -> String {
+    let v = serde_json::json!({"result": {
+        "@": round_to(r.t, 3),
+        "addr": format!("{:06x}", r.addr),
+        "lat": round_to(r.lat, 5),
+        "lon": round_to(r.lon, 5),
+        "alt": (r.alt_m / 0.3048).round(),
+        "callsign": r.callsign,
+        "squawk": r.squawk.map(|q| format!("{q:04}")),
+        "hdop": 0.0, "vdop": 0.0, "tdop": 0.0, "gdop": 0.0,
+        "nstations": r.receivers,
+    }});
+    v.to_string()
+}
+
+/// `{"result": {...}}` in the "ecef" layout that mlat-client asks for.
+pub fn result_ecef(r: &ClientResult) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert("@".into(), round_to(r.t, 3).into());
+    m.insert("addr".into(), format!("{:06x}", r.addr).into());
+    m.insert("n".into(), r.receivers.into());
+    m.insert("nd".into(), r.distinct.into());
+    // Missing 'cov' disconnects client 0.1.7: always present, null if unknown.
+    m.insert(
+        "cov".into(),
+        match r.cov {
+            Some(c) => serde_json::json!([c[0][0].round(), c[0][1].round(), c[0][2].round(), c[1][1].round(), c[1][2].round(), c[2][2].round()]),
+            None => serde_json::Value::Null,
+        },
+    );
+    if let Some((ns, ew)) = r.vel_kt {
+        m.insert("nsvel".into(), round_to(ns, 1).into());
+        m.insert("ewvel".into(), round_to(ew, 1).into());
+    }
+    if let Some(v) = r.vrate_fpm {
+        m.insert("vrate".into(), v.round().into());
+    }
+    m.insert("ecef".into(), serde_json::json!([r.ecef[0].round(), r.ecef[1].round(), r.ecef[2].round()]));
+    serde_json::json!({ "result": m }).to_string()
+}
+
 /// One MSG,3 line in exactly mlat-server's BasestationClient layout.
 pub fn sbs_line(f: &SbsFix) -> String {
     let (rd, rt) = sbs_datetime(f.t_fix);
@@ -250,5 +319,49 @@ mod tests {
         );
         // 22 comma-separated fields like mlat-server's TEMPLATE
         assert_eq!(l.trim_end().split(',').count(), 22);
+    }
+
+    #[test]
+    fn client_results_parse_as_mlat_client_expects() {
+        let r = ClientResult {
+            addr: 0x4ca1b2,
+            t: 1_792_858_311.12345,
+            ecef: [4_400_000.4, 700_000.6, 4_500_000.0],
+            lat: 45.123456,
+            lon: 9.123456,
+            alt_m: 10_000.0,
+            cov: Some([[100.0, 1.0, 2.0], [1.0, 200.0, 3.0], [2.0, 3.0, 300.0]]),
+            receivers: 6,
+            distinct: 5,
+            vel_kt: Some((300.04, -120.06)),
+            vrate_fpm: Some(-640.4),
+            callsign: Some("AZA123"),
+            squawk: Some(1200),
+        };
+        // mlat-client jsonclient.handle_connected_request, "ecef" branch.
+        let v: serde_json::Value = serde_json::from_str(&result_ecef(&r)).unwrap();
+        let x = &v["result"];
+        assert_eq!(x["addr"], "4ca1b2");
+        assert_eq!(x["@"], 1_792_858_311.123);
+        assert_eq!(x["n"], 6);
+        assert_eq!(x["nd"], 5);
+        assert_eq!(x["cov"].as_array().unwrap().len(), 6);
+        assert_eq!(x["ecef"][0], 4_400_000.0);
+        assert_eq!(x["nsvel"], 300.0);
+        assert_eq!(x["ewvel"], -120.1);
+        assert_eq!(x["vrate"], -640.0);
+        // "old" branch: lat/lon/alt/gdop/nstations/callsign/squawk.
+        let v: serde_json::Value = serde_json::from_str(&result_old(&r)).unwrap();
+        let x = &v["result"];
+        assert_eq!(x["lat"], 45.12346);
+        assert_eq!(x["alt"], 32808.0);
+        assert_eq!(x["gdop"], 0.0);
+        assert_eq!(x["nstations"], 6);
+        assert_eq!(x["callsign"], "AZA123");
+        assert_eq!(x["squawk"], "1200");
+        // Without covariance the key is still there (client 0.1.7).
+        let v: serde_json::Value = serde_json::from_str(&result_ecef(&ClientResult { cov: None, vel_kt: None, vrate_fpm: None, ..r })).unwrap();
+        assert!(v["result"]["cov"].is_null());
+        assert!(v["result"].get("nsvel").is_none());
     }
 }

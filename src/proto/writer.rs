@@ -28,6 +28,8 @@ pub(super) struct WriterCfg {
     pub shadow: bool,
     /// The client asked for results; mlat-server discards them otherwise.
     pub return_results: bool,
+    /// The client asked for stats (`send_stats`: `if self.return_stats`).
+    pub return_stats: bool,
 }
 
 /// Bytes waiting for the socket, plus zlib2 lines waiting for their flush.
@@ -124,7 +126,7 @@ fn heartbeat_line() -> Vec<u8> {
 }
 
 /// `{"start_sending":["4ca123",...]}` and friends; None = nothing to send.
-fn engine_line(m: ToClient, return_results: bool) -> Option<Vec<u8>> {
+fn engine_line(m: ToClient, return_results: bool, return_stats: bool) -> Option<Vec<u8>> {
     let icaos = |key: &str, v: Vec<u32>| {
         if v.is_empty() {
             return None; // mlat-server only sends non-empty sets
@@ -140,7 +142,12 @@ fn engine_line(m: ToClient, return_results: bool) -> Option<Vec<u8>> {
             b.push(b'\n');
             Some(b)
         }
-        ToClient::ResultLine(_) | ToClient::Close => None,
+        ToClient::StatsLine(s) if return_stats => {
+            let mut b = s.into_bytes();
+            b.push(b'\n');
+            Some(b)
+        }
+        ToClient::ResultLine(_) | ToClient::StatsLine(_) | ToClient::Close => None,
     }
 }
 
@@ -189,7 +196,7 @@ pub(super) async fn run(
                 // primary does the steering; never ask for anything.
                 Some(m) => {
                     if !cfg.shadow {
-                        if let Some(line) = engine_line(m, cfg.return_results) {
+                        if let Some(line) = engine_line(m, cfg.return_results, cfg.return_stats) {
                             o.queue(line);
                         }
                     }
@@ -207,11 +214,13 @@ mod tests {
 
     #[test]
     fn engine_lines() {
-        assert_eq!(engine_line(ToClient::StartSending(vec![0x4ca123, 0xabc]), false).unwrap(), b"{\"start_sending\":[\"4ca123\",\"000abc\"]}\n");
-        assert_eq!(engine_line(ToClient::StopSending(vec![1]), false).unwrap(), b"{\"stop_sending\":[\"000001\"]}\n");
-        assert_eq!(engine_line(ToClient::StartSending(vec![]), true), None);
-        assert_eq!(engine_line(ToClient::ResultLine("{\"result\":{}}".into()), true).unwrap(), b"{\"result\":{}}\n");
-        assert_eq!(engine_line(ToClient::ResultLine("{\"result\":{}}".into()), false), None);
+        assert_eq!(engine_line(ToClient::StartSending(vec![0x4ca123, 0xabc]), false, false).unwrap(), b"{\"start_sending\":[\"4ca123\",\"000abc\"]}\n");
+        assert_eq!(engine_line(ToClient::StopSending(vec![1]), false, false).unwrap(), b"{\"stop_sending\":[\"000001\"]}\n");
+        assert_eq!(engine_line(ToClient::StartSending(vec![]), true, true), None);
+        assert_eq!(engine_line(ToClient::ResultLine("{\"result\":{}}".into()), true, false).unwrap(), b"{\"result\":{}}\n");
+        assert_eq!(engine_line(ToClient::ResultLine("{\"result\":{}}".into()), false, true), None);
+        assert_eq!(engine_line(ToClient::StatsLine("{\"stats\":{}}".into()), false, true).unwrap(), b"{\"stats\":{}}\n");
+        assert_eq!(engine_line(ToClient::StatsLine("{\"stats\":{}}".into()), true, false), None);
     }
 
     #[test]

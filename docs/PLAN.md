@@ -111,13 +111,73 @@ and zero timestamps arrive unflagged (the adapter checks each clock's rate
 before using it); feeders move between cells (both are read; receivers are
 keyed by UUID).
 
+## Serve mode
+
+Added 2026-10-26, off by default. mlat-ng becomes the real server for the
+feeders that connect to `--serve-listen` (`MLAT_NG_SERVE_LISTEN`): it asks
+them for traffic and answers them. `--listen` keeps taking the shadow copy of
+everyone else, so one engine can serve one region and still use the whole
+network's data (mixed mode).
+
+- **Selection** (`src/interest.rs`): mlat-server's rules ported as they are,
+  so feeders send what they already send to production. mlat: an aircraft
+  seen by >= 2 receivers without an ADS-B position for 120 s (or with >10%
+  of its sync points rejected, or in its periodic forced window) is asked
+  from every receiver that sees it. sync: from each receiver's rate report,
+  aircraft scored by the product of the two receivers' rates, greedy until
+  every peer has enough shared rate or 12 positions/s, at least 3. A
+  receiver with a distrusted clock gets 3 sync aircraft and no mlat.
+  Beyond mlat-server: an aircraft is asked for the moment it becomes wanted,
+  not at each receiver's next rate report (~18 s).
+- **Results**: every published position goes back to the served receivers
+  whose copies made it, in the layout each client asked for ("old" or
+  "ecef"), and a `{"stats": ...}` line every 15 s (sync peers, bad-sync
+  timeout, outlier share) for clients that asked.
+- **Hybrid**: the router already makes a feeder's mlat-client the owner of
+  its key, so a served client merged with its own Beast feed is the one that
+  is asked and answered.
+
+Measured (2026-10-26):
+
+| | serve, mlat-server rules | every client sends everything |
+|---|---|---|
+| messages/s per feeder, p50 / p90 / p99 | 6.8 / 19 / 35 | 9.6 / 64 / 142 |
+| Mode-S-only aircraft (never ADS-B in the run) | 102 | 115 |
+| Mode-S-only positions | 23.6k | 25.1k |
+
+`mlat-ng replay --serve-sim select|all` on the 10-minute cap3 capture: every
+receiver of the registry (2,733) is an emulated mlat-client
+(`src/clientsim.rs`, a port of mlat-client 0.4.x's coordinator and reader
+filter), driven by what its receiver heard. Absolute rates are lower than
+production's (the 4906 feed carries only part of each receiver's replies);
+the comparison is the point.
+
+End to end with the real mlat-client 0.4.2 (10 clients near Milan replaying
+their own frames from the capture, the rest of the network on the hybrid
+feed, all on localhost): handshakes accepted, start/stop requests honoured
+("12 of 51 Mode S, 29 of 96 ADS-B used"), stats shown by the client
+("peer_count: 8 outlier_percent: 0.0 bad_sync_timeout: 0"), 2,757 results
+returned and passed on by the clients to their own outputs (178
+positions/minute on the busiest), no client errors.
+`mlat-ng replay --extract-dir` writes the per-receiver streams for such tests.
+
+Rollout (not done; needs the test's verdict first): per region through
+mlat-proxy's region map, `rest` first. That region's feeders go to
+`mlat-ng:30101` and must no longer be teed to the shadow hub (the engine
+would see them twice); readsb gets a `sbs_in_mlat` connector to mlat-ng's
+SBS output in place of the region's shard, with `--served-output-only` so
+that output carries only positions a served feeder contributed to (what the
+region's shard would have published; the other shards keep theirs).
+Rollback is one line in the map.
+
+Not yet: Mode A/C requests (`start_sending` with Mode A/C codes), the UDP
+transport (production listens TCP-only), and a per-aircraft cap on how many
+receivers are asked (mlat-server asks all of them; EU aircraft can be seen by
+80).
+
 ## Open items for v0.2
 
-- Serve mode: interest selection (sync aircraft by rate, MLAT targets),
-  results back to clients.
 - Per-receiver bias learning (antenna position errors) from holdout residuals.
-- Hybrid: feed and mlat-client in one engine, linking each receiver's two
-  clocks (same hardware, constant offset).
 - Mode A/C: the feed carries none today (only `0000` heartbeats); it needs
   readsb to forward Mode A/C on reduced output when asked (`1J`) and
   `--modeac-auto` on feeders.

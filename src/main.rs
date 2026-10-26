@@ -24,6 +24,7 @@ mod relay;
 mod replay;
 #[cfg(test)]
 mod sim;
+mod survey;
 mod solver;
 mod track;
 mod twosite;
@@ -232,6 +233,7 @@ fn main() -> anyhow::Result<()> {
                     render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref(), render_hybrid.as_deref()),
                 )),
                 "/receivers.json" => Some(("application/json", render_stats.registry_json.lock().unwrap().clone())),
+                "/survey.json" => Some(("application/json", render_stats.survey_json.lock().unwrap().clone())),
                 "/debug.json" => {
                     let d = render_stats.debug.lock().unwrap().clone();
                     Some(("application/json", serde_json::to_string_pretty(&d).unwrap_or_default()))
@@ -393,6 +395,9 @@ fn render_metrics(
     m("serve_send_full_total", "counter", l(&s.serve_send_full));
     m("serve_fast_starts_total", "counter", l(&s.serve_fast_starts));
     m("outputs_not_served_total", "counter", l(&s.outputs_not_served));
+    m("survey_receivers", "gauge", snap.survey_receivers as f64);
+    m("survey_reliable", "gauge", snap.survey_reliable as f64);
+    m("survey_reliable_over_100m", "gauge", snap.survey_reliable_over_100m as f64);
     m("two_site_tries_total", "counter", l(&s.two_site_tries));
     m("two_site_solved_total", "counter", l(&s.two_site_solved));
     m("two_site_accepted_total", "counter", l(&s.two_site_accepted));

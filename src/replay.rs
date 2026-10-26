@@ -104,6 +104,26 @@ pub struct ReplayArgs {
     extract_km: f64,
     #[arg(long, default_value_t = 300.0)]
     extract_seconds: f64,
+    /// Survey test: this share of receivers is declared `--perturb-m` metres
+    /// away from where the registry has them (random direction), and the
+    /// summary checks whether the survey finds the offset back.
+    #[arg(long, default_value_t = 0.0)]
+    perturb_share: f64,
+    #[arg(long, default_value_t = 300.0)]
+    perturb_m: f64,
+    /// Write every receiver's survey estimate (rid, d, sd, ...) here.
+    #[arg(long)]
+    survey_out: Option<String>,
+    /// Apply the estimates of an earlier `--survey-out` to the declared
+    /// positions (after any --perturb), for receivers with at least
+    /// `--apply-min-windows` windows and a weakest horizontal sigma under
+    /// `--apply-max-sd` metres.
+    #[arg(long)]
+    positions_from: Option<String>,
+    #[arg(long, default_value_t = 200)]
+    apply_min_windows: u32,
+    #[arg(long, default_value_t = 5.0)]
+    apply_max_sd: f64,
 }
 
 /// Plain Beast (`0x1A '2'|'3'` + 6-byte timestamp + signal + payload, 0x1A
@@ -259,7 +279,44 @@ fn aircraft_of(line: &str) -> Option<String> {
 pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let a = ReplayArgs::parse_from(argv);
     let doc: registry::Doc = serde_json::from_reader(File::open(&a.receivers)?)?;
-    let reg = registry::parse(&doc);
+    let mut reg = registry::parse(&doc);
+    // Survey test: move a share of the declared positions; remember by how
+    // much (east, north metres), keyed by receiver id.
+    let mut moved: HashMap<u64, (f64, f64)> = HashMap::new();
+    if a.perturb_share > 0.0 {
+        for (rid, r) in reg.iter_mut() {
+            let h = fxhash(&rid.to_le_bytes());
+            if (h % 10_000) as f64 >= a.perturb_share * 10_000.0 {
+                continue;
+            }
+            let bearing = ((h >> 20) % 360) as f64;
+            let (e, n) = (a.perturb_m * bearing.to_radians().sin(), a.perturb_m * bearing.to_radians().cos());
+            r.lat += n / 111_320.0;
+            r.lon += e / (111_320.0 * r.lat.to_radians().cos());
+            moved.insert(*rid, (e, n));
+        }
+    }
+    let mut applied = 0usize;
+    if let Some(p) = &a.positions_from {
+        let rows: Vec<serde_json::Value> = serde_json::from_reader(File::open(p)?)?;
+        for row in rows {
+            let Some(rid) = row["rid"].as_str().and_then(|x| u64::from_str_radix(x, 16).ok()) else { continue };
+            let windows = row["windows"].as_u64().unwrap_or(0) as u32;
+            let weak = row["sd_weak_h"].as_f64().unwrap_or(f64::INFINITY);
+            if windows < a.apply_min_windows || weak >= a.apply_max_sd {
+                continue;
+            }
+            let (Some(r), Some(d)) = (reg.get_mut(&rid), row["d"].as_array()) else { continue };
+            let d: Vec<f64> = d.iter().filter_map(|x| x.as_f64()).collect();
+            if d.len() != 3 {
+                continue;
+            }
+            r.lat += d[1] / 111_320.0;
+            r.lon += d[0] / (111_320.0 * r.lat.to_radians().cos());
+            r.alt += d[2];
+            applied += 1;
+        }
+    }
     if let Some(dir) = &a.extract_dir {
         return extract(&a, dir, &reg);
     }
@@ -467,6 +524,49 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             by_rx.entry(b).or_default().push(*f);
         }
     }
+    // Survey: estimates are by coverage identity, which for feed receivers
+    // is the receiver id. A moved receiver should come back with d = -move.
+    let est: HashMap<u64, crate::survey::Estimate> = eng.survey_estimates().into_iter().collect();
+    let (s_obs, s_win, s_drop) = eng.survey_counts();
+    let mut found_err = Vec::new();
+    let mut flagged_moved = 0usize;
+    let mut still = Vec::new();
+    let mut flagged_still = 0usize;
+    let flag = |e: &crate::survey::Estimate| {
+        let h = e.d[0].hypot(e.d[1]);
+        h > 100.0 && h > 4.0 * e.sd[0].hypot(e.sd[1])
+    };
+    for (rid, e) in &est {
+        match moved.get(rid) {
+            Some(&(me, mn)) => {
+                found_err.push((e.d[0] + me).hypot(e.d[1] + mn));
+                flagged_moved += flag(e) as usize;
+            }
+            None => {
+                still.push(e.d[0].hypot(e.d[1]));
+                flagged_still += flag(e) as usize;
+            }
+        }
+    }
+    if let Some(p) = &a.survey_out {
+        let rows: Vec<serde_json::Value> = est
+            .iter()
+            .map(|(rid, e)| json!({"rid": format!("{rid:016x}"), "moved": moved.get(rid), "d": e.d, "sd": e.sd,
+                                   "sigma": e.sigma, "sd_weak_h": e.sd_weak_h, "windows": e.windows, "dropped": e.dropped}))
+            .collect();
+        std::fs::write(p, serde_json::to_string(&rows)?)?;
+    }
+    let qm = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        let q = |p: f64| if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p) as usize].round() };
+        json!({"n": v.len(), "p50_m": q(0.5), "p90_m": q(0.9), "under_50m": v.iter().filter(|x| **x < 50.0).count()})
+    };
+    let survey = json!({
+        "applied": applied,
+        "observations": s_obs, "windows": s_win, "windows_dropped": s_drop, "receivers": est.len(),
+        "moved": {"count": moved.len(), "estimated": found_err.len(), "error_vs_move": qm(found_err), "flagged": flagged_moved},
+        "not_moved": {"offset": qm(still), "flagged": flagged_still},
+    });
     let l = |x: &AtomicU64| x.load(Ordering::Relaxed);
     let snap = stats.snapshot.lock().unwrap().clone();
     let (sent, req_mean) = csim.totals();
@@ -493,6 +593,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         "engine_mlat_wanted": snap.serve_mlat_wanted,
     });
     let summary = json!({
+        "survey": survey,
         "serve_sim": serve,
         "two_site": two_site,
         "sim_seconds": t_end - t0,

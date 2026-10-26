@@ -48,6 +48,7 @@ use crate::modes;
 use crate::norm::{self, Copy, Node};
 use crate::output::{result_ecef, result_old, sbs_line, ClientResult, SbsFix};
 use crate::solver::{self, Fix, Meas, SolveInput};
+use crate::survey::{self, Survey};
 use crate::track::{Gate, Track};
 use crate::twosite::{self, Rec2};
 use crate::types::{ConnId, Event, ReceiverInfo, ResultFormat, ToClient};
@@ -122,6 +123,8 @@ struct Rx {
     noise_scale: f64,
     /// Stable identity for its coverage map (survives reconnects).
     cov: CovId,
+    /// Local east/north/up frame at the declared position (survey).
+    enu: Enu,
     /// Serve mode: its last rate report (None = it never sent one), what it
     /// is currently asked for, and how that splits into sync and mlat.
     rate: Option<HashMap<u32, f32>>,
@@ -382,6 +385,10 @@ pub struct Stats {
     /// `/receivers.json`: mlat-client receivers with a UUID and their
     /// positions, for the feed instance (cluster-internal only).
     pub registry_json: Mutex<String>,
+    /// `/survey.json`: each receiver's position correction estimate
+    /// (cluster-internal: identities, corrections relative to declared
+    /// positions).
+    pub survey_json: Mutex<String>,
 }
 
 #[derive(Default, Clone, serde::Serialize)]
@@ -417,6 +424,11 @@ pub struct Snapshot {
     /// Altitude model: 1-degree cells with data, and aircraft samples held.
     pub alt_model_cells: usize,
     pub alt_model_samples: usize,
+    /// Survey: receivers with an estimate, reliable ones, and reliable ones
+    /// more than 100 m from their declared position.
+    pub survey_receivers: usize,
+    pub survey_reliable: usize,
+    pub survey_reliable_over_100m: usize,
     /// Serve mode: served receivers, the aircraft they are asked for in
     /// total (sync / mlat), and the mlat-wanted aircraft.
     pub serve_receivers: usize,
@@ -467,6 +479,9 @@ pub struct Engine {
     two_site_dump: Option<std::io::BufWriter<std::fs::File>>,
     /// Regional geometric-minus-baro altitude model (altmodel.rs).
     alt_model: AltModel,
+    /// Receiver position calibration from sync residuals (survey.rs), keyed
+    /// by coverage identity so it survives reconnects.
+    survey: Survey,
     /// Serve mode: traffic selection, and when stats last went out.
     interest: Interest,
     serve_stats_at: f64,
@@ -561,6 +576,7 @@ impl Engine {
             two_site_pub: VecDeque::new(),
             two_site_dump: None,
             alt_model: AltModel::default(),
+            survey: Survey::default(),
             interest: Interest::new(interest::Params::default(), 0x5e7e),
             serve_stats_at: 0.0,
             served_n: 0,
@@ -725,7 +741,9 @@ impl Engine {
                         r.info.lon = lon;
                         r.info.alt = alt;
                         r.pos = llh_to_ecef(Llh { lat, lon, alt });
+                        r.enu = Enu::at(r.pos);
                         self.coverage.place(r.cov, lat, lon, now);
+                        self.survey.forget(r.cov);
                     }
                 }
             }
@@ -754,6 +772,7 @@ impl Engine {
             used: 0,
             noise_scale: 1.0,
             cov: 0,
+            enu: Enu::at(pos),
             rate: None,
             requested: HashSet::new(),
             want_sync: 0,
@@ -1188,7 +1207,7 @@ impl Engine {
         variant.obs.push(obs);
         let (mut ok, mut bad) = (0, 0);
         for q in previous {
-            let (o, b) = self.pair_update(k, &obs, q, now);
+            let (o, b) = self.pair_update(k, &obs, q, now, (pa, pb));
             ok += o;
             bad += b;
         }
@@ -1201,7 +1220,7 @@ impl Engine {
     }
 
     /// Returns the observations the pair (accepted, rejected).
-    fn pair_update(&mut self, k: RxKey, o: &SyncObs, q: SyncObs, now: f64) -> (u32, u32) {
+    fn pair_update(&mut self, k: RxKey, o: &SyncObs, q: SyncObs, now: f64, at: (Ecef, Ecef)) -> (u32, u32) {
         let pk = pair_key(k, q.rx);
         if !self.pairs.contains_key(&pk) {
             let (Some(r1), Some(r2)) = (self.rxs.get(&k), self.rxs.get(&q.rx)) else { return (0, 0) };
@@ -1221,10 +1240,11 @@ impl Engine {
                 }
             }
         }
-        let m = self.pairs.get_mut(&pk).unwrap();
-        if m.updates >= 30 && now - m.updated_wall < PAIR_MIN_INTERVAL {
+        if self.pairs.get(&pk).is_some_and(|m| m.updates >= 30 && now - m.updated_wall < PAIR_MIN_INTERVAL) {
             return (0, 0);
         }
+        self.survey_observe(k, o, &q, now, at);
+        let m = self.pairs.get_mut(&pk).unwrap();
         // Orientation: the model is theta = s_b - s_a with a = the lower key.
         let (a, b) = if k == pk.0 { (o, &q) } else { (&q, o) };
         let (mut ok, mut bad) = (0, 0);
@@ -1243,6 +1263,74 @@ impl Engine {
             };
         }
         (ok, bad)
+    }
+
+    /// Both receivers' view of one sync observation, for the survey: for
+    /// each of the pair's two positions, z = (t_dK - t_dR) * c and the unit
+    /// vector from R to the aircraft in R's local frame (survey.rs).
+    fn survey_observe(&mut self, k: RxKey, o: &SyncObs, q: &SyncObs, now: f64, at: (Ecef, Ecef)) {
+        let (Some(r1), Some(r2)) = (self.rxs.get(&k), self.rxs.get(&q.rx)) else { return };
+        if r1.suspect || r2.suspect {
+            return;
+        }
+        let unit = |r: &Rx, p: &Ecef| {
+            let d = [p[0] - r.pos[0], p[1] - r.pos[1], p[2] - r.pos[2]];
+            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1.0);
+            let m = &r.enu.r;
+            let e = |i: usize| (m[i][0] * d[0] + m[i][1] * d[1] + m[i][2] * d[2]) / n;
+            [e(0), e(1), e(2)]
+        };
+        let (c1, c2) = (r1.cov, r2.cov);
+        let obs = [(at.0, o.tda, q.tda), (at.1, o.tdb, q.tdb)];
+        let mut out = Vec::with_capacity(4);
+        for (p, t1, t2) in obs {
+            out.push((c1, c2, t1, (t2 - t1) * C_AIR, unit(r1, &p)));
+            out.push((c2, c1, t2, (t1 - t2) * C_AIR, unit(r2, &p)));
+        }
+        for (r, kk, t, z, u) in out {
+            self.survey.observe(r, kk, t, now, z, u);
+        }
+    }
+
+    /// Position corrections (true = declared + d, metres east/north/up) for
+    /// receivers with at least one closed window, by coverage identity.
+    pub fn survey_estimates(&self) -> Vec<(CovId, survey::Estimate)> {
+        self.survey.receivers().filter_map(|c| self.survey.estimate(c).map(|e| (c, e))).collect()
+    }
+
+    /// `/survey.json` and the survey gauges. Corrections only, never an
+    /// absolute position; nothing here moves a receiver.
+    fn render_survey(&self) {
+        let names: HashMap<CovId, String> = self.rxs.values().map(|r| (r.cov, who_of(&r.info))).collect();
+        let mut rows = Vec::new();
+        let (mut n, mut reliable, mut over100) = (0usize, 0usize, 0usize);
+        for (c, e) in self.survey_estimates() {
+            n += 1;
+            if e.reliable() {
+                reliable += 1;
+                if e.horizontal_m() > 100.0 {
+                    over100 += 1;
+                }
+            }
+            rows.push(serde_json::json!({
+                "who": names.get(&c).cloned().unwrap_or_else(|| format!("cov:{c:016x}")),
+                "east_m": e.d[0].round(), "north_m": e.d[1].round(), "up_m": e.d[2].round(),
+                "sd_m": [e.sd[0].round(), e.sd[1].round(), e.sd[2].round()],
+                "sd_weak_h_m": (e.sd_weak_h * 10.0).round() / 10.0, "sigma_m": e.sigma.round(),
+                "windows": e.windows, "dropped": e.dropped, "reliable": e.reliable(),
+            }));
+        }
+        {
+            let mut snap = self.stats.snapshot.lock().unwrap();
+            snap.survey_receivers = n;
+            snap.survey_reliable = reliable;
+            snap.survey_reliable_over_100m = over100;
+        }
+        *self.stats.survey_json.lock().unwrap() = serde_json::to_string(&rows).unwrap_or_default();
+    }
+
+    pub fn survey_counts(&self) -> (u64, u64, u64) {
+        (self.survey.observations, self.survey.windows_closed, self.survey.windows_dropped)
     }
 
     // ---------------------------------------------------------------- mlat --
@@ -2231,6 +2319,8 @@ impl Engine {
     }
 
     fn housekeeping(&mut self, now: f64) {
+        self.survey.sweep(now);
+        self.render_survey();
         // Sync quality per aircraft over roughly the last minute.
         for a in self.aircraft.values_mut() {
             a.sync_ok *= 0.8;

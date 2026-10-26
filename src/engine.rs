@@ -440,6 +440,9 @@ pub struct Stats {
     /// Positions kept off the output because no served receiver contributed
     /// (served-output-only).
     pub outputs_not_served: AtomicU64,
+    /// Survey corrections applied, and ones too large to apply.
+    pub survey_applies: AtomicU64,
+    pub survey_apply_too_big: AtomicU64,
     /// Snapshot for /state.json and the gauges, rewritten every second.
     pub snapshot: Mutex<Snapshot>,
     /// Worst recent ADS-B-checked updates, for /debug.json.
@@ -491,6 +494,8 @@ pub struct Snapshot {
     pub survey_receivers: usize,
     pub survey_reliable: usize,
     pub survey_reliable_over_100m: usize,
+    /// Receivers whose position the engine has corrected.
+    pub survey_applied: usize,
     /// Serve mode: served receivers, the aircraft they are asked for in
     /// total (sync / mlat), and the mlat-wanted aircraft.
     pub serve_receivers: usize,
@@ -544,6 +549,13 @@ pub struct Engine {
     /// Receiver position calibration from sync residuals (survey.rs), keyed
     /// by coverage identity so it survives reconnects.
     survey: Survey,
+    /// Corrections applied to declared positions (east, north, up metres),
+    /// by coverage identity; re-applied when a receiver reconnects, dropped
+    /// when it declares a new position. In memory only: after a restart the
+    /// survey learns them again in about an hour.
+    applied: HashMap<CovId, [f64; 3]>,
+    apply: Option<survey::ApplyCfg>,
+    apply_at: f64,
     /// Serve mode: traffic selection, and when stats last went out.
     interest: Interest,
     serve_stats_at: f64,
@@ -639,6 +651,9 @@ impl Engine {
             two_site_dump: None,
             alt_model: AltModel::default(),
             survey: Survey::default(),
+            applied: HashMap::new(),
+            apply: None,
+            apply_at: 0.0,
             interest: Interest::new(interest::Params::default(), 0x5e7e),
             serve_stats_at: 0.0,
             served_n: 0,
@@ -690,6 +705,12 @@ impl Engine {
             Err(e) => tracing::info!(path, error = %e, "no coverage maps loaded: starting empty"),
         }
         self.coverage_file = Some(path.to_string());
+        self
+    }
+
+    /// Move receivers to their reliable survey estimates (survey::ApplyCfg).
+    pub fn with_survey_apply(mut self, cfg: Option<survey::ApplyCfg>) -> Engine {
+        self.apply = cfg;
         self
     }
 
@@ -806,6 +827,9 @@ impl Engine {
                         r.enu = Enu::at(r.pos);
                         self.coverage.place(r.cov, lat, lon, now);
                         self.survey.forget(r.cov);
+                        // A new declared position: an old correction no
+                        // longer applies.
+                        self.applied.remove(&r.cov);
                     }
                 }
             }
@@ -842,10 +866,13 @@ impl Engine {
             want_mlat: 0,
         };
         let cov = cov_id(&r.info);
+        let mut r = r;
+        if let Some(d) = self.applied.get(&cov) {
+            r.pos = corrected(&r.enu, d);
+        }
         self.coverage.place(cov, r.info.lat, r.info.lon, now);
         self.coverage.name(cov, &who_of(&r.info));
         self.rx_by_cov.insert(cov, key);
-        let mut r = r;
         r.cov = cov;
         self.rx_by_conn.insert(conn, key);
         if r.info.serve.is_some() {
@@ -1384,6 +1411,40 @@ impl Engine {
         }
     }
 
+    /// Move the receivers whose reliable estimate is off by more than
+    /// `min_m` (and 5 sigma) to it, the largest first. The estimate is
+    /// relative to where the receiver is now, so corrections add up; its
+    /// survey starts over from the new place, and its clock pairs
+    /// re-converge (they were fitted to the old one).
+    fn apply_survey(&mut self, cfg: survey::ApplyCfg) {
+        let mut cands: Vec<(f64, CovId, [f64; 3])> = Vec::new();
+        for (c, e) in self.survey_estimates() {
+            let h = e.horizontal_m();
+            if !e.reliable() || h <= cfg.min_m || h <= 5.0 * e.sd[0].hypot(e.sd[1]) {
+                continue;
+            }
+            let prev = self.applied.get(&c).copied().unwrap_or([0.0; 3]);
+            let total = [prev[0] + e.d[0], prev[1] + e.d[1], prev[2] + e.d[2]];
+            if total[0].hypot(total[1]) > cfg.max_m {
+                self.stats.survey_apply_too_big.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            cands.push((h, c, total));
+        }
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, c, total) in cands.into_iter().take(cfg.per_round) {
+            self.applied.insert(c, total);
+            self.survey.forget(c);
+            self.stats.survey_applies.fetch_add(1, Ordering::Relaxed);
+            if let Some(k) = self.rx_by_cov.get(&c).copied() {
+                self.drop_pairs(k);
+                if let Some(r) = self.rxs.get_mut(&k) {
+                    r.pos = corrected(&r.enu, &total);
+                }
+            }
+        }
+    }
+
     /// Position corrections (true = declared + d, metres east/north/up) for
     /// receivers with at least one closed window, by coverage identity.
     pub fn survey_estimates(&self) -> Vec<(CovId, survey::Estimate)> {
@@ -1410,6 +1471,7 @@ impl Engine {
                 "sd_m": [e.sd[0].round(), e.sd[1].round(), e.sd[2].round()],
                 "sd_weak_h_m": (e.sd_weak_h * 10.0).round() / 10.0, "sigma_m": e.sigma.round(),
                 "windows": e.windows, "dropped": e.dropped, "reliable": e.reliable(),
+                "applied_m": self.applied.get(&c).map(|a| [a[0].round(), a[1].round(), a[2].round()]),
             }));
         }
         {
@@ -1417,6 +1479,7 @@ impl Engine {
             snap.survey_receivers = n;
             snap.survey_reliable = reliable;
             snap.survey_reliable_over_100m = over100;
+            snap.survey_applied = self.applied.len();
         }
         *self.stats.survey_json.lock().unwrap() = serde_json::to_string(&rows).unwrap_or_default();
     }
@@ -2428,6 +2491,12 @@ impl Engine {
 
     fn housekeeping(&mut self, now: f64) {
         self.survey.sweep(now);
+        if let Some(cfg) = self.apply {
+            if now - self.apply_at >= cfg.every_s {
+                self.apply_at = now;
+                self.apply_survey(cfg);
+            }
+        }
         self.render_survey();
         // Sync quality per aircraft over roughly the last minute.
         for a in self.aircraft.values_mut() {
@@ -2667,6 +2736,16 @@ fn adsb_at(h: &VecDeque<(Ecef, f64)>, t: f64) -> Option<Ecef> {
         .map(|(p, _)| p)
 }
 
+/// The declared position (`enu`'s origin) moved by `d` (east, north, up m).
+fn corrected(enu: &Enu, d: &[f64; 3]) -> Ecef {
+    let (o, r) = (enu.origin, &enu.r);
+    [
+        o[0] + d[0] * r[0][0] + d[1] * r[1][0] + d[2] * r[2][0],
+        o[1] + d[0] * r[0][1] + d[1] * r[1][1] + d[2] * r[2][1],
+        o[2] + d[0] * r[0][2] + d[1] * r[1][2] + d[2] * r[2][2],
+    ]
+}
+
 pub(crate) fn fxhash(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &x in b {
@@ -2900,5 +2979,41 @@ mod tests {
         assert_eq!(adsb_at(&h, 20.6).unwrap(), [1000.0, 0.0, 0.0]);
         assert!(adsb_at(&h, 22.0).is_none());
         assert!(adsb_at(&VecDeque::new(), 1.0).is_none());
+    }
+
+    #[test]
+    fn corrections_move_the_receiver_and_survive_a_reconnect() {
+        let mut e = engine().with_survey_apply(Some(survey::ApplyCfg::default()));
+        let a = add_rx(&mut e, 1, 9.0);
+        let b = add_rx(&mut e, 2, 9.5);
+        let off = HashMap::from([(a, 0.0), (b, 1e-6)]);
+        add_pair(&mut e, a, b, &off, 100.0);
+        let declared = e.rxs[&a].pos;
+        let cov = e.rxs[&a].cov;
+        e.applied.insert(cov, [300.0, -400.0, 0.0]);
+        // Applying moves it and drops its clock pairs.
+        let total = e.applied[&cov];
+        e.drop_pairs(a);
+        let enu = e.rxs[&a].enu;
+        e.rxs.get_mut(&a).unwrap().pos = corrected(&enu, &total);
+        assert!((dist(&e.rxs[&a].pos, &declared) - 500.0).abs() < 1e-6);
+        assert!(e.pairs.is_empty());
+        // A reconnect comes back at the corrected place.
+        let info = e.rxs[&a].info.clone();
+        e.disconnect(1);
+        let (tx, _) = mpsc::channel(1);
+        e.connect(7, info, tx, 200.0);
+        let k = e.rx_by_conn[&7];
+        assert!((dist(&e.rxs[&k].pos, &declared) - 500.0).abs() < 1e-6);
+        let _ = b;
+    }
+
+    #[test]
+    fn corrected_is_east_north_up() {
+        let pos = llh_to_ecef(Llh { lat: 45.0, lon: 9.0, alt: 100.0 });
+        let enu = Enu::at(pos);
+        let p = corrected(&enu, &[100.0, 200.0, 0.0]);
+        let l = enu.to_enu(&p);
+        assert!((l[0] - 100.0).abs() < 1e-6 && (l[1] - 200.0).abs() < 1e-6 && l[2].abs() < 1e-6, "{l:?}");
     }
 }

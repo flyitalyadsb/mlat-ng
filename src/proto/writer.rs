@@ -119,10 +119,16 @@ impl Out {
     }
 }
 
-/// `{"heartbeat":{"server_time":round(time.time(), 3)}}`.
+/// `{"heartbeat":{"server_time":round(time.time(), 3)}}`. Python writes a
+/// float even on a whole second (`1793033357.0`); `{:?}` does too, `{}`
+/// would write an integer.
 fn heartbeat_line() -> Vec<u8> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-    format!("{{\"heartbeat\":{{\"server_time\":{}}}}}\n", (now * 1000.0).round() / 1000.0).into_bytes()
+    heartbeat_line_at(now)
+}
+
+fn heartbeat_line_at(now: f64) -> Vec<u8> {
+    format!("{{\"heartbeat\":{{\"server_time\":{:?}}}}}\n", (now * 1000.0).round() / 1000.0).into_bytes()
 }
 
 /// `{"start_sending":["4ca123",...]}` and friends; None = nothing to send.
@@ -221,6 +227,12 @@ mod tests {
         assert_eq!(engine_line(ToClient::ResultLine("{\"result\":{}}".into()), false, true), None);
         assert_eq!(engine_line(ToClient::StatsLine("{\"stats\":{}}".into()), false, true).unwrap(), b"{\"stats\":{}}\n");
         assert_eq!(engine_line(ToClient::StatsLine("{\"stats\":{}}".into()), true, false), None);
+    }
+
+    #[test]
+    fn heartbeat_time_is_a_float_even_on_a_whole_second() {
+        assert_eq!(heartbeat_line_at(1_793_033_357.0), b"{\"heartbeat\":{\"server_time\":1793033357.0}}\n");
+        assert_eq!(heartbeat_line_at(1_793_033_357.1234), b"{\"heartbeat\":{\"server_time\":1793033357.123}}\n");
     }
 
     #[test]

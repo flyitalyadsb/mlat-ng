@@ -72,6 +72,12 @@ struct Args {
     /// rollout: the map gets what that region's shard would have produced).
     #[arg(long, default_value_t = false, env = "MLAT_NG_SERVED_OUTPUT_ONLY")]
     served_output_only: bool,
+    /// Move receivers to their reliable survey estimates (src/survey.rs):
+    /// every 10 min, up to 25 receivers off by more than this many metres.
+    #[arg(long, default_value_t = false, env = "MLAT_NG_SURVEY_APPLY")]
+    survey_apply: bool,
+    #[arg(long, default_value_t = 100.0, env = "MLAT_NG_SURVEY_APPLY_MIN_M")]
+    survey_apply_min_m: f64,
     #[arg(long, default_value = "flyitalyadsb MLAT [mlat-ng]", env = "MLAT_NG_MOTD")]
     motd: String,
     #[arg(long, default_value = "https://github.com/nesso-labs/mlat-ng", env = "MLAT_NG_SOURCE_URL")]
@@ -166,6 +172,7 @@ fn main() -> anyhow::Result<()> {
     }
     eng = eng.with_two_site(args.two_site);
     eng = eng.with_served_output_only(args.served_output_only);
+    eng = eng.with_survey_apply(args.survey_apply.then(|| survey::ApplyCfg { min_m: args.survey_apply_min_m, ..Default::default() }));
     eng = eng.with_serve_params(interest::Params {
         no_adsb_mlat_s: args.serve_no_adsb_s,
         max_sync_rate: args.serve_max_sync_rate,
@@ -398,6 +405,9 @@ fn render_metrics(
     m("survey_receivers", "gauge", snap.survey_receivers as f64);
     m("survey_reliable", "gauge", snap.survey_reliable as f64);
     m("survey_reliable_over_100m", "gauge", snap.survey_reliable_over_100m as f64);
+    m("survey_applied", "gauge", snap.survey_applied as f64);
+    m("survey_applies_total", "counter", l(&s.survey_applies));
+    m("survey_apply_too_big_total", "counter", l(&s.survey_apply_too_big));
     m("two_site_tries_total", "counter", l(&s.two_site_tries));
     m("two_site_solved_total", "counter", l(&s.two_site_solved));
     m("two_site_accepted_total", "counter", l(&s.two_site_accepted));

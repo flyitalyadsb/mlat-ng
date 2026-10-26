@@ -115,6 +115,26 @@ impl Estimate {
     }
 }
 
+/// Applying estimates to the engine's receiver positions (`--survey-apply`).
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyCfg {
+    /// Horizontal correction needed to act, metres (and > 5 sigma).
+    pub min_m: f64,
+    /// Larger corrections are not applied but counted: a cloned UUID or an
+    /// aggregator is likelier than an antenna that far from where it says.
+    pub max_m: f64,
+    /// Receivers moved per round, largest corrections first: every move
+    /// re-converges the receiver's clock pairs.
+    pub per_round: usize,
+    pub every_s: f64,
+}
+
+impl Default for ApplyCfg {
+    fn default() -> Self {
+        ApplyCfg { min_m: 100.0, max_m: 2000.0, per_round: 25, every_s: 600.0 }
+    }
+}
+
 #[derive(Default)]
 pub struct Survey {
     open: HashMap<(RxKey, RxKey), Win>,

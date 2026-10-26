@@ -134,6 +134,10 @@ pub struct ReplayArgs {
     apply_min_windows: u32,
     #[arg(long, default_value_t = 5.0)]
     apply_max_sd: f64,
+    /// Let the engine move receivers to their survey estimates as it goes,
+    /// every this many seconds (0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    survey_apply_every: f64,
 }
 
 /// Plain Beast (`0x1A '2'|'3'` + 6-byte timestamp + signal + payload, 0x1A
@@ -340,6 +344,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let ecfg = EngineConfig { shadow: true, mlat_delay: a.mlat_delay, holdout_every: a.holdout_every };
     let mut eng = Engine::new(ecfg, stats.clone(), out)
         .with_bench_output(bench)
+        .with_survey_apply((a.survey_apply_every > 0.0).then(|| crate::survey::ApplyCfg { every_s: a.survey_apply_every, ..Default::default() }))
         .with_two_site(a.two_site)
         .with_bench_two_sites(a.bench_two_sites)
         .with_serve_params(crate::interest::Params {

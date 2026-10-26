@@ -64,6 +64,16 @@ pub struct ReplayArgs {
     /// for what the client path brings back).
     #[arg(long, default_value = "dup")]
     hybrid_mode: String,
+    /// Study: the stand-in clients' events reach the engine this many
+    /// seconds late (live, mlat-client data comes through the shadow hub and
+    /// client-side batching; the feed is faster).
+    #[arg(long, default_value_t = 0.0)]
+    hybrid_client_delay: f64,
+    /// Study: and they are sent in batches this many seconds apart, each
+    /// client on its own phase (mlat-client's zlib2 output is flushed ~1 s
+    /// after the first line).
+    #[arg(long, default_value_t = 0.0)]
+    hybrid_client_batch: f64,
     /// Save the receiver coverage maps built during the replay here.
     #[arg(long)]
     coverage_file: Option<String>,
@@ -371,6 +381,25 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let mut emu = Adapter::new(acfg, emu_stats.clone()).with_conn_base(1 << 61);
     let mut emu_evs = Vec::new();
     emu.set_registry(reg, &mut emu_evs);
+    let mut delayed: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u64)>> = std::collections::BinaryHeap::new();
+    let mut delayed_ev: HashMap<u64, crate::types::Event> = HashMap::new();
+    let mut delayed_seq = 0u64;
+    // When a stand-in client's event reaches the engine: its batch's flush
+    // (each connection on its own phase) plus the network delay.
+    let due_of = |ev: &crate::types::Event, t: f64| -> f64 {
+        let conn = match ev {
+            crate::types::Event::Sync { conn, .. } | crate::types::Event::Mlat { conn, .. } => *conn,
+            _ => 0,
+        };
+        let b = a.hybrid_client_batch;
+        let wait = if b > 0.0 {
+            let phase = (fxhash(&conn.to_be_bytes()) % 1000) as f64 / 1000.0 * b;
+            (phase - t).rem_euclid(b)
+        } else {
+            0.0
+        };
+        t + a.hybrid_client_delay + wait
+    };
     let rstats = Arc::new(RouterStats::default());
     let mut router = Router::new(rstats.clone());
     let mut routed: Vec<crate::types::Event> = Vec::new();
@@ -432,6 +461,18 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             for ev in emu_evs.drain(..) {
+                let due = due_of(&ev, next_tick);
+                delayed_seq += 1;
+                delayed.push(std::cmp::Reverse(((due * 1e6) as u64, delayed_seq)));
+                delayed_ev.insert(delayed_seq, ev);
+            }
+            while delayed.peek().is_some_and(|std::cmp::Reverse((due, _))| *due as f64 / 1e6 <= next_tick) {
+                let std::cmp::Reverse((due, k)) = delayed.pop().unwrap();
+                let mut ev = delayed_ev.remove(&k).unwrap();
+                // Live, the server stamps an mlat line when it reads it.
+                if let crate::types::Event::Mlat { rx, .. } = &mut ev {
+                    *rx = due as f64 / 1e6;
+                }
                 router.on_event(Src::Client, ev, &mut routed);
             }
             if serve_sim {
@@ -466,6 +507,17 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
             }
         }
         for ev in emu_evs.drain(..) {
+            let due = due_of(&ev, wall);
+            delayed_seq += 1;
+            delayed.push(std::cmp::Reverse(((due * 1e6) as u64, delayed_seq)));
+            delayed_ev.insert(delayed_seq, ev);
+        }
+        while delayed.peek().is_some_and(|std::cmp::Reverse((due, _))| *due as f64 / 1e6 <= wall) {
+            let std::cmp::Reverse((due, k)) = delayed.pop().unwrap();
+            let mut ev = delayed_ev.remove(&k).unwrap();
+            if let crate::types::Event::Mlat { rx, .. } = &mut ev {
+                *rx = due as f64 / 1e6;
+            }
             router.on_event(Src::Client, ev, &mut routed);
         }
         routed.append(&mut cs_evs);

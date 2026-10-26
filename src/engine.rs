@@ -78,6 +78,10 @@ const GEO_OWN_AGE: f64 = 60.0;
 const GEO_SAMPLE_AGE: f64 = 30.0;
 /// Mode A/C payloads that are shared by too many aircraft at once (VFR,
 /// conspicuity, defaults) or are line noise, as acbridge.py/mlat-client.
+/// WallMap: bucket length (s; the minimum covers one to two buckets) and the
+/// deliveries needed before it maps.
+const WALLMAP_BUCKET: f64 = 30.0;
+const WALLMAP_MIN_OBS: u32 = 20;
 /// Serve mode: `{"stats": ...}` to clients that asked, this often (s); the
 /// sync-point share of an aircraft is judged over this many observations.
 const SERVE_STATS_EVERY: f64 = 15.0;
@@ -125,12 +129,62 @@ struct Rx {
     cov: CovId,
     /// Local east/north/up frame at the declared position (survey).
     enu: Enu,
+    /// Its clock to wall time (2-site records, ADS-B truth).
+    wall: WallMap,
     /// Serve mode: its last rate report (None = it never sent one), what it
     /// is currently asked for, and how that splits into sync and mlat.
     rate: Option<HashMap<u32, f32>>,
     requested: HashSet<u32>,
     want_sync: usize,
     want_mlat: usize,
+}
+
+/// A receiver's clock mapped to wall time through its quickest deliveries:
+/// arrival minus clock time, as low as seen in the last 30-60 s. Batching
+/// (mlat-client flushes its output every second), the shadow hub and the
+/// network only ever add delay, so the minimum is the clock's offset plus the
+/// fastest path's latency, and `clock + offset` dates a transmission without
+/// the seconds of jitter its own arrival carries. In the hybrid one receiver
+/// arrives by two paths (mlat-client via the hub, the Beast feed) with
+/// different delays; dating its ADS-B positions by arrival mixed them, and
+/// the 2-site self-check measured that (1.7 km p50 live while readsb's truth
+/// put the same positions at 61 m, 2026-10-26).
+#[derive(Clone, Copy)]
+struct WallMap {
+    start: f64,
+    cur: f64,
+    prev: f64,
+    n: u32,
+}
+
+impl Default for WallMap {
+    fn default() -> Self {
+        WallMap { start: f64::NEG_INFINITY, cur: f64::INFINITY, prev: f64::INFINITY, n: 0 }
+    }
+}
+
+impl WallMap {
+    fn observe(&mut self, now: f64, clock_s: f64) {
+        if now - self.start > WALLMAP_BUCKET {
+            self.prev = self.cur;
+            self.cur = f64::INFINITY;
+            self.start = now;
+        }
+        self.cur = self.cur.min(now - clock_s);
+        self.n = self.n.saturating_add(1);
+    }
+
+    /// Wall time of clock time `clock_s`, once enough deliveries were seen
+    /// and when it is plausible against the arrival `now` (a clock that
+    /// jumped is not mapped).
+    fn map(&self, clock_s: f64, now: f64) -> Option<f64> {
+        let off = self.cur.min(self.prev);
+        if self.n < WALLMAP_MIN_OBS || !off.is_finite() {
+            return None;
+        }
+        let t = clock_s + off;
+        (t <= now + 0.5 && now - t <= 10.0).then_some(t)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +262,9 @@ struct Aircraft {
     /// diagnose multilateration of aircraft that also broadcast ADS-B.
     adsb: Option<(Ecef, f64)>,
     adsb_vel: Option<[f64; 3]>,
+    /// The same, dated by the receiving receiver's clock (WallMap).
+    adsb_rx: Option<(Ecef, f64)>,
+    adsb_rx_vel: Option<[f64; 3]>,
     /// Time of the last Comm-B ground velocity accepted into the track.
     last_vel_update: f64,
     /// Own geometric-minus-baro altitude (ft, from ADS-B TC 19) and its time.
@@ -773,6 +830,7 @@ impl Engine {
             noise_scale: 1.0,
             cov: 0,
             enu: Enu::at(pos),
+            wall: WallMap::default(),
             rate: None,
             requested: HashSet::new(),
             want_sync: 0,
@@ -831,6 +889,9 @@ impl Engine {
 
     fn clock_reset(&mut self, conn: ConnId) {
         let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
+        if let Some(r) = self.rxs.get_mut(&k) {
+            r.wall = WallMap::default();
+        }
         let peers: Vec<RxKey> = self.rxs.get(&k).map(|r| r.peers.iter().copied().collect()).unwrap_or_default();
         for p in peers {
             if let Some(m) = self.pairs.get_mut(&pair_key(k, p)) {
@@ -1111,10 +1172,12 @@ impl Engine {
             return;
         }
         let (ta, tb, ma, mb) = if et < ot { (et, ot, em, om) } else { (ot, et, om, em) };
-        let (freq, rpos) = match self.rxs.get_mut(&k) {
+        let (freq, rpos, tb_wall) = match self.rxs.get_mut(&k) {
             Some(r) => {
                 r.sync_msgs += 1;
-                (r.freq, r.pos)
+                let tb_s = et.max(ot) / r.freq;
+                r.wall.observe(now, tb_s);
+                (r.freq, r.pos, r.wall.map(tb_s, now))
             }
             None => return,
         };
@@ -1166,6 +1229,29 @@ impl Engine {
             }
             if ac.adsb.map(|(_, t0)| now - t0 > 0.5).unwrap_or(true) {
                 ac.adsb = Some((pb, now));
+            }
+            // The same dated by the receiver's clock, for the 2-site path
+            // (WallMap): positions arriving by paths with different delays
+            // keep their order and spacing.
+            if let Some(tw) = tb_wall {
+                // Replay dump: the clock-dated ADS-B positions of aircraft
+                // with 2-site records, for an offline interpolated truth.
+                if !ac.two.is_empty() {
+                    if let Some(w) = self.two_site_dump.as_mut() {
+                        let l = ecef_to_llh(pb);
+                        let line = serde_json::json!({"adsb": format!("{icao:06x}"), "t": tw, "lat": l.lat, "lon": l.lon});
+                        let _ = std::io::Write::write_all(w, format!("{line}\n").as_bytes());
+                    }
+                }
+                if let Some((p0, t0)) = ac.adsb_rx {
+                    let dt = tw - t0;
+                    if dt > 0.5 && dt < 15.0 {
+                        ac.adsb_rx_vel = Some([(pb[0] - p0[0]) / dt, (pb[1] - p0[1]) / dt, (pb[2] - p0[2]) / dt]);
+                    }
+                }
+                if ac.adsb_rx.map(|(_, t0)| tw - t0 > 0.5).unwrap_or(true) {
+                    ac.adsb_rx = Some((pb, tw));
+                }
             }
             // A validated ADS-B position: who hears this aircraft, and who
             // in range does not, is coverage evidence.
@@ -1342,6 +1428,7 @@ impl Engine {
         let freq = match self.rxs.get_mut(&k) {
             Some(r) => {
                 r.mlat_msgs += 1;
+                r.wall.observe(wall, t / r.freq);
                 if r.suspect {
                     return;
                 }
@@ -1540,11 +1627,14 @@ impl Engine {
             return;
         }
         let Some(d) = modes::decode(&bytes) else { return };
+        // The group's time by its receivers' clocks (WallMap): the earliest
+        // mapped copy. None until some receiver's clock is mapped.
+        let t_rx = g.copies.iter().filter_map(|(k, cs)| self.rxs.get(k).and_then(|r| r.wall.map(*cs, now))).reduce(f64::min);
         // The AP address of a corrupted frame is garbage; requiring that some
         // receiver reported the aircraft as seen filters those out.
         let known = self.aircraft.get(&d.address).map(|a| a.tracking > 0).unwrap_or(false);
         if known && (d.df == 20 || d.df == 21) && bytes.len() == 14 {
-            self.commb_velocity(d.address, &bytes, g.first_wall);
+            self.commb_velocity(d.address, &bytes, t_rx.unwrap_or(g.first_wall));
         }
         if !known || g.copies.len() < 2 {
             self.stats.groups_unknown_ac.fetch_add(1, Ordering::Relaxed);
@@ -1609,7 +1699,8 @@ impl Engine {
             let alt = self.altitude_for(d.address, ac, d.altitude_ft, now, at);
             let used_keys: Vec<RxKey> = cl.iter().map(|&i| keys[copies[normd.copies[i]].node]).collect();
             let sites = distinct_sites(&meas);
-            let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped, sites };
+            let t_clock = t_rx.map(|t0| t0 + (normd.t[cl[0]] - t_first));
+            let ctx = GroupCtx { df: d.df, clusters: n_clusters, copies: g.copies.len(), edges: normd.edges, dropped: normd.dropped, sites, t_clock };
             self.update_aircraft(d.address, &meas, &cov, alt, t_wall, now, &used_keys, &ctx);
         }
     }
@@ -1760,7 +1851,7 @@ impl Engine {
             }
         } else if n >= 2 && ctx.sites >= 2 {
             if self.two_site != TwoSite::Off && ctx.sites == 2 && n == 2 {
-                self.two_site_record(icao, meas, cov, alt, t, used);
+                self.two_site_record(icao, meas, cov, alt, ctx.t_clock.unwrap_or(t), used);
             }
             let ac = self.aircraft.get_mut(&icao).unwrap();
             if let Some(tr) = ac.track.as_mut() {
@@ -1805,7 +1896,7 @@ impl Engine {
         };
         self.check_adsb(icao, n, t, now, fix_used.as_ref(), published, accepted, used, ctx);
         if self.two_site != TwoSite::Off && !can_fix {
-            self.two_site_try(icao, t, now);
+            self.two_site_try(icao, ctx.t_clock.unwrap_or(t), t, now);
         }
     }
 
@@ -1833,9 +1924,14 @@ impl Engine {
     /// passes the checks becomes a fix for its track, which is published by
     /// the usual rules (confirmed, anchored by a fix in the last 10 s); in
     /// Bench mode only aircraft that also send ADS-B, to the bench output.
-    fn two_site_try(&mut self, icao: u32, t: f64, now: f64) {
+    ///
+    /// `t` is the update's time by the receivers' clocks (the records, the
+    /// Comm-B history and the ADS-B check are dated the same way), `t_arr`
+    /// the arrival-based time the track and the output run on: the fix is
+    /// moved along the velocity from one to the other.
+    fn two_site_try(&mut self, icao: u32, t: f64, t_arr: f64, now: f64) {
         let Some(ac) = self.aircraft.get(&icao) else { return };
-        if t - ac.two_tried < TWO_SITE_EVERY || t - ac.last_fix_update < 30.0 || ac.two.len() < TWO_SITE_MIN_RECS {
+        if t - ac.two_tried < TWO_SITE_EVERY || t_arr - ac.last_fix_update < 30.0 || ac.two.len() < TWO_SITE_MIN_RECS {
             return;
         }
         // Study knobs (replay): the velocity source and the window length.
@@ -1877,11 +1973,22 @@ impl Engine {
             r.off = off;
         }
         let heard = ac.two_heard.clone();
-        let truth = ac.adsb.filter(|(_, ta)| now - ta < 5.0).map(|(p, ta)| {
-            let v = ac.adsb_vel.unwrap_or([0.0; 3]);
-            let dt = t - ta;
-            [p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt]
-        });
+        // The aircraft's own ADS-B, dated by the receivers' clocks like the
+        // solution (arrival-dated ADS-B moved the "truth" km away in the
+        // hybrid: two paths, two delays).
+        let (adsb, adsb_vel) = match ac.adsb_rx {
+            Some(x) => (Some(x), ac.adsb_rx_vel),
+            None => (ac.adsb, ac.adsb_vel),
+        };
+        let truth_at = |tt: f64| {
+            adsb.filter(|(_, ta)| now - ta < 5.0).map(|(p, ta)| {
+                let v = adsb_vel.unwrap_or([0.0; 3]);
+                let dt = tt - ta;
+                [p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt]
+            })
+        };
+        let truth = truth_at(t);
+        let truth_arr = truth_at(t_arr);
         let last = recs.last().unwrap().clone();
         let mid = ecef_to_llh([(last.ra[0] + last.rb[0]) / 2.0, (last.ra[1] + last.rb[1]) / 2.0, (last.ra[2] + last.rb[2]) / 2.0]);
         let silent: Vec<CovId> = self
@@ -1915,7 +2022,9 @@ impl Engine {
             self.two_site_err.push_back((now, dist(&p, &sol.pos), ok));
             if let Some(w) = self.two_site_dump.as_mut() {
                 let mid = [(last.ra[0] + last.rb[0]) / 2.0, (last.ra[1] + last.rb[1]) / 2.0, (last.ra[2] + last.rb[2]) / 2.0];
+                let (sl, tl) = (ecef_to_llh(sol.pos), ecef_to_llh(p));
                 let line = serde_json::json!({
+                    "sol_lat": sl.lat, "sol_lon": sl.lon, "truth_lat": tl.lat, "truth_lon": tl.lon, "now": now,
                     "t": t, "icao": format!("{icao:06x}"), "err_m": dist(&p, &sol.pos), "ok": ok,
                     "rms": sol.rms, "err_h": sol.err_h, "margin": sol.margin, "n": sol.n, "span": sol.span,
                     "baseline_m": dist(&last.ra, &last.rb), "range_m": dist(&mid, &p), "h": last.h,
@@ -1936,12 +2045,16 @@ impl Engine {
         let rot = Matrix3::from_fn(|i, j| frame.r[i][j]);
         let var_h = sol.err_h * sol.err_h / 2.0;
         let cov = rot.transpose() * Matrix3::from_diagonal(&Vector3::new(var_h, var_h, 100.0 * 100.0)) * rot;
-        let fix = Fix { pos: sol.pos, cov, t0: 0.0, chi2: sol.rms * sol.rms, dof: 0, err_h: sol.err_h, gdop: 0.0, used: Vec::new() };
+        // Where it is at the track's (arrival-based) time.
+        let dt = t_arr - t;
+        let shift = rot.transpose() * Vector3::new(vel[0] * dt, vel[1] * dt, 0.0);
+        let pos = [sol.pos[0] + shift[0], sol.pos[1] + shift[1], sol.pos[2] + shift[2]];
+        let fix = Fix { pos, cov, t0: 0.0, chi2: sol.rms * sol.rms, dof: 0, err_h: sol.err_h, gdop: 0.0, used: Vec::new() };
         let ac = self.aircraft.get_mut(&icao).unwrap();
         let fed = match ac.track.as_mut() {
-            Some(tr) if t - tr.last_update() < 60.0 => tr.update_fix(&fix, t) == Gate::Accepted,
+            Some(tr) if t_arr - tr.last_update() < 60.0 => tr.update_fix(&fix, t_arr) == Gate::Accepted,
             _ => {
-                ac.track = Some(Track::new(&fix, t));
+                ac.track = Some(Track::new(&fix, t_arr));
                 ac.track_rejects = 0;
                 true
             }
@@ -1950,12 +2063,12 @@ impl Engine {
             return;
         }
         if let Some(tr) = ac.track.as_mut() {
-            tr.update_velocity(vel[0], vel[1], 1.5, t);
+            tr.update_velocity(vel[0], vel[1], 1.5, t_arr);
         }
-        ac.last_fix_update = t;
-        ac.last_vel_update = t;
+        ac.last_fix_update = t_arr;
+        ac.last_vel_update = t_arr;
         self.stats.two_site_tracked.fetch_add(1, Ordering::Relaxed);
-        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t, now, &[]), truth) {
+        if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t_arr, now, &[]), truth_arr) {
             self.two_site_pub.push_back((now, dist(&p, &pos)));
         }
     }
@@ -2492,6 +2605,8 @@ impl Engine {
 struct GroupCtx {
     /// distinct receiver sites in this update (receivers < 1 km apart = one)
     sites: usize,
+    /// This update's time by the receivers' clocks (WallMap), when mapped.
+    t_clock: Option<f64>,
     df: u8,
     clusters: usize,
     copies: usize,
@@ -2731,5 +2846,31 @@ mod tests {
         // Not again before 15 s.
         e.send_serve_stats(110.0);
         assert!(rx1.try_recv().is_err());
+    }
+
+    #[test]
+    fn wall_map_follows_the_quickest_deliveries() {
+        let mut m = WallMap::default();
+        // A clock 1000 s behind wall time; deliveries 0.2-1.4 s late
+        // (batches), the quickest 0.2 s.
+        for i in 0..40 {
+            let clock = 5000.0 + i as f64 * 0.5;
+            let late = 0.2 + (i % 7) as f64 * 0.2;
+            assert_eq!(m.map(clock, clock + 1000.0 + late).is_some(), i >= WALLMAP_MIN_OBS as usize);
+            m.observe(clock + 1000.0 + late, clock);
+        }
+        let t = m.map(5100.0, 6101.0).unwrap();
+        assert!((t - 6100.2).abs() < 1e-9, "{t}");
+        // A clock that jumped is not mapped.
+        assert!(m.map(9000.0, 6102.0).is_none());
+        // After two buckets the old minimum is gone: a slower path alone
+        // maps with its own (larger) delay.
+        let mut now = 6200.0;
+        while now < 6300.0 {
+            m.observe(now, now - 1000.0 - 0.9);
+            now += 1.0;
+        }
+        let t = m.map(5300.0, 6301.0).unwrap();
+        assert!((t - 6300.9).abs() < 1e-9, "{t}");
     }
 }

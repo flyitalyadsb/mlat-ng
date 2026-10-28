@@ -141,6 +141,10 @@ struct Args {
     /// in feeder-supplied keys out of reach.
     #[arg(long, env = "MLAT_NG_HASH_SEED")]
     hash_seed: Option<u64>,
+    /// Aircraft worker threads (worker.rs); 0 = one worker on the engine
+    /// thread. The output does not depend on it.
+    #[arg(long, default_value_t = 0, env = "MLAT_NG_WORKERS")]
+    workers: usize,
 }
 
 fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -195,6 +199,7 @@ fn main() -> anyhow::Result<()> {
         max_sync_rate: args.serve_max_sync_rate,
         ..interest::Params::default()
     });
+    eng = eng.with_workers(args.workers.max(1)).with_threads(args.workers > 0);
     let (q_tx, q_rx) = mpsc::channel(64);
     eng = eng.with_queries(q_rx);
     let feed_cfg = (!cells.is_empty()).then(|| relay::FeedConfig {

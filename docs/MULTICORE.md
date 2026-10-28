@@ -1,9 +1,13 @@
 # mlat-ng on many cores: study
 
 Status: study, 2026-10-28.
-- **Step 0 (output independent of map order, `hashing.rs`) is implemented,**
-  in the PR that adds this file.
-- Steps 1 and later are not implemented.
+- **Step 0 is implemented** (mlat-ng #17): the output does not depend on map
+  order (`hashing.rs`).
+- **Step 1 is implemented:** stage 1 plus aircraft workers (`worker.rs`),
+  still on the engine thread. The output is byte-identical to step 0 for any
+  number of workers ("Step 1 as implemented").
+- Next is step 2: workers on their own threads, a coverage thread, and the
+  two reference changes behind flags.
 - The experiments under "Measured" used a prototype with a fixed Fx hasher.
 - The implementation uses foldhash, seeded once per process: random in the
   server, fixed in replays and tests. Its output was checked to be the same
@@ -313,3 +317,39 @@ CPU, cap3 feed replay, sequential, `/usr/bin/time` user:
 - **about −22%**.
 
 All 240 tests pass, with the default seed and with another one.
+
+### Step 1 as implemented (stage 1 + inline aircraft workers)
+
+The engine is now in two stages.
+- `engine.rs` is stage 1. It keeps the receivers, clock pairs, sync points,
+  grouping, Mode A/C, and the sync half of every aircraft: who sees it, its
+  ADS-B timing, its altitude, and what the serve mode reads.
+- At the tick, stage 1 freezes each due Mode S group into a `GroupJob`:
+  - its nodes and copies;
+  - the clock edges, exactly as `normalize` would read them at that moment,
+    bridge edges included;
+  - the receivers' identities;
+  - which receivers report seeing the aircraft (2-site).
+- Holdout groups become a `HoldoutJob`. It carries the altitude model's
+  estimate, and the worker counts it only when the group normalises, as
+  before.
+- `worker.rs` owns the track half of each aircraft, sharded by address, and
+  does what follows: normalisation, clustering, solving, tracks, Comm-B,
+  2-site, the ADS-B check, output.
+  - Besides its jobs and the ADS-B updates of its aircraft, it reads only the
+    altitude model and the coverage maps.
+  - It writes back only commutative counters (`Effects`: receivers' use,
+    coverage fix counts, replay dump lines).
+  - Every 10 s, housekeeping asks the workers which aircraft still have a
+    track before both halves forget an aircraft.
+- Mode A/C association still reads every worker's tracks from stage 1. That
+  is fine inline; step 2 needs a per-tick summary (change 2 of the
+  reference).
+
+Checked: cap3 replayed with `--workers 1` and `--workers 4` against step 0
+(a975524) on the feed path, the hybrid path, the survey perturbation test and
+the serve simulation.
+- The SBS output and the 2-site dump are byte-identical.
+- The summaries are identical except the solve timing.
+- All 240 tests pass.
+

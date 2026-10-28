@@ -31,6 +31,7 @@ mod solver;
 mod track;
 mod twosite;
 mod types;
+mod worker;
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;

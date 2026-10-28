@@ -126,13 +126,18 @@ impl Router {
 
     pub fn on_event(&mut self, src: Src, ev: Event, out: &mut Vec<Event>) {
         match ev {
-            Event::Connect { conn, info, tx } => self.on_connect(src, Side { conn, info, tx }, out),
-            Event::Disconnect { conn } => self.on_disconnect(conn, out),
+            Event::Connect { conn, info, tx } => {
+                self.on_connect(src, Side { conn, info, tx }, out);
+                self.gauges();
+            }
+            Event::Disconnect { conn } => {
+                self.on_disconnect(conn, out);
+                self.gauges();
+            }
             // About an aircraft, not a receiver: nothing to route.
             ev @ Event::GeoBaro { .. } => out.push(ev),
             ev => self.on_data(ev, out),
         }
-        self.gauges();
     }
 
     fn on_connect(&mut self, src: Src, side: Side, out: &mut Vec<Event>) {

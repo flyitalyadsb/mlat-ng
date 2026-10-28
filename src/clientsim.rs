@@ -20,7 +20,7 @@
 //! `select = false` emulates a client that is asked for everything it sees
 //! (no selection): the baseline for traffic and accuracy.
 
-use std::collections::{HashMap, HashSet};
+use crate::hashing::{HashMap, HashSet};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -86,7 +86,7 @@ pub struct ClientSim {
 
 impl ClientSim {
     pub fn new(select: bool) -> ClientSim {
-        ClientSim { clients: HashMap::new(), select, rng: StdRng::seed_from_u64(0xc11e) }
+        ClientSim { clients: HashMap::default(), select, rng: StdRng::seed_from_u64(0xc11e) }
     }
 
     pub fn len(&self) -> usize {
@@ -122,11 +122,11 @@ impl ClientSim {
                 conn,
                 rx,
                 freq: reg.clock.freq(),
-                aircraft: HashMap::new(),
-                requested: HashSet::new(),
-                interested: HashSet::new(),
-                seen: HashSet::new(),
-                reported: HashSet::new(),
+                aircraft: HashMap::default(),
+                requested: HashSet::default(),
+                interested: HashSet::default(),
+                seen: HashSet::default(),
+                reported: HashSet::default(),
                 next_update: first,
                 last_update: wall,
                 next_report: self.rng.gen::<f64>() * REPORT_EVERY,
@@ -155,7 +155,12 @@ impl ClientSim {
     /// Timers, and the server's requests to each client.
     pub fn tick(&mut self, wall: f64, out: &mut Vec<Event>) {
         let select = self.select;
-        for c in self.clients.values_mut() {
+        // In receiver order: each client draws from the shared rng
+        // (hashing.rs: nothing may depend on the map's order).
+        let mut rids: Vec<u64> = self.clients.keys().copied().collect();
+        rids.sort_unstable();
+        for rid in rids {
+            let c = self.clients.get_mut(&rid).unwrap();
             while let Ok(m) = c.rx.try_recv() {
                 match m {
                     ToClient::StartSending(v) => {
@@ -344,8 +349,10 @@ impl Client {
     /// send_aircraft_report + send_rate_report
     fn report(&mut self, now: f64, out: &mut Vec<Event>) {
         let all: HashSet<u32> = self.aircraft.iter().filter(|(_, a)| a.messages > 1).map(|(k, _)| *k).collect();
-        let seen: Vec<u32> = all.difference(&self.reported).copied().collect();
-        let lost: Vec<u32> = self.reported.difference(&all).copied().collect();
+        let mut seen: Vec<u32> = all.difference(&self.reported).copied().collect();
+        let mut lost: Vec<u32> = self.reported.difference(&all).copied().collect();
+        seen.sort_unstable();
+        lost.sort_unstable();
         if !seen.is_empty() {
             out.push(Event::Seen { conn: self.conn, icao: seen });
         }
@@ -364,6 +371,7 @@ impl Client {
             }
         }
         if !rates.is_empty() {
+            rates.sort_unstable_by_key(|(a, _)| *a);
             out.push(Event::RateReport { conn: self.conn, rates });
         }
     }

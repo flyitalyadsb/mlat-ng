@@ -1,0 +1,315 @@
+# mlat-ng on many cores: study
+
+Status: study, 2026-10-28.
+- **Step 0 (output independent of map order, `hashing.rs`) is implemented,**
+  in the PR that adds this file.
+- Steps 1 and later are not implemented.
+- The experiments under "Measured" used a prototype with a fixed Fx hasher.
+- The implementation uses foldhash, seeded once per process: random in the
+  server, fixed in replays and tests. Its output was checked to be the same
+  for any seed ("Step 0 as implemented").
+
+## Why
+
+PLAN.md chose "network on all cores, one engine thread owning all state". Only
+the network runs on many cores. Everything that makes a position runs on one
+thread: clock sync, grouping, normalisation, solving, tracks, coverage, survey
+and the altitude model. That was fine at 0.36 core for 3,203 receivers
+(24/10). Since then coverage (Lightcone), survey, the altitude model, 2-site
+and the hybrid have been added to the same thread.
+
+Live, 2026-10-28 ~09:00Z (`top -H` on nesso-worker-9, EPYC 7542, image
+sha-5d7dba6), before the EU peak:
+
+| process | `engine` thread | `net` threads | |
+|---|---|---|---|
+| mlat-ng (3,221 receivers) | 72% | 3–5% each | headroom shrinking |
+| mlat-ng-feed (2,461) | 77% | 8–11% each | headroom shrinking |
+| mlat-ng-hybrid (4,870) | **99.4%** | 86%, 26%, 24%, 20% | **saturated, losing data** |
+
+The hybrid's losses since its start 16 h earlier:
+- `hybrid_engine_full_total` 63.9 M;
+- `msgs_dropped_queue_full_total` 46.8 M;
+- engine queue 60–180 k;
+- `engine_late_ms_max` 4,025.
+
+One hybrid `net` thread at 86% is very probably the hybrid router. The router is
+a single tokio task, so it is a second one-core ceiling (to be confirmed, see
+"Open points").
+
+A faster core buys a constant factor, once. The ceiling is in the design.
+
+## Where the engine's time goes
+
+The profiles are from macOS `sample` on `origin/main` (5d7dba6), replaying cap3
+(600 s of the real Beast feed, 2026-10-24). Shares are of engine time only. The
+capture inflate, Beast parsing and hybrid router are left out; they run on
+`net` threads live.
+
+| | feed path | hybrid path (70% stand-in clients, 2-site publish, survey apply, mature coverage) |
+|---|---|---|
+| Coverage::observe (on ADS-B sync points) | 28.3% | 23.0% |
+| **group processing** | **43.9%** | **47.0%** |
+| · normalise | 15.3% | 12.0% |
+| · solver | 19.8% | 14.4% |
+| · 2-site try (`twosite::solve`) | – | 13.3% |
+| · track | 5.0% | 3.8% |
+| sync / clock pairs / grouping (rest of `handle_at`) | ~14% | ~14.5% |
+| survey observe | 4.8% | 4.0% |
+| altitude model insert + estimate | 4.8% | 4.7% |
+| expire + housekeeping | 2.3% | 1.8% |
+| edge prediction + build (would stay on the sequential thread) | 1.7% | 1.5% |
+| *SipHash, all of the above (default `HashMap` hasher)* | *13.3%* | *13.8%* |
+
+Two thirds of the engine's time is not sequential by nature:
+- **Group processing** depends on other aircraft only through read-only state.
+- **Coverage** is a side product for Lightcone and 2-site.
+
+What is truly sequential is the clock-pair Kalman filters. A pair's
+observations must be applied in time order. Together with grouping, that is
+~15% of today's load.
+
+## The rule: no loss of quality
+
+1. **Reference = today's engine, made reproducible.** Today the same input gives
+   slightly different output from run to run (see "Measured"), because some
+   floating-point sums and a few first-match choices follow `HashMap`
+   iteration order. Step 0 makes every such place go in key order, so the
+   output no longer depends on the hash seed. Quality is unchanged, to the last
+   bits.
+2. **The parallel engine must give BIT-IDENTICAL output to the reference** on
+   every replay capture, for any number of workers. "Bit-identical" means:
+   - the same SBS lines, sorted by (time, address);
+   - the same bench lines;
+   - the same holdout / ADS-B-check / 2-site error sets.
+
+   A yes/no test with no statistics. Any race or ordering bug shows up as a
+   diff.
+3. **Where exactness would cost a lock-step,** we change the reference itself
+   in a deterministic way, and validate that change once, statistically,
+   against today. There are two such places (2-site coverage reads and Mode
+   A/C association; see Design). Both are measured or have zero live traffic.
+
+## What the single thread gives for free (and must be kept)
+
+- **Tick semantics.**
+  - Groups are processed only at the 50 ms tick, in due order.
+  - Each group reads clock pairs, receivers, the altitude model and coverage as
+    they are at that tick.
+  - Events arriving between two ticks are all applied before the next tick's
+    groups.
+- **Per-aircraft order.** An aircraft's ADS-B truth, Comm-B velocities, fixes
+  and track updates happen in one total order.
+- **Within a tick, Mode S groups of different aircraft don't interact.** Their
+  cross-aircraft writes are commutative counters: stats, `r.used`, coverage
+  `count_fix`, diagnostics deques. The one exception is Mode A/C association,
+  which reads every aircraft's track.
+
+## State map
+
+| state | written by | read by | goes to |
+|---|---|---|---|
+| receivers (`rxs`: pos, jitter, noise, suspect, peers, WallMap, serve, tx) | connect/disconnect, sync, mlat, housekeeping, survey apply | build, normalise, bridges, emit, 2-site, serve | **stage 1**; jobs carry what they need |
+| clock pairs, sync table | sync, housekeeping, clock reset, position update | normalise (edges) | **stage 1**; edges frozen into the job |
+| groups being collected | mlat | process_due | **stage 1** |
+| aircraft, sync half: tracking, seen_by, sync_ok/bad, last_adsb, geo_baro, alt_ft/squawk/callsign* | seen/lost, sync, GeoBaro, housekeeping, frame decode* | serve, sync validation, altitude-model insert, existence checks | **stage 1** |
+| aircraft, track half: track, last_fix, last_out, ADS-B truth + history, Comm-B, 2-site records, alt_ft/squawk/callsign* | sync (forwarded), group processing, 2-site | group processing, emit, ADS-B check, 2-site | **worker owning the ICAO** |
+| altitude model | sync (insert), housekeeping (expire) | sync validation (stage 1), altitude constraint (worker) | stage 1; workers read a per-tick `Arc` snapshot (small: 1,913 cells live) |
+| coverage maps | sync (observe), connect (place), fix (count) | 2-site (near, log_lik), HTTP | **coverage thread**; 2-site reads a snapshot |
+| survey | pair updates | housekeeping (apply), HTTP | stage 1 (or its own thread later) |
+| Mode A/C tracks | Mode A/C groups | Mode A/C groups | **Mode A/C step** (see below) |
+| diagnostics (holdout, ADS-B check, 2-site errors, diag_bad) | groups | /metrics, /debug | per-worker buffers, merged in sequence order |
+
+\* alt_ft, squawk and callsign are written from each group's decoded frame and
+read by serve mode, so stage 1 keeps them. Stage 1 decodes the frame when it
+freezes the job, which is exactly when `process_group` does it today. The job
+carries the frame, so the worker applies the same update.
+
+## Design
+
+```
+net threads ──► STAGE 1 (one thread, sequential; replaces the engine thread)
+                 · sync: validate, clock pairs, survey, altitude-model insert
+                 · mlat: collect groups; at the tick, FREEZE each due group into a job
+                 · seen/lost, serve, connect/disconnect, receiver health
+                 │ one ordered channel per worker            │ observe(...) messages
+                 ▼                                           ▼
+        AIRCRAFT WORKERS ×N (icao hash → worker)      COVERAGE THREAD
+         · own the aircraft "track half"                 · owns coverage maps
+         · normalise → clusters → solve → track          · publishes a snapshot every 60 s
+         · 2-site, ADS-B check, emit                     · Lightcone HTTP reads
+```
+
+- **The frozen job is exact by construction.** At the tick, stage 1 does what
+  `process_group` does today before any heavy work:
+  - build the nodes;
+  - compute the member edges (`Engine::edge`) and, for disconnected groups,
+    the bridge edges;
+  - map the WallMap time;
+  - set the `known`/`last_adsb` flags;
+  - apply the frame decode.
+
+  The job carries those numbers: they are the ones today's code would read at
+  that tick. Normalisation is a pure function of them. The heavy work is
+  normalise, solve, track and 2-site (~45% of today, up to 2/3 of the
+  remaining time). It moves to the workers.
+- **Per-aircraft order is kept.** Stage 1 sends a worker, in event order, three
+  kinds of messages: the ADS-B updates of its aircraft, the seen/lost changes,
+  and the jobs. A worker therefore sees its aircraft's history exactly as the
+  single thread did.
+- **Altitude model.** It is written between ticks. Workers read an `Arc`
+  snapshot published at each tick (cheap: ~2 k cells), which is exactly the
+  state the single thread had at that tick.
+- **Housekeeping every 10 s is a short barrier.** Whether an aircraft survives
+  depends on both halves: tracking (stage 1) and a non-stale track (worker).
+  Stage 1 sends the housekeeping marker. Each worker answers with what it
+  drops when it reaches the marker. Stage 1 waits for the answers (a few ms),
+  so existence stays exactly as today.
+- **Coverage moves off the sequential path.** That is 23–28% of today's load,
+  off stage 1.
+  - Coverage `observe` needs "who sees this aircraft". The coverage thread
+    gets the same seen/lost stream, so it keeps its own exact copy.
+  - *Change 1 to the reference:* 2-site reads coverage as of the last 60 s
+    boundary instead of the current tick. Coverage maps evolve with a 24 h
+    half-life, so this is measured below. It is the only input to a position
+    that is not exact by construction.
+- **Mode A/C association** reads every aircraft's track.
+  - *Change 2 to the reference:* a tick's Mode A/C groups are processed after
+    its Mode S groups (today they are interleaved by due order). They read a
+    per-tick summary of tracks that the workers publish. An associated TDOA
+    update reaches the Mode S track at the start of the next tick.
+  - Live impact today: none. The hybrid shows 177 k Mode A/C groups and
+    0 fixes, and real Mode A/C never arrives through the hub (2026-10-24).
+  - To validate on a client-path capture before Mode A/C matters.
+- **Outputs.** Each worker sends to the same broadcast channels. Within an
+  aircraft the order is as today; lines of different aircraft may interleave
+  differently, which none of the consumers depend on.
+- **Backpressure.** The channels to the workers are bounded and block. A
+  worker that falls behind slows stage 1, which slows input exactly as today.
+  Nothing is dropped inside the engine.
+- **Map order decides nothing** (step 0, done). Every map takes a per-process
+  seed. Every place where the order reached a result now goes in key order.
+  It is needed for reproducibility, and it removes most of the 13–14% SipHash
+  cost.
+
+## Expected capacity (same hardware)
+
+Hybrid shares of today's engine time:
+
+| thread | load | headroom |
+|---|---|---|
+| stage 1 | ~15% (sync, pairs, grouping) + 4% (survey) + 3% (altitude insert) + 3% (freezing jobs, decode) + 2% (expire/housekeeping) ≈ **27%**, before step 0's hashing gain | ~3.7× |
+| coverage thread | ~23% | ~4× (its own algorithm can be made much cheaper later) |
+| workers | ~47% spread over N | scales with cores |
+
+A later step 2 could split stage 1 by sharding the sync table and clock pairs.
+It is not needed for the growth we expect.
+
+## Verification
+
+1. Step 0, single thread, reproducible:
+   - Two runs give byte-identical output on cap2, cap3 and the hybrid replay.
+   - Against today's main, all metrics are identical up to the last-bit noise
+     we already have between today's own runs.
+2. Step 1, still single thread, split into stage 1, jobs and an inline worker:
+   bit-identical to step 0.
+3. Reference changes 1 and 2 behind flags: a replay comparison with the paired
+   bootstrap already used in the algorithm study (2026-10-25). Inputs:
+   - cap3 hybrid replay with 2-site publish;
+   - the 2-site bench (`--bench-two-sites`);
+   - a client-path capture for Mode A/C.
+4. Threads: workers = 1, 2, 4, 8, on every capture, 20 repetitions each.
+   Everything must be bit-identical to step 2's reference. A CI test does the
+   same on the simulator (sim.rs).
+5. Live:
+   - The hybrid goes first. It is the saturated one, so its quality can only
+     improve when the drops stop.
+   - The judge compares it before and after.
+   - Then mlat-ng and the feed.
+   - Not before the head-to-head verdict (31/10).
+
+## Open points
+
+- **The hybrid router.** It is one tokio task (`hybrid::run`). Its state is per
+  receiver key, so it can be sharded by key. Before doing that, confirm the
+  86% `net` thread is the router, with a CPU profile of the live pod.
+- ~~Fx is not collision-resistant~~. Done in step 0: foldhash, with a random
+  seed per server process. The output does not depend on the seed, so keeping
+  it secret costs nothing.
+- Survey observe could get its own thread like coverage. It is not needed for
+  the capacity above.
+- The serve mode is off live. Its reads are all stage-1 state; check them again
+  when it rolls out.
+
+## Measured (2026-10-28, cap3 hybrid replay)
+
+Setup:
+- Capture: cap3, 600 s.
+- Hybrid path: 70% stand-in clients (0.8 s delay, 1 s batches), 2-site publish,
+  survey apply every 300 s.
+- Starting coverage: maps from an earlier cap3 replay.
+- Output: 17,808 SBS lines.
+
+| comparison | SBS lines differing | summary metrics differing | 2-site accepted (n, p50, p90) |
+|---|---|---|---|
+| main vs main (same binary, same input) | **20** | 14 (each ±1–3, e.g. published 110,374 / 110,373) | 150, 161 m, 390 m — same |
+| Fx vs Fx (step 0: deterministic hasher) | **0** (byte-identical, same order) | 0 (only solve timing) | same |
+| Fx vs main | 55 (the main-vs-main noise) | 10, each ±1–3 | same |
+| Fx + coverage snapshot 60 s vs Fx | **0** (byte-identical) | 2, diagnostics of *rejected* 2-site solutions (over 5 km 177→179) | same |
+
+- **Today's engine is not reproducible.** The same binary on the same input
+  gives a slightly different output.
+  - Cause: std `HashMap` iteration order, which is seeded per process.
+  - Mechanism: that order feeds floating-point sums (receiver noise scale,
+    reject rate) and the survey's window handling.
+  - Quality is unaffected; the differences are last-bit chaos. But it rules
+    out "bit-identical" as a test until it is fixed.
+- **Step 0 works.** With a fixed-seed Fx hasher everywhere, two runs are
+  byte-identical, and all 240 tests pass. This is the reference the parallel
+  engine must match.
+- **Change 1 (2-site reads 60 s-old coverage) changes nothing that is
+  published on this capture.** The SBS output is byte-identical. The same 150
+  2-site solutions are accepted, with the same errors. Only two counters
+  of rejected solutions move.
+  - Caveat: one 10-minute capture. Repeat on cap2 and on a fresh capture with
+    live coverage maps before relying on it.
+- **Speed of step 0 alone (Fx instead of SipHash).** Measured on the cap3 feed
+  replay, run sequentially, `/usr/bin/time` user CPU:
+  - main: 104.4 s and 102.6 s;
+  - Fx: 77.4 s and 79.7 s;
+  - **−24%**, with the same published positions (109,965), the same published
+    error (p50 97 m, p90 307 m) and the same holdout (p50 50 m).
+  - The figure covers the whole process, ingest included. The engine thread's
+    own share is at least the 13–14% SipHash it spent.
+
+### Step 0 as implemented (foldhash, seeded per process)
+
+Seed independence: cap3 replayed with `--hash-seed 0` and `--hash-seed 1`.
+
+| replay | SBS output, seed 0 vs seed 1 | summary metrics differing |
+|---|---|---|
+| feed path | byte-identical (17,465 lines) | 0 |
+| hybrid path (2-site publish, survey apply, coverage) | byte-identical (17,809) | 0 (only solve timing) |
+| survey perturbation test (5% of receivers moved 300 m, apply every 300 s) | byte-identical (17,637) | 0 |
+| serve simulation (`--serve-sim select`) | byte-identical (23,782) | 0 |
+
+What had to change for that: every place where map order reached a result
+now goes in key order.
+- Clock pairs, for the receiver noise scale and reject rate.
+- Survey windows, as they close.
+- Feed events: registry, Seen/Lost, idle receivers.
+- Mode A/C association. It now takes the nearest matching track, then the
+  lowest address, instead of the map's first.
+- Mode A/C tracks.
+- Ties in the survey corrections.
+- Serve selection and the serve simulator.
+
+Against main on the hybrid replay, every metric moves by ±1–3: the same noise
+main shows between two of its own runs. Published p50 and p90 are unchanged.
+
+CPU, cap3 feed replay, sequential, `/usr/bin/time` user:
+- main: 104.1 s and 114.7 s today (102.6 and 104.4 s earlier);
+- foldhash: 81.3 s and 81.2 s;
+- **about −22%**.
+
+All 240 tests pass, with the default seed and with another one.

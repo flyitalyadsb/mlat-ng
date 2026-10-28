@@ -27,7 +27,7 @@
 //! The HTTP side reads them, and the maps, through `map_json` and
 //! `summary_json`, which run on the engine thread.
 
-use std::collections::{HashMap, HashSet};
+use crate::hashing::{HashMap, HashSet};
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,7 @@ impl Map {
             who: String::new(),
             today: DayStats::new(day_of(now)),
             yesterday: DayStats::default(),
-            unique_seen: HashSet::new(),
+            unique_seen: HashSet::default(),
         }
     }
 

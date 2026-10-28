@@ -9,7 +9,7 @@
 //! arrival times, so arrival is interpolated from the compressed offset;
 //! readsb flushes and the WAN already jitter arrivals by ~0.1-0.3 s.
 
-use std::collections::{HashMap, HashSet};
+use crate::hashing::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,6 +138,10 @@ pub struct ReplayArgs {
     /// every this many seconds (0 = off).
     #[arg(long, default_value_t = 0.0)]
     survey_apply_every: f64,
+    /// Seed of every hash map (hashing.rs). The output must not depend on
+    /// it: two seeds giving different results is a bug.
+    #[arg(long, default_value_t = 0)]
+    hash_seed: u64,
 }
 
 /// Plain Beast (`0x1A '2'|'3'` + 6-byte timestamp + signal + payload, 0x1A
@@ -170,7 +174,7 @@ fn extract(a: &ReplayArgs, dir: &str, reg: &HashMap<u64, registry::Receiver>) ->
         12_742.0 * x.sqrt().asin()
     };
     std::fs::create_dir_all(dir)?;
-    let mut files: HashMap<u64, (std::io::BufWriter<File>, u64)> = HashMap::new();
+    let mut files: HashMap<u64, (std::io::BufWriter<File>, u64)> = HashMap::default();
     let mut buf = Vec::new();
     for spec in &a.captures {
         let mut src = Source::open(spec)?;
@@ -292,11 +296,12 @@ fn aircraft_of(line: &str) -> Option<String> {
 
 pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let a = ReplayArgs::parse_from(argv);
+    crate::hashing::set_seed(a.hash_seed);
     let doc: registry::Doc = serde_json::from_reader(File::open(&a.receivers)?)?;
     let mut reg = registry::parse(&doc);
     // Survey test: move a share of the declared positions; remember by how
     // much (east, north metres), keyed by receiver id.
-    let mut moved: HashMap<u64, (f64, f64)> = HashMap::new();
+    let mut moved: HashMap<u64, (f64, f64)> = HashMap::default();
     if a.perturb_share > 0.0 {
         for (rid, r) in reg.iter_mut() {
             let h = fxhash(&rid.to_le_bytes());
@@ -387,7 +392,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let mut emu_evs = Vec::new();
     emu.set_registry(reg, &mut emu_evs);
     let mut delayed: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u64)>> = std::collections::BinaryHeap::new();
-    let mut delayed_ev: HashMap<u64, crate::types::Event> = HashMap::new();
+    let mut delayed_ev: HashMap<u64, crate::types::Event> = HashMap::default();
     let mut delayed_seq = 0u64;
     // When a stand-in client's event reaches the engine: its batch's flush
     // (each connection on its own phase) plus the network delay.
@@ -408,10 +413,10 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let rstats = Arc::new(RouterStats::default());
     let mut router = Router::new(rstats.clone());
     let mut routed: Vec<crate::types::Event> = Vec::new();
-    let mut client_rids = HashSet::new();
+    let mut client_rids = HashSet::default();
 
     let (mut main_lines, mut bench_lines) = (0usize, 0usize);
-    let (mut main_ac, mut bench_ac) = (HashSet::new(), HashSet::new());
+    let (mut main_ac, mut bench_ac) = (HashSet::default(), HashSet::default());
     let mut dump: Option<std::io::BufWriter<File>> = a.dump_sbs.as_ref().map(File::create).transpose()?.map(std::io::BufWriter::new);
     let mut drain = |out_rx: &mut broadcast::Receiver<Arc<str>>, bench_rx: &mut broadcast::Receiver<Arc<str>>| {
         while let Ok(l) = out_rx.try_recv() {
@@ -569,7 +574,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let errs = eng.adsb_errors();
     let fix_errs: Vec<f64> = errs.iter().filter_map(|e| e.1).collect();
     let out_errs: Vec<f64> = errs.iter().filter_map(|e| e.2).collect();
-    let mut by_rx: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut by_rx: HashMap<&str, Vec<f64>> = HashMap::default();
     for (n, f, _) in &errs {
         let b = match n {
             0..=3 => "2-3",

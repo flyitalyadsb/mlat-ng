@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 use std::sync::Arc;
 
 use super::adapter::{Adapter, AdapterConfig, AdapterStats, CONN_BASE};
@@ -175,7 +175,7 @@ fn sync_pairs_are_the_same_subset_at_every_receiver() {
     live(&mut a, &[1, 2], &mut evs);
     evs.clear();
     // 60 alternating even/odd positions of one aircraft, heard by both
-    let mut pairs: HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>> = HashMap::new();
+    let mut pairs: HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>> = HashMap::default();
     for i in 0..60u64 {
         let f = crate::sim::test_df17_position(0x4CA001, 45.5 + i as f64 * 1e-3, 9.2, 35_000, i % 2 == 1);
         for r in [1u64, 2] {

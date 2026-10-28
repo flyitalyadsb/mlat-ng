@@ -4,7 +4,7 @@
 //! publishes as `/receivers.json` (cluster-internal: it holds antenna
 //! positions). Replay reads the same format from a file.
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +54,7 @@ pub struct Receiver {
 /// Parse a registry document into id -> receiver. Entries with a bad key, an
 /// impossible position or an unknown clock type are skipped.
 pub fn parse(doc: &Doc) -> HashMap<u64, Receiver> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for e in &doc.receivers {
         let Ok(k) = u64::from_str_radix(&e.key, 16) else { continue };
         if e.key.len() != 16 || !(-90.0..=90.0).contains(&e.lat) || !(-180.0..=180.0).contains(&e.lon) {

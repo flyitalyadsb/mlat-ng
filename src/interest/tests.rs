@@ -65,7 +65,7 @@ fn legacy_client_gets_up_to_max_sync_random_aircraft() {
 fn empty_rate_report_gets_the_floor() {
     let mut i = Interest::new(Params::default(), 3);
     let tracking: HashSet<u32> = (1..=40).collect();
-    let empty = HashMap::new();
+    let empty = HashMap::default();
     let (sync, _) = i.select(false, Some(&empty), &tracking, |_| vec![], meta_all);
     assert_eq!(sync.len(), 3);
 }
@@ -101,7 +101,7 @@ fn dont_use_aircraft_only_in_the_second_round() {
 fn mlat_is_what_the_receiver_sees_of_the_wanted_set() {
     let mut i = Interest::new(Params { force_mlat_interval: 1e9, ..Params::default() }, 1);
     i.refresh_wanted(1000.0, [ac(1, 3, 0.0), ac(2, 3, 0.0), ac(3, 3, 999.0)].into_iter());
-    let (_, mlat) = i.select(false, Some(&HashMap::new()), &set(&[1, 3, 4]), |_| vec![], meta_all);
+    let (_, mlat) = i.select(false, Some(&HashMap::default()), &set(&[1, 3, 4]), |_| vec![], meta_all);
     assert_eq!(mlat, set(&[1]));
 }
 

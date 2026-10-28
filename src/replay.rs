@@ -142,6 +142,10 @@ pub struct ReplayArgs {
     /// it: two seeds giving different results is a bug.
     #[arg(long, default_value_t = 0)]
     hash_seed: u64,
+    /// Aircraft workers (worker.rs), inline. The output must not depend on
+    /// it: two counts giving different results is a bug.
+    #[arg(long, default_value_t = 1)]
+    workers: usize,
 }
 
 /// Plain Beast (`0x1A '2'|'3'` + 6-byte timestamp + signal + payload, 0x1A
@@ -348,6 +352,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let (bench, mut bench_rx) = broadcast::channel(1 << 16);
     let ecfg = EngineConfig { shadow: true, mlat_delay: a.mlat_delay, holdout_every: a.holdout_every };
     let mut eng = Engine::new(ecfg, stats.clone(), out)
+        .with_workers(a.workers)
         .with_bench_output(bench)
         .with_survey_apply((a.survey_apply_every > 0.0).then(|| crate::survey::ApplyCfg { every_s: a.survey_apply_every, ..Default::default() }))
         .with_two_site(a.two_site)

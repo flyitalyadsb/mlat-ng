@@ -400,6 +400,7 @@ fn render_metrics(
     m("holdout_failed_total", "counter", l(&s.holdout_failed));
     m("alt_geo_corrected_total", "counter", l(&s.alt_geo_corrected));
     m("alt_geo_fallback_total", "counter", l(&s.alt_geo_fallback));
+    m("alt_replica_mismatch_total", "counter", l(&s.alt_replica_mismatch));
     m("sync_refs_geometric_total", "counter", l(&s.sync_refs_geometric));
     m("groups_bridged_total", "counter", l(&s.groups_bridged));
     m("bridge_receivers_total", "counter", l(&s.bridge_receivers));

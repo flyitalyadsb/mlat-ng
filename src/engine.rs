@@ -57,7 +57,7 @@ use crate::solver::{self, Fix, SolveInput};
 use crate::survey::{self, Survey};
 use crate::track::{Gate, Track};
 use crate::types::{ConnId, Event, ReceiverInfo, ToClient};
-use crate::worker::{self, AdsbUpdate, Effects, Frozen, GroupJob, HoldoutJob, RxRef, Worker};
+use crate::worker::{self, AdsbUpdate, Effects, Frozen, GroupJob, HoldoutJob, ModeAcCand, Pool, RxRef, ToWorker, Worker};
 
 /// Aircraft-to-receiver range beyond which a sync point is not used (radio
 /// horizon at FL450 is ~480 km).
@@ -544,8 +544,18 @@ pub struct Engine {
     /// would, while the shadow input still helps every fix.
     served_output_only: bool,
     /// The aircraft workers (worker.rs), by `worker::shard` of the address.
-    workers: Vec<Worker>,
+    workers: Pool,
+    /// The altitude model changed since the workers' snapshot.
+    alt_dirty: bool,
+    /// The coverage snapshot the workers' 2-site path reads (its period).
+    cov_epoch: Option<i64>,
+    threads: bool,
 }
+
+/// The 2-site path reads coverage maps as of the last multiple of this
+/// (seconds): a snapshot the workers can share (docs/MULTICORE.md, change 1;
+/// the maps move with a 24 h half-life).
+const COVERAGE_SNAPSHOT_S: f64 = 60.0;
 
 /// A receiver's coverage identity: its UUID key (as the Beast feed keys it)
 /// when it has one, else a hash of its user name.
@@ -598,7 +608,7 @@ fn pair_key(a: RxKey, b: RxKey) -> (RxKey, RxKey) {
 impl Engine {
     pub fn new(cfg: EngineConfig, stats: Arc<Stats>, out: broadcast::Sender<Arc<str>>) -> Engine {
         stats.snapshot.lock().unwrap().started = unix_now();
-        let workers = vec![Worker::new(stats.clone(), out.clone())];
+        let workers = Pool::new(vec![Worker::new(stats.clone(), out.clone())]);
         Engine {
             cfg,
             stats,
@@ -639,6 +649,9 @@ impl Engine {
             served_n: 0,
             served_output_only: false,
             workers,
+            alt_dirty: true,
+            cov_epoch: None,
+            threads: false,
         }
     }
 
@@ -658,21 +671,71 @@ impl Engine {
     /// Run `n` aircraft workers (worker.rs). The output does not depend on
     /// `n`; they run inline on the engine thread.
     pub fn with_workers(mut self, n: usize) -> Engine {
-        self.workers = (0..n.max(1)).map(|_| Worker::new(self.stats.clone(), self.out.clone())).collect();
+        self.workers = Pool::new((0..n.max(1)).map(|_| Worker::new(self.stats.clone(), self.out.clone())).collect());
         self.configure_workers();
+        self
+    }
+
+    /// Move the workers to their own threads (after the last `with_*`).
+    pub fn spawn_workers(&mut self) {
+        self.workers.spawn();
+    }
+
+    /// `run` moves the workers to their own threads.
+    pub fn with_threads(mut self, on: bool) -> Engine {
+        self.threads = on;
         self
     }
 
     fn configure_workers(&mut self) {
         let (bench, two_site, only, dump) = (self.bench_out.clone(), self.two_site, self.served_output_only, self.two_site_dump.is_some());
-        for w in &mut self.workers {
+        for w in self.workers.inline_mut() {
             w.configure(bench.clone(), two_site, only, dump);
         }
     }
 
-    fn worker_of(&mut self, icao: u32) -> &mut Worker {
-        let n = self.workers.len();
-        &mut self.workers[worker::shard(icao, n)]
+    fn shard(&self, icao: u32) -> usize {
+        worker::shard(icao, self.workers.len())
+    }
+
+    /// Apply what the workers left so far.
+    fn drain_effects(&mut self) {
+        let fxs: Vec<Effects> = self.workers.effects().collect();
+        for fx in fxs {
+            self.apply_effects(fx);
+        }
+    }
+
+    /// Wait for the workers to finish what they were sent, and apply what
+    /// they left (replay end, shutdown).
+    pub fn flush(&mut self) {
+        self.workers.flush();
+        self.drain_effects();
+        self.flush_two_site_dump();
+    }
+
+    /// The read-only views the workers' jobs of this tick must see: the
+    /// altitude model when it changed, the coverage maps (2-site) at each
+    /// `COVERAGE_SNAPSHOT_S` boundary.
+    fn send_views(&mut self, now: f64) {
+        if self.alt_dirty {
+            self.alt_dirty = false;
+            let m = Arc::new(self.alt_model.clone());
+            self.workers.broadcast(|| ToWorker::AltModel(m.clone()));
+        }
+        if self.two_site != TwoSite::Off {
+            let e = (now / COVERAGE_SNAPSHOT_S).floor() as i64;
+            if self.cov_epoch != Some(e) {
+                self.cov_epoch = Some(e);
+                let c = Arc::new(self.coverage.clone());
+                self.workers.broadcast(|| ToWorker::Coverage(c.clone()));
+            }
+        }
+    }
+
+    /// The workers' diagnostics, merged.
+    fn diag<T>(&self, f: impl Fn(&worker::WorkerDiag) -> Vec<T>) -> Vec<T> {
+        self.workers.shared().iter().flat_map(|s| f(&s.diag.lock().unwrap())).collect()
     }
 
     /// Apply what a worker left for stage 1.
@@ -700,12 +763,12 @@ impl Engine {
 
     /// (time, error m vs own ADS-B, accepted) of the 2-site solutions so far.
     pub fn two_site_errors(&self) -> Vec<(f64, f64, bool)> {
-        self.workers.iter().flat_map(|w| w.two_site_err.iter().copied()).collect()
+        self.diag(|d| d.two_site_err.iter().copied().collect())
     }
 
     /// (time, error m vs own ADS-B) of the positions published after them.
     pub fn two_site_published(&self) -> Vec<(f64, f64)> {
-        self.workers.iter().flat_map(|w| w.two_site_pub.iter().copied()).collect()
+        self.diag(|d| d.two_site_pub.iter().copied().collect())
     }
 
     /// Save the coverage maps now (replay calls this at the end).
@@ -825,6 +888,9 @@ impl Engine {
     /// Run until the event channel closes. Meant for a dedicated thread with
     /// its own current-thread runtime, away from the network workers.
     pub async fn run(mut self, mut rx: mpsc::Receiver<Event>) {
+        if self.threads {
+            self.spawn_workers();
+        }
         let mut tick = tokio::time::interval(Duration::from_millis(50));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_tick = Instant::now();
@@ -855,7 +921,9 @@ impl Engine {
                     Some(ev) => self.handle(ev),
                     // Every sender gone: the process is stopping.
                     None => {
+                        self.flush();
                         self.save_state_now();
+                        self.workers.stop();
                         return;
                     }
                 },
@@ -1329,14 +1397,8 @@ impl Engine {
         if let Some(geo_baro) = geo_baro {
             // The track half: ADS-B truth for the 2-site path and the check.
             // (Fields, not methods: `entry` still borrows the sync table.)
-            let mut fx = Effects::default();
-            let n = self.workers.len();
-            self.workers[worker::shard(icao, n)].adsb(AdsbUpdate { icao, pb, alt_b, now, tb_wall }, &mut fx);
-            if let Some(w) = self.two_site_dump.as_mut() {
-                for line in fx.dump {
-                    let _ = std::io::Write::write_all(w, line.as_bytes());
-                }
-            }
+            let i = worker::shard(icao, self.workers.len());
+            self.workers.send(i, ToWorker::Adsb(AdsbUpdate { icao, pb, alt_b, now, tb_wall }));
             // A validated ADS-B position: who hears this aircraft, and who
             // in range does not, is coverage evidence.
             let llh = ecef_to_llh(pb);
@@ -1345,6 +1407,7 @@ impl Engine {
             if let Some((d, t)) = geo_baro {
                 if now - t <= GEO_SAMPLE_AGE {
                     self.alt_model.insert(icao, llh.lat, llh.lon, alt_b as f64, d, now);
+                    self.alt_dirty = true;
                 }
             }
             let (rxs, by_cov) = (&self.rxs, &self.rx_by_cov);
@@ -1576,6 +1639,8 @@ impl Engine {
     }
 
     fn process_due(&mut self, now: f64) {
+        self.drain_effects();
+        self.send_views(now);
         while let Some(&(due, mk)) = self.group_due.front() {
             if due > now {
                 break;
@@ -1830,11 +1895,8 @@ impl Engine {
     }
 
     fn run_group(&mut self, job: GroupJob) {
-        let n = self.workers.len();
-        let w = &mut self.workers[worker::shard(job.icao, n)];
-        let mut fx = Effects::default();
-        w.group(job, &self.alt_model, &self.coverage, &mut fx);
-        self.apply_effects(fx);
+        let i = self.shard(job.icao);
+        self.workers.send(i, ToWorker::Group(job));
     }
 
     // ------------------------------------------------------------ mode a/c --
@@ -1887,27 +1949,15 @@ impl Engine {
             //    same altitude (Mode C), within 15 km of its track. The
             //    nearest one (then the lowest address), not the map's first:
             //    the result must not depend on the map's order (hashing.rs).
+            //    The workers own the tracks: each answers with its nearest
+            //    match once it has done the jobs sent before this question,
+            //    so they see the tracks as they are now.
             let mut assoc = None;
-            for (f, mode_c) in &candidates {
-                let mut best: Option<(f64, u32)> = None;
-                for (icao, ac) in self.workers.iter().flat_map(|w| w.aircraft.iter()) {
-                    let Some(tr) = &ac.track else { continue };
-                    if t - tr.last_update() > 30.0 {
-                        continue;
-                    }
-                    let matches = if *mode_c {
-                        match (ac.alt_ft, mac.altitude_ft) {
-                            (Some(a), Some(b)) => (a - b).abs() <= 300,
-                            _ => false,
-                        }
-                    } else {
-                        ac.squawk == Some(mac.squawk)
-                    };
-                    let d = dist(&tr.predict(t).0, &f.pos);
-                    if matches && d < 15e3 && best.is_none_or(|(bd, bi)| (d, *icao) < (bd, bi)) {
-                        best = Some((d, *icao));
-                    }
-                }
+            let cands: Vec<ModeAcCand> = candidates.iter().map(|(f, mode_c)| ModeAcCand { pos: f.pos, mode_c: *mode_c }).collect();
+            let (altitude_ft, squawk) = (mac.altitude_ft, mac.squawk);
+            let answers = self.workers.ask(|reply| ToWorker::ModeAcQuery { cands: cands.clone(), altitude_ft, squawk, t, reply });
+            for (i, (_, mode_c)) in candidates.iter().enumerate() {
+                let best = answers.iter().filter_map(|a| a[i]).min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                 if let Some((_, icao)) = best {
                     assoc = Some((icao, *mode_c));
                     break;
@@ -1916,12 +1966,8 @@ impl Engine {
             if let Some((icao, mode_c)) = assoc {
                 self.stats.modeac_assoc.fetch_add(1, Ordering::Relaxed);
                 let alt = if mode_c { mac.altitude_ft.map(|ft| self.geo_constraint(None, ft, 100.0, at, now)) } else { None };
-                let ac = self.worker_of(icao).aircraft.get_mut(&icao).unwrap();
-                if let Some(tr) = ac.track.as_mut() {
-                    if tr.update_tdoa(&meas, &cov, alt, t) == Gate::Accepted {
-                        self.stats.track_tdoa_updates.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                let i = self.shard(icao);
+                self.workers.send(i, ToWorker::ModeAcUpdate { icao, meas, cov, alt, t });
                 continue;
             }
             // 2) Mode A/C-only tracks: same code, consistent position.
@@ -1988,15 +2034,14 @@ impl Engine {
         let at = ecef_to_llh(truth);
         let alt_est = self.alt_model.estimate(at.lat, at.lon, alt_ft as f64, now, Some(icao));
         let frozen = self.freeze(keys, nodes, copies, now);
-        self.worker_of(icao).holdout(HoldoutJob { frozen, truth, alt_ft, alt_est, now });
+        let i = self.shard(icao);
+        self.workers.send(i, ToWorker::Holdout(HoldoutJob { frozen, truth, alt_ft, alt_est, now }));
     }
 
     // --------------------------------------------------------- maintenance --
 
     fn expire(&mut self, now: f64) {
-        for w in &mut self.workers {
-            w.expire(now);
-        }
+        self.workers.broadcast(|| ToWorker::Expire(now));
         while let Some(&(t, key)) = self.sync_expiry.front() {
             if now - t < SYNC_TTL {
                 break;
@@ -2080,13 +2125,11 @@ impl Engine {
             r.noise_scale = receiver_noise_scale(noise);
         }
         self.alt_model.expire(now);
+        self.alt_dirty = true;
         // Tracks: the workers drop stale ones and say which aircraft still
-        // have one; an aircraft nobody sees and without a track is forgotten
-        // by both halves.
-        let mut tracked = HashSet::default();
-        for w in &mut self.workers {
-            w.stale_tracks(now, &mut tracked);
-        }
+        // have one (once they have done every job sent so far); an aircraft
+        // nobody sees and without a track is forgotten by both halves.
+        let tracked: HashSet<u32> = self.workers.ask(|reply| ToWorker::Housekeeping { now, reply }).into_iter().flatten().collect();
         let mut gone = Vec::new();
         self.aircraft.retain(|icao, a| {
             let keep = a.tracking > 0 || tracked.contains(icao);
@@ -2095,8 +2138,14 @@ impl Engine {
             }
             keep
         });
+        let mut by_worker: Vec<Vec<u32>> = vec![Vec::new(); self.workers.len()];
         for icao in gone {
-            self.worker_of(icao).forget(icao);
+            by_worker[self.shard(icao)].push(icao);
+        }
+        for (i, v) in by_worker.into_iter().enumerate() {
+            if !v.is_empty() {
+                self.workers.send(i, ToWorker::Forget(v));
+            }
         }
         self.actracks.retain(|_, t| !t.track.stale(now));
         // Groups that somehow outlived their deadline (clock jumps).
@@ -2136,11 +2185,11 @@ impl Engine {
     /// ADS-B-checked updates of the last 10 minutes: (receivers, stand-alone
     /// fix error, published error), metres.
     pub(crate) fn adsb_errors(&self) -> Vec<(usize, Option<f64>, Option<f64>)> {
-        self.workers.iter().flat_map(|w| w.adsb_err.iter()).map(|x| (x.1, x.2, x.3)).collect()
+        self.diag(|d| d.adsb_err.iter().map(|x| (x.1, x.2, x.3)).collect())
     }
 
     pub(crate) fn publish_at(&self, queue_depth: usize, now: f64) {
-        let mut errs: Vec<f64> = self.workers.iter().flat_map(|w| w.holdout_err.iter()).map(|x| x.1).collect();
+        let mut errs: Vec<f64> = self.diag(|d| d.holdout_err.iter().map(|x| x.1).collect());
         errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let q = |p: f64| if errs.is_empty() { 0.0 } else { errs[((errs.len() - 1) as f64 * p) as usize] };
         let mut s = self.stats.snapshot.lock().unwrap();
@@ -2166,9 +2215,8 @@ impl Engine {
         s.sync_entries = self.sync.len();
         s.pending_groups = self.groups.len();
         s.aircraft = self.aircraft.len();
-        let tracks = || self.workers.iter().flat_map(|w| w.aircraft.values()).filter_map(|a| a.track.as_ref());
-        s.tracks = tracks().count();
-        s.tracks_confirmed = tracks().filter(|t| t.confirmed()).count();
+        s.tracks = self.workers.shared().iter().map(|w| w.tracks.load(Ordering::Relaxed)).sum();
+        s.tracks_confirmed = self.workers.shared().iter().map(|w| w.confirmed.load(Ordering::Relaxed)).sum();
         s.modeac_tracks = self.actracks.len();
         s.queue_depth = queue_depth;
         s.holdout_n = errs.len();
@@ -2180,10 +2228,10 @@ impl Engine {
             let at = |p: f64| if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p) as usize] };
             (v.len(), at(0.5), at(0.9))
         };
-        let two_err = || self.workers.iter().flat_map(|w| w.two_site_err.iter());
-        s.two_site_all = pct(two_err().filter(|x| now - x.0 < 600.0).map(|x| x.1).collect());
-        s.two_site_ok = pct(two_err().filter(|x| now - x.0 < 600.0 && x.2).map(|x| x.1).collect());
-        s.two_site_pub = pct(self.workers.iter().flat_map(|w| w.two_site_pub.iter()).filter(|x| now - x.0 < 600.0).map(|x| x.1).collect());
+        let two_err = self.diag(|d| d.two_site_err.iter().copied().collect());
+        s.two_site_all = pct(two_err.iter().filter(|x| now - x.0 < 600.0).map(|x| x.1).collect());
+        s.two_site_ok = pct(two_err.iter().filter(|x| now - x.0 < 600.0 && x.2).map(|x| x.1).collect());
+        s.two_site_pub = pct(self.diag(|d| d.two_site_pub.iter().filter(|x| now - x.0 < 600.0).map(|x| x.1).collect()));
         let qv = |v: &mut Vec<f64>, p: f64| {
             if v.is_empty() {
                 return 0.0;
@@ -2191,10 +2239,10 @@ impl Engine {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             v[((v.len() - 1) as f64 * p) as usize]
         };
+        let adsb_err = self.diag(|d| d.adsb_err.iter().copied().collect());
         let mut buckets = Vec::new();
         for (name, lo, hi) in [("2", 2, 2), ("3", 3, 3), ("4-5", 4, 5), ("6-9", 6, 9), ("10+", 10, usize::MAX)] {
-            let sel: Vec<&(f64, usize, Option<f64>, Option<f64>)> =
-                self.workers.iter().flat_map(|w| w.adsb_err.iter()).filter(|x| x.1 >= lo && x.1 <= hi).collect();
+            let sel: Vec<(f64, usize, Option<f64>, Option<f64>)> = adsb_err.iter().filter(|x| x.1 >= lo && x.1 <= hi).copied().collect();
             let mut f: Vec<f64> = sel.iter().filter_map(|x| x.2).collect();
             let mut o: Vec<f64> = sel.iter().filter_map(|x| x.3).collect();
             buckets.push((name.to_string(), sel.len(), qv(&mut f, 0.5), qv(&mut f, 0.9), qv(&mut o, 0.5), qv(&mut o, 0.9)));
@@ -2202,7 +2250,7 @@ impl Engine {
         s.adsb_check = buckets;
         drop(s);
         // The workers' last cases, oldest first.
-        let mut diag: Vec<Diag> = self.workers.iter().flat_map(|w| w.diag_bad.iter().cloned()).collect();
+        let mut diag: Vec<Diag> = self.diag(|d| d.diag_bad.iter().cloned().collect());
         diag.sort_by(|a, b| a.t.total_cmp(&b.t));
         *self.stats.debug.lock().unwrap() = diag.split_off(diag.len().saturating_sub(400));
     }

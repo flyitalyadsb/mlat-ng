@@ -6,8 +6,11 @@ Status: study, 2026-10-28.
 - **Step 1 is implemented:** stage 1 plus aircraft workers (`worker.rs`),
   still on the engine thread. The output is byte-identical to step 0 for any
   number of workers ("Step 1 as implemented").
-- Next is step 2: workers on their own threads, a coverage thread, and the
-  two reference changes behind flags.
+- **Step 2 is implemented:** the workers can run on their own threads
+  (`MLAT_NG_WORKERS`). Threaded output is identical to inline output; see
+  "Step 2 as implemented".
+- Still open: the coverage thread (it would take ~25% of today's load off
+  stage 1) and the hybrid router.
 - The experiments under "Measured" used a prototype with a fixed Fx hasher.
 - The implementation uses foldhash, seeded once per process: random in the
   server, fixed in replays and tests. Its output was checked to be the same
@@ -91,8 +94,9 @@ observations must be applied in time order. Together with grouping, that is
    diff.
 3. **Where exactness would cost a lock-step,** we change the reference itself
    in a deterministic way, and validate that change once, statistically,
-   against today. There are two such places (2-site coverage reads and Mode
-   A/C association; see Design). Both are measured or have zero live traffic.
+   against today. In the end there is one such place: 2-site coverage reads
+   (see Design). It was measured. Mode A/C association turned out to stay
+   exact (step 2).
 
 ## What the single thread gives for free (and must be kept)
 
@@ -177,14 +181,17 @@ net threads ──► STAGE 1 (one thread, sequential; replaces the engine threa
     boundary instead of the current tick. Coverage maps evolve with a 24 h
     half-life, so this is measured below. It is the only input to a position
     that is not exact by construction.
-- **Mode A/C association** reads every aircraft's track.
-  - *Change 2 to the reference:* a tick's Mode A/C groups are processed after
-    its Mode S groups (today they are interleaved by due order). They read a
-    per-tick summary of tracks that the workers publish. An associated TDOA
-    update reaches the Mode S track at the start of the next tick.
-  - Live impact today: none. The hybrid shows 177 k Mode A/C groups and
-    0 fixes, and real Mode A/C never arrives through the hub (2026-10-24).
-  - To validate on a client-path capture before Mode A/C matters.
+- **Mode A/C association** reads every aircraft's track. This stays exact,
+  with no change to the reference:
+  - Stage 1 asks every worker, in its message stream, for its nearest
+    matching track. A worker answers only after doing the jobs sent before
+    the question, so all of them answer about the tracks as they are at that
+    point of the tick.
+  - The associated TDOA update goes back as a message to the track's owner.
+  - Stage 1 waits for those answers; Mode A/C groups are a few per second at
+    most.
+  - (The first draft deferred Mode A/C groups to the end of the tick: change
+    2. It is not needed.)
 - **Outputs.** Each worker sends to the same broadcast channels. Within an
   aircraft the order is as today; lines of different aircraft may interleave
   differently, which none of the consumers depend on.
@@ -343,8 +350,7 @@ The engine is now in two stages.
   - Every 10 s, housekeeping asks the workers which aircraft still have a
     track before both halves forget an aircraft.
 - Mode A/C association still reads every worker's tracks from stage 1. That
-  is fine inline; step 2 needs a per-tick summary (change 2 of the
-  reference).
+  is fine inline; step 2 asks the workers instead (see Design).
 
 Checked: cap3 replayed with `--workers 1` and `--workers 4` against step 0
 (a975524) on the feed path, the hybrid path, the survey perturbation test and
@@ -353,3 +359,41 @@ the serve simulation.
 - The summaries are identical except the solve timing.
 - All 240 tests pass.
 
+
+### Step 2 as implemented (workers on their own threads)
+
+- **Views as messages.** The workers no longer read stage 1's state. The
+  altitude model reaches them as a snapshot at every tick that follows a
+  change. The coverage maps for the 2-site path arrive as a snapshot every
+  `COVERAGE_SNAPSHOT_S` = 60 s (change 1). Each view comes in the same
+  message stream as the jobs, so a job always sees the view of its own tick.
+- **Questions with replies.** Housekeeping and Mode A/C association send each
+  worker a question and wait for the reply. A worker answers once it has done
+  everything sent before the question.
+- **Effects go back on a channel.** Receivers' use, coverage fix counts and
+  replay dump lines are applied at the next tick. `count_fix` never rolls a
+  map back to an earlier day.
+- **`Pool`** runs the workers either inline or on threads, with the same
+  code on the same messages. Each thread has a bounded queue of 65,536; when
+  it is full, stage 1 waits.
+- **Configuration.** `MLAT_NG_WORKERS=N` gives N worker threads; 0, the
+  default, keeps one worker on the engine thread. For replays, use
+  `--workers N --threads`.
+
+Checked, cap3:
+
+| comparison | SBS output | summary |
+|---|---|---|
+| inline vs step 1: feed, survey perturbation, serve | identical, same order | identical |
+| inline vs step 1: hybrid (2-site publish) | identical, same order | 2 counters of *rejected* 2-site solutions (change 1) |
+| threads (1, 2, 3, 4, 8 workers) vs inline: feed, hybrid, survey perturbation | identical as sorted lines (aircraft interleave differently) | identical but solve timing; 2-site dump identical as sorted lines |
+| threads (4) vs inline: serve simulation | identical as sorted lines | ±1–3 of 14.6 M events |
+
+The serve-simulation difference comes from shared client queues. Result
+lines to served clients now leave from the workers. They share each client's
+bounded queue with stage 1's traffic requests, and the simulated client reads
+that queue on its own timer, so the interleaving of the two is not fixed.
+Serve mode is off live. If it matters, the fix is to send result lines from
+stage 1 at the next tick, which keeps their order fixed.
+
+240 tests pass.

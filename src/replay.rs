@@ -142,10 +142,13 @@ pub struct ReplayArgs {
     /// it: two seeds giving different results is a bug.
     #[arg(long, default_value_t = 0)]
     hash_seed: u64,
-    /// Aircraft workers (worker.rs), inline. The output must not depend on
-    /// it: two counts giving different results is a bug.
+    /// Aircraft workers (worker.rs). The output must not depend on it: two
+    /// counts giving different results is a bug.
     #[arg(long, default_value_t = 1)]
     workers: usize,
+    /// Run the workers on their own threads (otherwise inline).
+    #[arg(long, default_value_t = false)]
+    threads: bool,
 }
 
 /// Plain Beast (`0x1A '2'|'3'` + 6-byte timestamp + signal + payload, 0x1A
@@ -348,8 +351,10 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     let t_end = srcs.iter().map(|s| s.start + s.dur).fold(f64::NEG_INFINITY, f64::max);
 
     let stats = Arc::new(Stats::default());
-    let (out, mut out_rx) = broadcast::channel(1 << 16);
-    let (bench, mut bench_rx) = broadcast::channel(1 << 16);
+    // Threaded workers publish while the replay runs ahead: room for every
+    // line between two drains.
+    let (out, mut out_rx) = broadcast::channel(1 << 20);
+    let (bench, mut bench_rx) = broadcast::channel(1 << 20);
     let ecfg = EngineConfig { shadow: true, mlat_delay: a.mlat_delay, holdout_every: a.holdout_every };
     let mut eng = Engine::new(ecfg, stats.clone(), out)
         .with_workers(a.workers)
@@ -367,6 +372,9 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
     }
     if let Some(p) = &a.two_site_dump {
         eng = eng.with_two_site_dump(p)?;
+    }
+    if a.threads {
+        eng.spawn_workers();
     }
     let astats = Arc::new(AdapterStats::default());
     let acfg = AdapterConfig {
@@ -549,9 +557,9 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         t += 0.05;
     }
     eng.tick_at(t, true);
+    eng.flush();
     drain(&mut out_rx, &mut bench_rx);
     eng.publish_at(0, t);
-    eng.flush_two_site_dump();
     let wall_s = started.elapsed().as_secs_f64();
     if let Some(p) = &a.coverage_file {
         eng.save_coverage(p)?;

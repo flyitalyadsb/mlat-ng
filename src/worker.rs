@@ -15,13 +15,18 @@
 //! writes to stage 1 are commutative counters, returned as `Effects`. So
 //! the output is the same for any number of workers, and does not depend on
 //! when a worker runs a job as long as each worker sees its messages in
-//! order (step 2 moves workers to their own threads). In this step they run
-//! inline on the engine thread, and the output is bit-identical to the
-//! single-loop engine.
+//! order.
+//!
+//! Step 2: the read-only views reach the workers as messages too (`ToWorker`),
+//! in stream order: the altitude model as a snapshot at each tick that follows
+//! a change, the coverage maps for the 2-site path as a snapshot every
+//! `COVERAGE_SNAPSHOT_S`. With that a worker can run on its own thread
+//! (`Pool::spawn`), and inline and threaded workers run the same code on the
+//! same messages.
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use nalgebra::{DMatrix, Matrix3, Vector3};
@@ -32,7 +37,7 @@ use crate::coverage::{CovId, Coverage};
 use crate::engine::{Diag, Stats, TwoSite, ADSB_HIST_S, ALT_SIGMA_M, TWO_SITE_EVERY, TWO_SITE_MAX_ERR, TWO_SITE_MAX_RECS,
     TWO_SITE_MAX_RMS, TWO_SITE_MIN_MARGIN, TWO_SITE_MIN_RECS, TWO_SITE_MIN_SPAN, TWO_SITE_N_EFF, TWO_SITE_VEL_AGE, TWO_SITE_WINDOW};
 use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Enu, Llh, C_AIR, FT_TO_M};
-use crate::hashing::{HashMap, HashSet};
+use crate::hashing::HashMap;
 use crate::modes;
 use crate::norm::{self, Copy, Node};
 use crate::output::{result_ecef, result_old, sbs_line, ClientResult, SbsFix};
@@ -183,6 +188,63 @@ pub(crate) struct Effects {
     pub dump: Vec<String>,
 }
 
+impl Effects {
+    fn is_empty(&self) -> bool {
+        self.used.is_empty() && self.fixes.is_empty() && self.dump.is_empty()
+    }
+}
+
+/// A worker's diagnostics, read by stage 1 for /metrics and the replay
+/// summary.
+#[derive(Default)]
+pub(crate) struct WorkerDiag {
+    pub holdout_err: VecDeque<(f64, f64)>,
+    /// (time, receivers, fix error, published error) of ADS-B-checked updates
+    pub adsb_err: VecDeque<(f64, usize, Option<f64>, Option<f64>)>,
+    pub diag_bad: VecDeque<Diag>,
+    /// (time, error m vs own ADS-B, accepted) of 2-site solutions.
+    pub two_site_err: VecDeque<(f64, f64, bool)>,
+    /// (time, error m vs own ADS-B) of positions published after a 2-site fix.
+    pub two_site_pub: VecDeque<(f64, f64)>,
+}
+
+#[derive(Default)]
+pub(crate) struct WorkerShared {
+    pub diag: Mutex<WorkerDiag>,
+    /// Tracks and confirmed tracks, as of the last `Expire`.
+    pub tracks: AtomicUsize,
+    pub confirmed: AtomicUsize,
+}
+
+/// A Mode A/C solution looking for a Mode S track (engine, process_modeac).
+#[derive(Clone, Copy)]
+pub(crate) struct ModeAcCand {
+    pub pos: Ecef,
+    pub mode_c: bool,
+}
+
+/// What stage 1 sends a worker, in the order it must be applied.
+pub(crate) enum ToWorker {
+    Adsb(AdsbUpdate),
+    Group(GroupJob),
+    Holdout(HoldoutJob),
+    /// The altitude model as of this tick (it changed since the last one).
+    AltModel(Arc<AltModel>),
+    /// The coverage maps the 2-site path reads until the next one.
+    Coverage(Arc<Coverage>),
+    /// For each candidate (in order), this worker's nearest matching track:
+    /// (distance, address).
+    ModeAcQuery { cands: Vec<ModeAcCand>, altitude_ft: Option<i32>, squawk: u16, t: f64, reply: std_mpsc::Sender<Vec<Option<(f64, u32)>>> },
+    /// A Mode A/C solution associated with one of its tracks.
+    ModeAcUpdate { icao: u32, meas: Vec<Meas>, cov: DMatrix<f64>, alt: Option<(f64, f64)>, t: f64 },
+    /// Drop stale tracks; reply with the aircraft that still have one.
+    Housekeeping { now: f64, reply: std_mpsc::Sender<Vec<u32>> },
+    Forget(Vec<u32>),
+    Expire(f64),
+    /// Reply once everything before it is done.
+    Flush(std_mpsc::Sender<()>),
+}
+
 /// What processing a job may read besides the worker's own state.
 pub(crate) struct Cx<'a> {
     pub alt_model: &'a AltModel,
@@ -207,14 +269,10 @@ pub(crate) struct Worker {
     served_output_only: bool,
     /// Replay: 2-site dump lines go to `Effects::dump`.
     dump: bool,
-    pub(crate) holdout_err: VecDeque<(f64, f64)>,
-    /// (time, receivers, fix error, published error) of ADS-B-checked updates
-    pub(crate) adsb_err: VecDeque<(f64, usize, Option<f64>, Option<f64>)>,
-    pub(crate) diag_bad: VecDeque<Diag>,
-    /// (time, error m vs own ADS-B, accepted) of 2-site solutions.
-    pub(crate) two_site_err: VecDeque<(f64, f64, bool)>,
-    /// (time, error m vs own ADS-B) of positions published after a 2-site fix.
-    pub(crate) two_site_pub: VecDeque<(f64, f64)>,
+    shared: Arc<WorkerShared>,
+    /// The read-only views, as of the last message that carried them.
+    alt: Arc<AltModel>,
+    coverage: Arc<Coverage>,
 }
 
 /// The worker that owns aircraft `icao`, of `n`.
@@ -232,12 +290,74 @@ impl Worker {
             two_site: TwoSite::Off,
             served_output_only: false,
             dump: false,
-            holdout_err: VecDeque::new(),
-            adsb_err: VecDeque::new(),
-            diag_bad: VecDeque::new(),
-            two_site_err: VecDeque::new(),
-            two_site_pub: VecDeque::new(),
+            shared: Arc::new(WorkerShared::default()),
+            alt: Arc::new(AltModel::default()),
+            coverage: Arc::new(Coverage::default()),
         }
+    }
+
+    pub(crate) fn shared(&self) -> Arc<WorkerShared> {
+        self.shared.clone()
+    }
+
+    /// Apply one message.
+    pub(crate) fn handle(&mut self, msg: ToWorker, fx: &mut Effects) {
+        match msg {
+            ToWorker::Adsb(u) => self.adsb(u, fx),
+            ToWorker::Group(job) => self.group(job, fx),
+            ToWorker::Holdout(job) => self.holdout(job),
+            ToWorker::AltModel(m) => self.alt = m,
+            ToWorker::Coverage(c) => self.coverage = c,
+            ToWorker::ModeAcQuery { cands, altitude_ft, squawk, t, reply } => {
+                let _ = reply.send(cands.iter().map(|c| self.modeac_match(c, altitude_ft, squawk, t)).collect());
+            }
+            ToWorker::ModeAcUpdate { icao, meas, cov, alt, t } => {
+                let ac = self.aircraft.get_mut(&icao).unwrap();
+                if let Some(tr) = ac.track.as_mut() {
+                    if tr.update_tdoa(&meas, &cov, alt, t) == Gate::Accepted {
+                        self.stats.track_tdoa_updates.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            ToWorker::Housekeeping { now, reply } => {
+                let _ = reply.send(self.stale_tracks(now));
+            }
+            ToWorker::Forget(v) => {
+                for icao in v {
+                    self.aircraft.remove(&icao);
+                }
+            }
+            ToWorker::Expire(now) => self.expire(now),
+            ToWorker::Flush(reply) => {
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    /// Mode A/C association (engine, process_modeac): the nearest of its
+    /// tracks that matches by identity (Mode A) or altitude (Mode C), within
+    /// 15 km, then the lowest address.
+    fn modeac_match(&self, c: &ModeAcCand, altitude_ft: Option<i32>, squawk: u16, t: f64) -> Option<(f64, u32)> {
+        let mut best: Option<(f64, u32)> = None;
+        for (icao, ac) in &self.aircraft {
+            let Some(tr) = &ac.track else { continue };
+            if t - tr.last_update() > 30.0 {
+                continue;
+            }
+            let matches = if c.mode_c {
+                match (ac.alt_ft, altitude_ft) {
+                    (Some(a), Some(b)) => (a - b).abs() <= 300,
+                    _ => false,
+                }
+            } else {
+                ac.squawk == Some(squawk)
+            };
+            let d = dist(&tr.predict(t).0, &c.pos);
+            if matches && d < 15e3 && best.is_none_or(|(bd, bi)| (d, *icao) < (bd, bi)) {
+                best = Some((d, *icao));
+            }
+        }
+        best
     }
 
     pub(crate) fn configure(&mut self, bench_out: Option<broadcast::Sender<Arc<str>>>, two_site: TwoSite, served_output_only: bool, dump: bool) {
@@ -248,7 +368,7 @@ impl Worker {
     }
 
     /// A validated ADS-B position of one of its aircraft.
-    pub(crate) fn adsb(&mut self, u: AdsbUpdate, fx: &mut Effects) {
+    fn adsb(&mut self, u: AdsbUpdate, fx: &mut Effects) {
         let AdsbUpdate { icao, pb, alt_b, now, tb_wall } = u;
         let ac = self.aircraft.entry(icao).or_default();
         ac.last_adsb = now;
@@ -288,9 +408,10 @@ impl Worker {
     }
 
     /// A due Mode S group of one of its aircraft.
-    pub(crate) fn group(&mut self, job: GroupJob, alt_model: &AltModel, coverage: &Coverage, fx: &mut Effects) {
+    fn group(&mut self, job: GroupJob, fx: &mut Effects) {
         let GroupJob { icao, bytes, d, t_rx, first_wall, now, commb, update, copies_n, frozen, rx, seeing } = job;
-        let cx = &mut Cx { alt_model, coverage, rx: &rx, seeing: &seeing, fx };
+        let (alt, coverage) = (self.alt.clone(), self.coverage.clone());
+        let cx = &mut Cx { alt_model: &alt, coverage: &coverage, rx: &rx, seeing: &seeing, fx };
         if commb {
             self.commb_velocity(icao, &bytes, t_rx.unwrap_or(first_wall));
         }
@@ -338,7 +459,7 @@ impl Worker {
     }
 
     /// A due holdout group: multilaterated, then compared with its ADS-B.
-    pub(crate) fn holdout(&mut self, job: HoldoutJob) {
+    fn holdout(&mut self, job: HoldoutJob) {
         let HoldoutJob { frozen: fz, truth, alt_ft, alt_est, now } = job;
         let Some(normd) = fz.normalize(&self.stats) else {
             self.stats.holdout_failed.fetch_add(1, Ordering::Relaxed);
@@ -357,7 +478,7 @@ impl Worker {
                 self.stats.holdout_solved.fetch_add(1, Ordering::Relaxed);
                 let (a, b) = (ecef_to_llh(f.pos), ecef_to_llh(truth));
                 let e = crate::geo::haversine_m(a.lat, a.lon, b.lat, b.lon);
-                self.holdout_err.push_back((now, e));
+                self.shared.diag.lock().unwrap().holdout_err.push_back((now, e));
             }
             None => {
                 self.stats.holdout_failed.fetch_add(1, Ordering::Relaxed);
@@ -365,8 +486,9 @@ impl Worker {
         }
     }
 
-    /// Drop stale tracks; add the aircraft that still have one to `tracked`.
-    pub(crate) fn stale_tracks(&mut self, now: f64, tracked: &mut HashSet<u32>) {
+    /// Drop stale tracks; the aircraft that still have one.
+    fn stale_tracks(&mut self, now: f64) -> Vec<u32> {
+        let mut tracked = Vec::new();
         for (icao, a) in self.aircraft.iter_mut() {
             if let Some(tr) = &a.track {
                 if tr.stale(now) {
@@ -374,33 +496,35 @@ impl Worker {
                 }
             }
             if a.track.is_some() {
-                tracked.insert(*icao);
+                tracked.push(*icao);
             }
         }
+        tracked
     }
 
-    pub(crate) fn forget(&mut self, icao: u32) {
-        self.aircraft.remove(&icao);
-    }
-
-    pub(crate) fn expire(&mut self, now: f64) {
-        while self.two_site_err.front().is_some_and(|x| now - x.0 >= 600.0) {
-            self.two_site_err.pop_front();
+    fn expire(&mut self, now: f64) {
+        let tracks = self.aircraft.values().filter_map(|a| a.track.as_ref());
+        let (n, confirmed) = tracks.fold((0, 0), |(n, c), t| (n + 1, c + t.confirmed() as usize));
+        self.shared.tracks.store(n, Ordering::Relaxed);
+        self.shared.confirmed.store(confirmed, Ordering::Relaxed);
+        let mut dg = self.shared.diag.lock().unwrap();
+        while dg.two_site_err.front().is_some_and(|x| now - x.0 >= 600.0) {
+            dg.two_site_err.pop_front();
         }
-        while self.two_site_pub.front().is_some_and(|x| now - x.0 >= 600.0) {
-            self.two_site_pub.pop_front();
+        while dg.two_site_pub.front().is_some_and(|x| now - x.0 >= 600.0) {
+            dg.two_site_pub.pop_front();
         }
-        while let Some(&(t, _)) = self.holdout_err.front() {
+        while let Some(&(t, _)) = dg.holdout_err.front() {
             if now - t < 600.0 {
                 break;
             }
-            self.holdout_err.pop_front();
+            dg.holdout_err.pop_front();
         }
-        while let Some(&(t, ..)) = self.adsb_err.front() {
+        while let Some(&(t, ..)) = dg.adsb_err.front() {
             if now - t < 600.0 {
                 break;
             }
-            self.adsb_err.pop_front();
+            dg.adsb_err.pop_front();
         }
     }
 
@@ -682,7 +806,7 @@ impl Worker {
         self.stats.two_site_solved.fetch_add(1, Ordering::Relaxed);
         let ok = sol.rms <= TWO_SITE_MAX_RMS && sol.err_h <= TWO_SITE_MAX_ERR && sol.margin >= TWO_SITE_MIN_MARGIN;
         if let Some(p) = truth {
-            self.two_site_err.push_back((now, dist(&p, &sol.pos), ok));
+            self.shared.diag.lock().unwrap().two_site_err.push_back((now, dist(&p, &sol.pos), ok));
             if self.dump {
                 let mid = [(last.ra[0] + last.rb[0]) / 2.0, (last.ra[1] + last.rb[1]) / 2.0, (last.ra[2] + last.rb[2]) / 2.0];
                 let (sl, tl) = (ecef_to_llh(sol.pos), ecef_to_llh(p));
@@ -734,7 +858,7 @@ impl Worker {
         // The published position, taken back to the solution's time.
         if let (Some(pos), Some(p)) = (self.emit(icao, Some(&fix), 2, t_arr, now, &[], cx), truth) {
             let back = [pos[0] - shift[0], pos[1] - shift[1], pos[2] - shift[2]];
-            self.two_site_pub.push_back((now, dist(&p, &back)));
+            self.shared.diag.lock().unwrap().two_site_pub.push_back((now, dist(&p, &back)));
         }
     }
 
@@ -773,11 +897,12 @@ impl Worker {
         if fix_err.is_none() && out_err.is_none() {
             return;
         }
-        self.adsb_err.push_back((now, n, fix_err, out_err));
+        let mut dg = self.shared.diag.lock().unwrap();
+        dg.adsb_err.push_back((now, n, fix_err, out_err));
         let bad = fix_err.unwrap_or(0.0) > 1000.0 || out_err.unwrap_or(0.0) > 1000.0;
         if bad {
             let users = used.iter().filter_map(|k| cx.rx(k).map(|r| r.user.to_string())).collect();
-            self.diag_bad.push_back(Diag {
+            dg.diag_bad.push_back(Diag {
                 t,
                 icao: format!("{icao:06X}"),
                 df: ctx.df,
@@ -796,8 +921,8 @@ impl Worker {
                 confirmed: ac.track.as_ref().map(|tr| tr.confirmed()).unwrap_or(false),
                 users,
             });
-            while self.diag_bad.len() > 400 {
-                self.diag_bad.pop_front();
+            while dg.diag_bad.len() > 400 {
+                dg.diag_bad.pop_front();
             }
         }
     }
@@ -906,6 +1031,124 @@ impl Worker {
             }
         }
         Some(pos)
+    }
+}
+
+/// Messages a threaded worker may have queued before stage 1 waits for it.
+const QUEUE: usize = 65_536;
+
+/// The workers, inline or on their own threads; either way each gets its
+/// messages in the order they are sent.
+pub(crate) struct Pool {
+    handles: Vec<Handle>,
+    shared: Vec<Arc<WorkerShared>>,
+    fx_tx: std_mpsc::Sender<Effects>,
+    fx_rx: std_mpsc::Receiver<Effects>,
+}
+
+enum Handle {
+    Inline(Box<Worker>),
+    Thread { tx: Option<std_mpsc::SyncSender<ToWorker>>, join: Option<std::thread::JoinHandle<()>> },
+}
+
+impl Pool {
+    pub(crate) fn new(workers: Vec<Worker>) -> Pool {
+        let (fx_tx, fx_rx) = std_mpsc::channel();
+        let shared = workers.iter().map(|w| w.shared()).collect();
+        Pool { handles: workers.into_iter().map(|w| Handle::Inline(Box::new(w))).collect(), shared, fx_tx, fx_rx }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub(crate) fn shared(&self) -> &[Arc<WorkerShared>] {
+        &self.shared
+    }
+
+    /// The workers, while still inline (to configure them).
+    pub(crate) fn inline_mut(&mut self) -> impl Iterator<Item = &mut Worker> {
+        self.handles.iter_mut().filter_map(|h| match h {
+            Handle::Inline(w) => Some(w.as_mut()),
+            Handle::Thread { .. } => None,
+        })
+    }
+
+    /// Move every worker to its own thread.
+    pub(crate) fn spawn(&mut self) {
+        for (i, h) in self.handles.iter_mut().enumerate() {
+            let Handle::Inline(_) = h else { continue };
+            let Handle::Inline(mut w) = std::mem::replace(h, Handle::Thread { tx: None, join: None }) else { unreachable!() };
+            let (tx, rx) = std_mpsc::sync_channel::<ToWorker>(QUEUE);
+            let fx_tx = self.fx_tx.clone();
+            let join = std::thread::Builder::new()
+                .name(format!("worker-{i}"))
+                .spawn(move || {
+                    while let Ok(m) = rx.recv() {
+                        let mut fx = Effects::default();
+                        w.handle(m, &mut fx);
+                        if !fx.is_empty() {
+                            let _ = fx_tx.send(fx);
+                        }
+                    }
+                })
+                .expect("worker thread");
+            *h = Handle::Thread { tx: Some(tx), join: Some(join) };
+        }
+    }
+
+    pub(crate) fn send(&mut self, i: usize, msg: ToWorker) {
+        match &mut self.handles[i] {
+            Handle::Inline(w) => {
+                let mut fx = Effects::default();
+                w.handle(msg, &mut fx);
+                if !fx.is_empty() {
+                    let _ = self.fx_tx.send(fx);
+                }
+            }
+            // A worker that panicked takes the engine down with it.
+            Handle::Thread { tx, .. } => tx.as_ref().unwrap().send(msg).expect("worker gone"),
+        }
+    }
+
+    /// To every worker, in order.
+    pub(crate) fn broadcast(&mut self, mut msg: impl FnMut() -> ToWorker) {
+        for i in 0..self.handles.len() {
+            self.send(i, msg());
+        }
+    }
+
+    /// Ask every worker; one reply each, in worker order.
+    pub(crate) fn ask<T>(&mut self, mut msg: impl FnMut(std_mpsc::Sender<T>) -> ToWorker) -> Vec<T> {
+        let mut rxs = Vec::with_capacity(self.handles.len());
+        for i in 0..self.handles.len() {
+            let (tx, rx) = std_mpsc::channel();
+            self.send(i, msg(tx));
+            rxs.push(rx);
+        }
+        rxs.into_iter().map(|rx| rx.recv().expect("worker gone")).collect()
+    }
+
+    /// Wait until every worker has done everything sent so far.
+    pub(crate) fn flush(&mut self) {
+        self.ask(ToWorker::Flush);
+    }
+
+    /// What the workers left for stage 1 so far.
+    pub(crate) fn effects(&self) -> std_mpsc::TryIter<'_, Effects> {
+        self.fx_rx.try_iter()
+    }
+
+    /// Stop the threads once they have done everything sent.
+    pub(crate) fn stop(&mut self) {
+        for h in &mut self.handles {
+            if let Handle::Thread { tx, join } = h {
+                drop(tx.take());
+                if let Some(j) = join.take() {
+                    let _ = j.join();
+                }
+            }
+        }
     }
 }
 

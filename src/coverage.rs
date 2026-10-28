@@ -167,7 +167,7 @@ fn idx(sector: usize, band: usize, ring: usize) -> usize {
     (sector * BANDS_M.len() + band) * RINGS + ring
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Coverage {
     maps: HashMap<CovId, Map>,
     /// Receivers placed on the map right now, by index cell.
@@ -227,6 +227,16 @@ impl Coverage {
     /// An MLAT position was published with this receiver's data.
     pub fn count_fix(&mut self, id: CovId, now: f64) {
         if let Some(m) = self.maps.get_mut(&id) {
+            // A worker's fix can arrive after the map moved to the next day
+            // (worker.rs, Effects): it counts for the day it belongs to and
+            // never rolls the map back.
+            let d = day_of(now);
+            if d < m.today.day {
+                if d == m.yesterday.day {
+                    m.yesterday.fixes += 1;
+                }
+                return;
+            }
             m.roll(now);
             m.today.fixes += 1;
         }

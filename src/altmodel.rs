@@ -69,7 +69,7 @@ struct Sample {
     t: f64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AltModel {
     cells: HashMap<(i32, i32), Vec<Sample>>,
     cell_of: HashMap<u32, (i32, i32)>,

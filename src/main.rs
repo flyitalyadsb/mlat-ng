@@ -12,6 +12,7 @@ mod altmodel;
 mod clock;
 mod clientsim;
 mod coverage;
+mod covworker;
 mod engine;
 mod geo;
 mod hashing;

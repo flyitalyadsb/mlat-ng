@@ -230,8 +230,9 @@ pub(crate) enum ToWorker {
     Holdout(HoldoutJob),
     /// The altitude model as of this tick (it changed since the last one).
     AltModel(Arc<AltModel>),
-    /// The coverage maps the 2-site path reads until the next one.
-    Coverage(Arc<Coverage>),
+    /// The coverage maps the 2-site path reads until the next one, as the
+    /// maps' thread hands them over (covworker.rs).
+    CoverageFrom(std_mpsc::Receiver<Arc<Coverage>>),
     /// For each candidate (in order), this worker's nearest matching track:
     /// (distance, address).
     ModeAcQuery { cands: Vec<ModeAcCand>, altitude_ft: Option<i32>, squawk: u16, t: f64, reply: std_mpsc::Sender<Vec<Option<(f64, u32)>>> },
@@ -307,7 +308,7 @@ impl Worker {
             ToWorker::Group(job) => self.group(job, fx),
             ToWorker::Holdout(job) => self.holdout(job),
             ToWorker::AltModel(m) => self.alt = m,
-            ToWorker::Coverage(c) => self.coverage = c,
+            ToWorker::CoverageFrom(rx) => self.coverage = rx.recv().expect("coverage thread gone"),
             ToWorker::ModeAcQuery { cands, altitude_ft, squawk, t, reply } => {
                 let _ = reply.send(cands.iter().map(|c| self.modeac_match(c, altitude_ft, squawk, t)).collect());
             }

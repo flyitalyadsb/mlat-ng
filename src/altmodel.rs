@@ -119,6 +119,22 @@ impl AltModel {
         });
     }
 
+    /// A fingerprint of the samples, independent of their order (the
+    /// workers' copies are checked against stage 1's model with it).
+    pub fn fingerprint(&self) -> u64 {
+        let mix = |mut x: u64| {
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+            x ^ (x >> 31)
+        };
+        self.cells.values().flatten().fold(0u64, |acc, s| {
+            let fields = [s.icao as u64, s.lat.to_bits(), s.lon.to_bits(), s.baro_ft.to_bits(), s.delta_ft.to_bits(), s.t.to_bits()];
+            acc.wrapping_add(fields.iter().fold(0u64, |h, &v| mix(h ^ v)))
+        })
+    }
+
     /// Cells holding at least one sample.
     pub fn cells(&self) -> usize {
         self.cells.len()
@@ -288,5 +304,25 @@ mod tests {
         m.insert(499, 47.5, 9.5, 30_000.0, 900.0, 600.0);
         assert_eq!(m.cells(), 2);
         assert_eq!(m.samples(), MAX_PER_CELL);
+    }
+
+    #[test]
+    fn fingerprint_follows_the_samples_not_their_order() {
+        let samples: Vec<(u32, f64, f64)> = (0..40u32).map(|k| (k, 44.0 + 0.3 * (k % 7) as f64, 8.0 + 0.4 * (k % 5) as f64)).collect();
+        let (mut a, mut b) = (AltModel::default(), AltModel::default());
+        for &(k, lat, lon) in &samples {
+            a.insert(k, lat, lon, 33_000.0, 500.0 + k as f64, 10.0);
+        }
+        for &(k, lat, lon) in samples.iter().rev() {
+            b.insert(k, lat, lon, 33_000.0, 500.0 + k as f64, 10.0);
+        }
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        // Copies kept by the same changes stay equal; one different sample shows.
+        a.expire(10.0 + MAX_AGE_S + 1.0);
+        b.expire(10.0 + MAX_AGE_S + 1.0);
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        a.insert(3, 44.0, 8.0, 33_000.0, 501.0, 2_000.0);
+        b.insert(3, 44.0, 8.0, 33_000.0, 502.0, 2_000.0);
+        assert_ne!(a.fingerprint(), b.fingerprint());
     }
 }

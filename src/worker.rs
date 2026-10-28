@@ -228,8 +228,12 @@ pub(crate) enum ToWorker {
     Adsb(AdsbUpdate),
     Group(GroupJob),
     Holdout(HoldoutJob),
-    /// The altitude model as of this tick (it changed since the last one).
-    AltModel(Arc<AltModel>),
+    /// The altitude model's changes, as stage 1 makes them: each worker keeps
+    /// its own copy, the same as stage 1's at every tick.
+    AltInsert { icao: u32, lat: f64, lon: f64, baro_ft: f64, delta_ft: f64, t: f64 },
+    AltExpire(f64),
+    /// Stage 1's model fingerprint: the copy must match it.
+    AltCheck(u64),
     /// The coverage maps the 2-site path reads until the next one, as the
     /// maps' thread hands them over (covworker.rs).
     CoverageFrom(std_mpsc::Receiver<Arc<Coverage>>),
@@ -307,7 +311,15 @@ impl Worker {
             ToWorker::Adsb(u) => self.adsb(u, fx),
             ToWorker::Group(job) => self.group(job, fx),
             ToWorker::Holdout(job) => self.holdout(job),
-            ToWorker::AltModel(m) => self.alt = m,
+            // Between jobs the worker holds the only reference: no copy.
+            ToWorker::AltInsert { icao, lat, lon, baro_ft, delta_ft, t } => Arc::make_mut(&mut self.alt).insert(icao, lat, lon, baro_ft, delta_ft, t),
+            ToWorker::AltExpire(now) => Arc::make_mut(&mut self.alt).expire(now),
+            ToWorker::AltCheck(fp) => {
+                if self.alt.fingerprint() != fp {
+                    self.stats.alt_replica_mismatch.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("altitude model copy differs from stage 1's");
+                }
+            }
             ToWorker::CoverageFrom(rx) => self.coverage = rx.recv().expect("coverage thread gone"),
             ToWorker::ModeAcQuery { cands, altitude_ft, squawk, t, reply } => {
                 let _ = reply.send(cands.iter().map(|c| self.modeac_match(c, altitude_ft, squawk, t)).collect());
@@ -1035,8 +1047,14 @@ impl Worker {
     }
 }
 
-/// Messages a threaded worker may have queued before stage 1 waits for it.
-const QUEUE: usize = 65_536;
+/// A threaded worker gets its messages in batches of up to `BATCH`: one
+/// wake-up per batch instead of one per message (waking a sleeping thread
+/// is a system call, and per message it was ~25% of stage 1, 2026-10-28).
+/// Stage 1 sends what it has at the end of each tick, before every question,
+/// and whenever a batch is full; the order is unchanged.
+const BATCH: usize = 512;
+/// Batches a threaded worker may have queued before stage 1 waits for it.
+const QUEUE: usize = 256;
 
 /// The workers, inline or on their own threads; either way each gets its
 /// messages in the order they are sent.
@@ -1049,7 +1067,7 @@ pub(crate) struct Pool {
 
 enum Handle {
     Inline(Box<Worker>),
-    Thread { tx: Option<std_mpsc::SyncSender<ToWorker>>, join: Option<std::thread::JoinHandle<()>> },
+    Thread { tx: Option<std_mpsc::SyncSender<Vec<ToWorker>>>, join: Option<std::thread::JoinHandle<()>>, buf: Vec<ToWorker> },
 }
 
 impl Pool {
@@ -1079,22 +1097,24 @@ impl Pool {
     pub(crate) fn spawn(&mut self) {
         for (i, h) in self.handles.iter_mut().enumerate() {
             let Handle::Inline(_) = h else { continue };
-            let Handle::Inline(mut w) = std::mem::replace(h, Handle::Thread { tx: None, join: None }) else { unreachable!() };
-            let (tx, rx) = std_mpsc::sync_channel::<ToWorker>(QUEUE);
+            let Handle::Inline(mut w) = std::mem::replace(h, Handle::Thread { tx: None, join: None, buf: Vec::new() }) else { unreachable!() };
+            let (tx, rx) = std_mpsc::sync_channel::<Vec<ToWorker>>(QUEUE);
             let fx_tx = self.fx_tx.clone();
             let join = std::thread::Builder::new()
                 .name(format!("worker-{i}"))
                 .spawn(move || {
-                    while let Ok(m) = rx.recv() {
+                    while let Ok(batch) = rx.recv() {
                         let mut fx = Effects::default();
-                        w.handle(m, &mut fx);
+                        for m in batch {
+                            w.handle(m, &mut fx);
+                        }
                         if !fx.is_empty() {
                             let _ = fx_tx.send(fx);
                         }
                     }
                 })
                 .expect("worker thread");
-            *h = Handle::Thread { tx: Some(tx), join: Some(join) };
+            *h = Handle::Thread { tx: Some(tx), join: Some(join), buf: Vec::with_capacity(BATCH) };
         }
     }
 
@@ -1107,8 +1127,23 @@ impl Pool {
                     let _ = self.fx_tx.send(fx);
                 }
             }
-            // A worker that panicked takes the engine down with it.
-            Handle::Thread { tx, .. } => tx.as_ref().unwrap().send(msg).expect("worker gone"),
+            Handle::Thread { tx, buf, .. } => {
+                buf.push(msg);
+                if buf.len() >= BATCH {
+                    send_batch(tx, buf);
+                }
+            }
+        }
+    }
+
+    /// Send every threaded worker what is waiting for it (end of a tick).
+    pub(crate) fn send_batches(&mut self) {
+        for h in &mut self.handles {
+            if let Handle::Thread { tx, buf, .. } = h {
+                if !buf.is_empty() {
+                    send_batch(tx, buf);
+                }
+            }
         }
     }
 
@@ -1127,6 +1162,7 @@ impl Pool {
             self.send(i, msg(tx));
             rxs.push(rx);
         }
+        self.send_batches();
         rxs.into_iter().map(|rx| rx.recv().expect("worker gone")).collect()
     }
 
@@ -1142,8 +1178,9 @@ impl Pool {
 
     /// Stop the threads once they have done everything sent.
     pub(crate) fn stop(&mut self) {
+        self.send_batches();
         for h in &mut self.handles {
-            if let Handle::Thread { tx, join } = h {
+            if let Handle::Thread { tx, join, .. } = h {
                 drop(tx.take());
                 if let Some(j) = join.take() {
                     let _ = j.join();
@@ -1151,6 +1188,11 @@ impl Pool {
             }
         }
     }
+}
+
+fn send_batch(tx: &Option<std_mpsc::SyncSender<Vec<ToWorker>>>, buf: &mut Vec<ToWorker>) {
+    // A worker that panicked takes the engine down with it.
+    tx.as_ref().unwrap().send(std::mem::replace(buf, Vec::with_capacity(BATCH))).expect("worker gone");
 }
 
 /// Roughly where an aircraft is, for the altitude model (whose field is

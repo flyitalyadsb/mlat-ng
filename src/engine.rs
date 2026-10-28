@@ -402,6 +402,8 @@ pub struct Stats {
     /// those left barometric (no model data nearby; wider sigma).
     pub alt_geo_corrected: AtomicU64,
     pub alt_geo_fallback: AtomicU64,
+    /// A worker's copy of the altitude model did not match stage 1's.
+    pub alt_replica_mismatch: AtomicU64,
     /// Sync reference pairs placed at geometric height (own TC 19 or model).
     pub sync_refs_geometric: AtomicU64,
     /// Groups normalised through bridge receivers, bridges used, and copies
@@ -550,8 +552,6 @@ pub struct Engine {
     served_output_only: bool,
     /// The aircraft workers (worker.rs), by `worker::shard` of the address.
     workers: Pool,
-    /// The altitude model changed since the workers' snapshot.
-    alt_dirty: bool,
     /// The coverage snapshot the workers' 2-site path reads (its period).
     cov_epoch: Option<i64>,
     threads: bool,
@@ -656,7 +656,6 @@ impl Engine {
             served_n: 0,
             served_output_only: false,
             workers,
-            alt_dirty: true,
             cov_epoch: None,
             threads: false,
         }
@@ -729,11 +728,6 @@ impl Engine {
     /// altitude model when it changed, the coverage maps (2-site) at each
     /// `COVERAGE_SNAPSHOT_S` boundary.
     fn send_views(&mut self, now: f64) {
-        if self.alt_dirty {
-            self.alt_dirty = false;
-            let m = Arc::new(self.alt_model.clone());
-            self.workers.broadcast(|| ToWorker::AltModel(m.clone()));
-        }
         if self.two_site != TwoSite::Off {
             let e = (now / COVERAGE_SNAPSHOT_S).floor() as i64;
             if self.cov_epoch != Some(e) {
@@ -1418,8 +1412,9 @@ impl Engine {
             // the altitude model (at its barometric level).
             if let Some((d, t)) = geo_baro {
                 if now - t <= GEO_SAMPLE_AGE {
-                    self.alt_model.insert(icao, llh.lat, llh.lon, alt_b as f64, d, now);
-                    self.alt_dirty = true;
+                    let (lat, lon, baro_ft) = (llh.lat, llh.lon, alt_b as f64);
+                    self.alt_model.insert(icao, lat, lon, baro_ft, d, now);
+                    self.workers.broadcast(|| ToWorker::AltInsert { icao, lat, lon, baro_ft, delta_ft: d, t: now });
                 }
             }
             if self.cov_last_sample.get(&icao).is_none_or(|t| now - t >= coverage::SAMPLE_EVERY) {
@@ -1672,6 +1667,8 @@ impl Engine {
                 self.process_holdout(g, now);
             }
         }
+        // The tick's jobs, and what came before them, go out now.
+        self.workers.send_batches();
     }
 
     /// Nodes and copies for a group, receivers deduplicated.
@@ -2125,7 +2122,9 @@ impl Engine {
             r.noise_scale = receiver_noise_scale(noise);
         }
         self.alt_model.expire(now);
-        self.alt_dirty = true;
+        self.workers.broadcast(|| ToWorker::AltExpire(now));
+        let fp = self.alt_model.fingerprint();
+        self.workers.broadcast(|| ToWorker::AltCheck(fp));
         // Tracks: the workers drop stale ones and say which aircraft still
         // have one (once they have done every job sent so far); an aircraft
         // nobody sees and without a track is forgotten by both halves.

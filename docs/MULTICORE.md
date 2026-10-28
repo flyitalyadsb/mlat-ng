@@ -435,3 +435,34 @@ replay's 2-site dump differ, in the 15th digit of one rejected solution's
 error estimate; the positions and decisions are the same. The maps (the
 only 2-site input step 3 touches) are identical, and step 3 itself gives the
 same dump inline and threaded. The cause is not pinned down. 240 tests pass.
+
+### Step 4 (fewer wake-ups, altitude model by changes)
+
+After step 3 the hybrid's engine thread was still at ~75%. A profile of the
+threaded hybrid replay showed where its own work went:
+- ~half of it sending messages to the workers, almost all of that in
+  `semaphore_signal_trap`. Each message woke a sleeping worker: one system
+  call, tens of thousands of times a second;
+- ~6% copying the altitude model for the workers at every tick.
+
+The two changes:
+- **Batches.** A threaded worker gets its messages in batches of up to 512.
+  Stage 1 sends what it has at the end of each tick, before every question,
+  and when a batch is full. The order is unchanged.
+- **Changes, not copies.** Stage 1 sends each insert and expiry of the
+  altitude model, and every worker keeps its own copy, identical at every
+  tick. Every 10 s stage 1 sends an order-independent fingerprint of its
+  model; a worker whose copy differs counts it in
+  `alt_replica_mismatch_total` and logs a warning.
+
+Checked, cap3:
+- **Against step 3 + router fix (inline):** byte-identical SBS output,
+  2-site dump and saved coverage maps on the feed path, the hybrid path, the
+  survey perturbation test and the serve simulation.
+- **Threads (4, 8) against inline:** identical on all but the serve
+  simulation, which keeps its ±1–2 from shared client queues.
+- **Fingerprint:** no mismatch in any run. 241 tests pass, including one for
+  the fingerprint.
+
+In the threaded hybrid replay, stage 1's own work fell 41% (15.7 k → 9.3 k
+samples), and sending messages fell 92% (8.1 k → 0.7 k).

@@ -22,7 +22,7 @@
 //!   velocity messages, for the engine's altitude model (altmodel.rs): once
 //!   per aircraft per `GEO_BARO_EVERY` seconds, or when it changes.
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -158,11 +158,11 @@ impl Adapter {
         Adapter {
             cfg,
             stats,
-            registry: HashMap::new(),
-            rxs: HashMap::new(),
-            unmapped: HashMap::new(),
-            adsb_pos: HashMap::new(),
-            geo_baro: HashMap::new(),
+            registry: HashMap::default(),
+            rxs: HashMap::default(),
+            unmapped: HashMap::default(),
+            adsb_pos: HashMap::default(),
+            geo_baro: HashMap::default(),
             next_conn: CONN_BASE,
             tx,
         }
@@ -171,6 +171,9 @@ impl Adapter {
     /// Merge a registry snapshot. Entries are never dropped (a feeder's
     /// mlat-client may be reconnecting); a moved antenna is reported.
     pub fn set_registry(&mut self, reg: HashMap<u64, Receiver>, out: &mut Vec<Event>) {
+        // Events in receiver order, whatever the map's order (hashing.rs).
+        let mut reg: Vec<(u64, Receiver)> = reg.into_iter().collect();
+        reg.sort_unstable_by_key(|(k, _)| *k);
         for (k, r) in reg {
             if let (Some(old), Some(rx)) = (self.registry.get(&k), self.rxs.get(&k)) {
                 let moved = crate::geo::haversine_m(old.lat, old.lon, r.lat, r.lon) > 100.0 || (old.alt - r.alt).abs() > 100.0;
@@ -247,8 +250,8 @@ impl Adapter {
                     phase: Phase::Probation,
                     first: (f.ts, wall),
                     last: (f.ts, wall),
-                    cpr: HashMap::new(),
-                    seen: HashMap::new(),
+                    cpr: HashMap::default(),
+                    seen: HashMap::default(),
                     unsent_seen: Vec::new(),
                     jumps: std::collections::VecDeque::new(),
                 },
@@ -473,7 +476,11 @@ impl Adapter {
         let idle = self.cfg.idle_timeout;
         let mut gone = Vec::new();
         let (mut live, mut prob, mut bad, mut multi) = (0u64, 0u64, 0u64, 0u64);
-        for (rid, rx) in self.rxs.iter_mut() {
+        // Events in receiver order, whatever the map's order (hashing.rs).
+        let mut rids: Vec<u64> = self.rxs.keys().copied().collect();
+        rids.sort_unstable();
+        for rid in &rids {
+            let rx = self.rxs.get_mut(rid).unwrap();
             if wall - rx.last.1 > idle {
                 if rx.phase == Phase::Live {
                     out.push(Event::Disconnect { conn: rx.conn });
@@ -495,6 +502,7 @@ impl Adapter {
                 }
                 keep
             });
+            lost.sort_unstable();
             rx.cpr.retain(|_, s| s.iter().flatten().any(|(ts, _)| rx.last.0.saturating_sub(*ts) as f64 / TICK_HZ <= 10.0));
             if rx.phase == Phase::Live {
                 if !rx.unsent_seen.is_empty() {

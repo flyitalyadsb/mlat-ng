@@ -31,7 +31,8 @@
 //! group when the group's own clock graph is disconnected (norm.rs explains
 //! why only then).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::hashing::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -631,24 +632,24 @@ impl Engine {
             stats,
             out,
             bench_out: None,
-            rx_by_conn: HashMap::new(),
-            rxs: HashMap::new(),
+            rx_by_conn: HashMap::default(),
+            rxs: HashMap::default(),
             next_key: 1,
-            pairs: HashMap::new(),
-            sync: HashMap::new(),
+            pairs: HashMap::default(),
+            sync: HashMap::default(),
             sync_expiry: VecDeque::new(),
-            groups: HashMap::new(),
+            groups: HashMap::default(),
             group_due: VecDeque::new(),
             holdout_due: VecDeque::new(),
-            holdout_groups: HashMap::new(),
-            aircraft: HashMap::new(),
-            actracks: HashMap::new(),
+            holdout_groups: HashMap::default(),
+            aircraft: HashMap::default(),
+            actracks: HashMap::default(),
             next_ac_id: 0,
             holdout_err: VecDeque::new(),
             adsb_err: VecDeque::new(),
             diag_bad: VecDeque::new(),
             coverage: Coverage::default(),
-            rx_by_cov: HashMap::new(),
+            rx_by_cov: HashMap::default(),
             coverage_file: None,
             coverage_saved: 0.0,
             survey_file: None,
@@ -663,7 +664,7 @@ impl Engine {
             two_site_dump: None,
             alt_model: AltModel::default(),
             survey: Survey::default(),
-            applied: HashMap::new(),
+            applied: HashMap::default(),
             apply: None,
             apply_at: 0.0,
             interest: Interest::new(interest::Params::default(), 0x5e7e),
@@ -905,9 +906,9 @@ impl Engine {
             jitter: info.clock.jitter(),
             info,
             pos,
-            peers: HashSet::new(),
+            peers: HashSet::default(),
             band_count: [0; 4],
-            seen: HashSet::new(),
+            seen: HashSet::default(),
             tx,
             suspect: false,
             connected: now,
@@ -919,7 +920,7 @@ impl Engine {
             enu: Enu::at(pos),
             wall: WallMap::default(),
             rate: None,
-            requested: HashSet::new(),
+            requested: HashSet::default(),
             want_sync: 0,
             want_mlat: 0,
         };
@@ -937,6 +938,14 @@ impl Engine {
             self.served_n += 1;
         }
         self.rxs.insert(key, r);
+    }
+
+    /// Clock pairs in key order: sums over them must not depend on the
+    /// map's order (hashing.rs).
+    fn pairs_sorted(&self) -> Vec<(&(RxKey, RxKey), &PairModel)> {
+        let mut v: Vec<_> = self.pairs.iter().collect();
+        v.sort_unstable_by_key(|(k, _)| **k);
+        v
     }
 
     fn drop_pairs(&mut self, k: RxKey) {
@@ -1029,15 +1038,15 @@ impl Engine {
         if self.served_n == 0 {
             return;
         }
-        let newly = self.interest.refresh_wanted(
-            now,
-            self.aircraft.iter().filter(|(_, a)| a.tracking > 0).map(|(&icao, a)| AcState {
-                icao,
-                tracking: a.tracking as usize,
-                last_adsb: a.last_adsb,
-                sync_bad: sync_bad_share(a),
-            }),
-        );
+        // In address order: refresh_wanted draws from its rng per aircraft.
+        let mut acs: Vec<AcState> = self
+            .aircraft
+            .iter()
+            .filter(|(_, a)| a.tracking > 0)
+            .map(|(&icao, a)| AcState { icao, tracking: a.tracking as usize, last_adsb: a.last_adsb, sync_bad: sync_bad_share(a) })
+            .collect();
+        acs.sort_unstable_by_key(|a| a.icao);
+        let newly = self.interest.refresh_wanted(now, acs.into_iter());
         if !newly.is_empty() {
             self.push_mlat(&newly);
         }
@@ -1046,7 +1055,7 @@ impl Engine {
     /// Ask every served receiver that sees one of `icaos` (and is not
     /// distrusted, nor already asked) for it.
     fn push_mlat(&mut self, icaos: &[u32]) {
-        let mut by_rx: HashMap<RxKey, Vec<u32>> = HashMap::new();
+        let mut by_rx: HashMap<RxKey, Vec<u32>> = HashMap::default();
         for &a in icaos {
             let Some(ac) = self.aircraft.get(&a) else { continue };
             for &k in &ac.seen_by {
@@ -1108,12 +1117,16 @@ impl Engine {
         let Some(r) = rxs.get(&k) else { return };
         let peers = |icao: u32| -> Vec<(interest::RxKey, f32)> {
             let Some(a) = aircraft.get(&icao) else { return Vec::new() };
-            a.seen_by
+            let mut v: Vec<(interest::RxKey, f32)> = a
+                .seen_by
                 .iter()
                 .filter(|&&p| p != k)
                 .filter_map(|p| rxs.get(p))
                 .map(|p| (p.key, p.rate.as_ref().map_or(0.8, |m| m.get(&icao).copied().unwrap_or(0.0))))
-                .collect()
+                .collect();
+            // Receiver order: the selection sums over this list.
+            v.sort_unstable_by_key(|(p, _)| *p);
+            v
         };
         let dont_use = interest.p.sync_bad_dont_use;
         let meta = |icao: u32| -> Option<AcMeta> {
@@ -1159,8 +1172,8 @@ impl Engine {
             return;
         }
         self.serve_stats_at = now;
-        let mut reject: HashMap<RxKey, (f64, u32)> = HashMap::new();
-        for ((a, b), m) in &self.pairs {
+        let mut reject: HashMap<RxKey, (f64, u32)> = HashMap::default();
+        for ((a, b), m) in self.pairs_sorted() {
             if m.updates < crate::clock::MIN_UPDATES {
                 continue;
             }
@@ -1489,7 +1502,7 @@ impl Engine {
             }
             cands.push((h, c, total));
         }
-        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         for (_, c, total) in cands.into_iter().take(cfg.per_round) {
             self.applied.insert(c, total);
             self.survey.forget(c);
@@ -1706,7 +1719,7 @@ impl Engine {
         }
         // normalize asks for i < j only: member pairs are cached.
         let normd = norm::normalize(&nodes_all, copies, |i, j| if j < k { cache[i * k + j] } else { self.edge(&keys_all, &s_of, i, j, now) })?;
-        let mut per_comp: HashMap<usize, usize> = HashMap::new();
+        let mut per_comp: HashMap<usize, usize> = HashMap::default();
         for c in copies {
             *per_comp.entry(comp[c.node]).or_default() += 1;
         }
@@ -2144,7 +2157,7 @@ impl Engine {
                     "baseline_m": dist(&last.ra, &last.rb), "range_m": dist(&mid, &p), "h": last.h,
                     "speed": (vel[0] * vel[0] + vel[1] * vel[1]).sqrt(),
                     "heard": heard.len(), "silent": silent.len(),
-                    "pairs": recs.iter().map(|r| (r.ra[0] as i64, r.rb[0] as i64)).collect::<std::collections::HashSet<_>>().len(),
+                    "pairs": recs.iter().map(|r| (r.ra[0] as i64, r.rb[0] as i64)).collect::<crate::hashing::HashSet<_>>().len(),
                 });
                 let _ = std::io::Write::write_all(w, format!("{line}\n").as_bytes());
             }
@@ -2404,9 +2417,12 @@ impl Engine {
             }
             self.stats.modeac_fixes.fetch_add(1, Ordering::Relaxed);
             // 1) Association with a Mode S aircraft: same identity (Mode A) or
-            //    same altitude (Mode C), within 15 km of its track.
+            //    same altitude (Mode C), within 15 km of its track. The
+            //    nearest one (then the lowest address), not the map's first:
+            //    the result must not depend on the map's order (hashing.rs).
             let mut assoc = None;
-            'outer: for (f, mode_c) in &candidates {
+            for (f, mode_c) in &candidates {
+                let mut best: Option<(f64, u32)> = None;
                 for (icao, ac) in &self.aircraft {
                     let Some(tr) = &ac.track else { continue };
                     if t - tr.last_update() > 30.0 {
@@ -2420,10 +2436,14 @@ impl Engine {
                     } else {
                         ac.squawk == Some(mac.squawk)
                     };
-                    if matches && dist(&tr.predict(t).0, &f.pos) < 15e3 {
-                        assoc = Some((*icao, *mode_c));
-                        break 'outer;
+                    let d = dist(&tr.predict(t).0, &f.pos);
+                    if matches && d < 15e3 && best.is_none_or(|(bd, bi)| (d, *icao) < (bd, bi)) {
+                        best = Some((d, *icao));
                     }
+                }
+                if let Some((_, icao)) = best {
+                    assoc = Some((icao, *mode_c));
+                    break;
                 }
             }
             if let Some((icao, mode_c)) = assoc {
@@ -2439,7 +2459,11 @@ impl Engine {
             }
             // 2) Mode A/C-only tracks: same code, consistent position.
             let mut taken = false;
-            for (id, at) in self.actracks.iter_mut() {
+            // In id order: the first track that takes the fix keeps it.
+            let mut ids: Vec<u32> = self.actracks.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                let at = self.actracks.get_mut(&id).unwrap();
                 if at.code != mac.code || t - at.track.last_update() > 60.0 {
                     continue;
                 }
@@ -2602,8 +2626,8 @@ impl Engine {
         // Receiver health: a receiver most of whose converged pairs keep
         // rejecting observations has a wrong position or a broken clock; its
         // copies are kept out of multilateration until that changes.
-        let mut rate: HashMap<RxKey, (f64, u32, Vec<f64>)> = HashMap::new();
-        for ((a, b), m) in &self.pairs {
+        let mut rate: HashMap<RxKey, (f64, u32, Vec<f64>)> = HashMap::default();
+        for ((a, b), m) in self.pairs_sorted() {
             if m.updates < crate::clock::MIN_UPDATES {
                 continue;
             }
@@ -3069,7 +3093,7 @@ mod tests {
         let mut e = engine().with_survey_apply(Some(survey::ApplyCfg::default()));
         let a = add_rx(&mut e, 1, 9.0);
         let b = add_rx(&mut e, 2, 9.5);
-        let off = HashMap::from([(a, 0.0), (b, 1e-6)]);
+        let off: HashMap<_, _> = [(a, 0.0), (b, 1e-6)].into_iter().collect();
         add_pair(&mut e, a, b, &off, 100.0);
         let declared = e.rxs[&a].pos;
         let cov = e.rxs[&a].cov;

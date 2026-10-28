@@ -449,7 +449,7 @@ fn run_feed_sim(seed: u64, n_rx: usize, forward_p: f64, duration: f64) -> (Score
     use crate::relay::adapter::{Adapter, AdapterConfig, AdapterStats};
     use crate::relay::beast::Frame;
     use crate::relay::registry::Receiver;
-    use std::collections::HashMap;
+    use crate::hashing::HashMap;
 
     let mut rng = StdRng::seed_from_u64(seed);
     let epoch = 1_800_000_000.0;

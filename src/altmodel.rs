@@ -36,7 +36,7 @@
 //! aircraft never has. With fewer than `MIN_SAMPLES` neighbours there is no
 //! estimate: the caller falls back to a zero correction with `fallback_sigma`.
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 
 /// Neighbourhood of an estimate (km).
 const RADIUS_KM: f64 = 150.0;

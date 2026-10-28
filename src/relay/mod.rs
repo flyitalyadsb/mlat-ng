@@ -182,7 +182,7 @@ async fn read_cell(i: usize, name: String, addr: String, stats: Arc<FeedStats>, 
 async fn fetch_registry(
     url: String,
     stats: Arc<FeedStats>,
-    out: mpsc::Sender<std::collections::HashMap<u64, registry::Receiver>>,
+    out: mpsc::Sender<crate::hashing::HashMap<u64, registry::Receiver>>,
 ) {
     loop {
         match http_get(&url).await.and_then(|b| Ok(serde_json::from_str::<registry::Doc>(&b)?)) {

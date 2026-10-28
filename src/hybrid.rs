@@ -19,7 +19,8 @@
 //! - Connections without a usable UUID, and a second mlat-client with a key
 //!   already taken by another client (a cloned UUID), pass through untouched.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::hashing::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -120,7 +121,7 @@ fn connect(s: &Side) -> Event {
 
 impl Router {
     pub fn new(stats: Arc<RouterStats>) -> Router {
-        Router { slots: HashMap::new(), conn_key: HashMap::new(), passthrough: HashSet::new(), stats }
+        Router { slots: HashMap::default(), conn_key: HashMap::default(), passthrough: HashSet::default(), stats }
     }
 
     pub fn on_event(&mut self, src: Src, ev: Event, out: &mut Vec<Event>) {

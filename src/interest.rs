@@ -32,7 +32,7 @@
 //! the sorted rate pairs are broken by (receiver, aircraft) instead of
 //! mlat-server's object comparison.
 
-use std::collections::{HashMap, HashSet};
+use crate::hashing::{HashMap, HashSet};
 
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -106,7 +106,7 @@ pub struct Interest {
 
 impl Interest {
     pub fn new(p: Params, seed: u64) -> Interest {
-        Interest { p, rng: StdRng::seed_from_u64(seed), wanted: HashSet::new(), wanted_at: f64::NEG_INFINITY, force: HashMap::new() }
+        Interest { p, rng: StdRng::seed_from_u64(seed), wanted: HashSet::default(), wanted_at: f64::NEG_INFINITY, force: HashMap::default() }
     }
 
     pub fn wanted(&self) -> &HashSet<u32> {
@@ -123,7 +123,7 @@ impl Interest {
         self.wanted_at = now;
         let before = std::mem::take(&mut self.wanted);
         let fi = self.p.force_mlat_interval;
-        let mut alive = HashSet::new();
+        let mut alive = HashSet::default();
         for a in aircraft {
             alive.insert(a.icao);
             let rng = &mut self.rng;
@@ -182,7 +182,7 @@ impl Interest {
                 v.sort_unstable();
                 sync = v.choose_multiple(&mut self.rng, 3).copied().collect();
             }
-            return (sync, HashSet::new());
+            return (sync, HashSet::default());
         }
         (sync, mlat)
     }
@@ -196,8 +196,8 @@ impl Interest {
     ) -> HashSet<u32> {
         // (rate product, other receiver, aircraft, my rate for it)
         let mut pairs: Vec<(f64, RxKey, u32, f64)> = Vec::new();
-        let mut by_ac: HashMap<u32, Vec<(f64, RxKey)>> = HashMap::new();
-        let mut dont_use: HashSet<u32> = HashSet::new();
+        let mut by_ac: HashMap<u32, Vec<(f64, RxKey)>> = HashMap::default();
+        let mut dont_use: HashSet<u32> = HashSet::default();
         let mut icaos: Vec<(&u32, &f32)> = rate.iter().collect();
         icaos.sort_unstable_by_key(|(a, _)| **a);
         for (&icao, &r) in icaos {
@@ -224,8 +224,8 @@ impl Interest {
         let mut first: Vec<(f64, RxKey, u32, f64)> = pairs[..pairs.len() / 2].to_vec();
         first.shuffle(&mut self.rng);
 
-        let mut ntotal: HashMap<RxKey, f64> = HashMap::new();
-        let mut sync: HashSet<u32> = HashSet::new();
+        let mut ntotal: HashMap<RxKey, f64> = HashMap::default();
+        let mut sync: HashSet<u32> = HashSet::default();
         let mut total_rate = 0.0;
         let take = |sync: &mut HashSet<u32>, ntotal: &mut HashMap<RxKey, f64>, total: &mut f64, icao: u32, r: f64| {
             sync.insert(icao);

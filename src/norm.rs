@@ -26,7 +26,7 @@
 //! last resort for disconnected groups they recovered +3% fixes and +8.6%
 //! Mode-S-only aircraft on a 10-minute capture, accuracy unchanged.
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 use std::hash::Hash;
 
 use nalgebra::DMatrix;
@@ -242,7 +242,7 @@ pub fn choose_bridges<K: std::marker::Copy + Ord + Hash>(comp: &[usize], links: 
     if max == 0 || comp.iter().all(|&c| c == comp[0]) {
         return Vec::new();
     }
-    let mut joined: HashMap<K, Vec<usize>> = HashMap::new();
+    let mut joined: HashMap<K, Vec<usize>> = HashMap::default();
     for (k, member) in links {
         let Some(&c) = comp.get(member) else { continue };
         let v = joined.entry(k).or_default();

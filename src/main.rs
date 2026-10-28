@@ -14,6 +14,7 @@ mod clientsim;
 mod coverage;
 mod engine;
 mod geo;
+mod hashing;
 mod hybrid;
 mod interest;
 mod modes;
@@ -134,6 +135,11 @@ struct Args {
     /// publish.
     #[arg(long, default_value = "off", env = "MLAT_NG_TWO_SITE")]
     two_site: engine::TwoSite,
+    /// Seed of every hash map (hashing.rs); unset: a random one. The output
+    /// does not depend on it; a seed nobody knows keeps crafted collisions
+    /// in feeder-supplied keys out of reach.
+    #[arg(long, env = "MLAT_NG_HASH_SEED")]
+    hash_seed: Option<u64>,
 }
 
 fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -158,6 +164,7 @@ fn main() -> anyhow::Result<()> {
         return replay::main(argv[1..].to_vec());
     }
     let args = Args::parse();
+    hashing::set_seed(args.hash_seed.unwrap_or_else(rand::random));
     let cells = parse_cells(&args.feed)?;
     tracing::info!(?args, "mlat-ng {} starting", env!("CARGO_PKG_VERSION"));
 

@@ -28,7 +28,7 @@
 //! horizontal prior is weak. The estimate is a diagnostic first ("bench"):
 //! nothing here moves a receiver.
 
-use std::collections::HashMap;
+use crate::hashing::HashMap;
 
 use nalgebra::{Matrix3, Vector3};
 
@@ -167,7 +167,10 @@ impl Survey {
 
     /// Close every window opened more than `WINDOW` ago (call now and then).
     pub fn sweep(&mut self, now: f64) {
-        let old: Vec<(RxKey, RxKey)> = self.open.iter().filter(|(_, w)| now - w.wall0 > WINDOW).map(|(k, _)| *k).collect();
+        let mut old: Vec<(RxKey, RxKey)> = self.open.iter().filter(|(_, w)| now - w.wall0 > WINDOW).map(|(k, _)| *k).collect();
+        // Closing adds into the receivers' sums: in key order, so the result
+        // does not depend on the map's order (hashing.rs).
+        old.sort_unstable();
         for key in old {
             if let Some(w) = self.open.remove(&key) {
                 self.close(key.0, w, now);

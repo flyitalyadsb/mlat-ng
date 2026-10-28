@@ -9,8 +9,11 @@ Status: study, 2026-10-28.
 - **Step 2 is implemented:** the workers can run on their own threads
   (`MLAT_NG_WORKERS`). Threaded output is identical to inline output; see
   "Step 2 as implemented".
-- Still open: the coverage thread (it would take ~25% of today's load off
-  stage 1) and the hybrid router.
+- **Step 3 is implemented:** the coverage maps run on their own thread
+  (`covworker.rs`), with Lightcone's questions and the saves. It starts with
+  the worker threads. See "Step 3 as implemented".
+- Still open: the hybrid router (one tokio task), and result lines in serve
+  mode.
 - The experiments under "Measured" used a prototype with a fixed Fx hasher.
 - The implementation uses foldhash, seeded once per process: random in the
   server, fixed in replays and tests. Its output was checked to be the same
@@ -397,3 +400,38 @@ Serve mode is off live. If it matters, the fix is to send result lines from
 stage 1 at the next tick, which keeps their order fixed.
 
 240 tests pass.
+
+### Step 3 as implemented (coverage maps on their own thread)
+
+- **The maps are off stage 1.** Counting ADS-B samples into the maps was
+  ~25% of the engine thread. The maps now live in `covworker.rs` and get, in
+  stage-1 order:
+  - samples, each with the coverage ids of the receivers that report seeing
+    the aircraft at that moment;
+  - receivers placed, removed and named;
+  - fixes to count;
+  - Lightcone's questions;
+  - saves.
+- **Stage 1 does the per-aircraft sampling** (`SAMPLE_EVERY`), so only
+  samples that count are sent.
+- **The 2-site snapshot** is taken by the maps where stage 1's request sits
+  in their stream. Each worker waits for it where the matching message sits
+  in its own stream, so it is the same snapshot as in step 2.
+- **Lightcone** is answered by the maps' thread, no longer by the engine.
+- **The thread** starts together with the worker threads
+  (`MLAT_NG_WORKERS` > 0).
+
+Checked, cap3. The coverage maps saved at the end of each replay were
+compared after decompression.
+
+| comparison | SBS output | coverage maps saved | summary |
+|---|---|---|---|
+| inline vs step 2: feed, hybrid, survey perturbation, serve | identical, same order | identical | identical (timing aside) |
+| threads (4, 8) vs inline: feed, hybrid, survey perturbation | identical (sorted) | identical | identical (timing aside) |
+| threads (4) vs inline: serve simulation | identical (sorted) | identical | ±1–3 of 14.6 M events (step 2) |
+
+One exception remains. Against step 2, 3 of the 2.6 M lines of the hybrid
+replay's 2-site dump differ, in the 15th digit of one rejected solution's
+error estimate; the positions and decisions are the same. The maps (the
+only 2-site input step 3 touches) are identical, and step 3 itself gives the
+same dump inline and threaded. The cause is not pinned down. 240 tests pass.

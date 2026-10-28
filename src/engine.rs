@@ -47,7 +47,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::altmodel::AltModel;
 use crate::clock::{band_of, receiver_noise_scale, Outcome, PairModel, PAIR_BUDGET};
-use crate::coverage::{CovId, Coverage};
+use crate::coverage::{self, CovId, Coverage};
+use crate::covworker::{CovHandle, CovShared, ToCoverage};
 use crate::geo::{dist, ecef_to_llh, llh_to_ecef, Ecef, Enu, Llh, C_AIR, FT_TO_M};
 use crate::interest::{self, AcMeta, AcState, Interest};
 use crate::modes;
@@ -505,7 +506,12 @@ pub struct Engine {
     aircraft: HashMap<u32, AcSync>,
     actracks: HashMap<u32, AcTrack>,
     next_ac_id: u32,
-    coverage: Coverage,
+    /// The coverage maps (covworker.rs), inline or on their own thread.
+    coverage: CovHandle,
+    cov_shared: Arc<CovShared>,
+    /// When each aircraft last gave the maps a sample (their
+    /// `SAMPLE_EVERY`, applied here so only samples that count are sent).
+    cov_last_sample: HashMap<u32, f64>,
     rx_by_cov: HashMap<CovId, RxKey>,
     /// Where coverage maps are saved (and loaded from at start), if anywhere.
     coverage_file: Option<String>,
@@ -513,7 +519,6 @@ pub struct Engine {
     /// Where the survey and the applied corrections are kept, if anywhere.
     survey_file: Option<String>,
     survey_saved: f64,
-    cov_writer: crate::persist::Writer,
     survey_writer: crate::persist::Writer,
     /// Coverage questions from the HTTP side, answered on this thread.
     queries: Option<mpsc::Receiver<CovQuery>>,
@@ -609,6 +614,7 @@ impl Engine {
     pub fn new(cfg: EngineConfig, stats: Arc<Stats>, out: broadcast::Sender<Arc<str>>) -> Engine {
         stats.snapshot.lock().unwrap().started = unix_now();
         let workers = Pool::new(vec![Worker::new(stats.clone(), out.clone())]);
+        let (coverage, cov_shared) = CovHandle::new(Coverage::default());
         Engine {
             cfg,
             stats,
@@ -627,13 +633,14 @@ impl Engine {
             aircraft: HashMap::default(),
             actracks: HashMap::default(),
             next_ac_id: 0,
-            coverage: Coverage::default(),
+            coverage,
+            cov_shared,
+            cov_last_sample: HashMap::default(),
             rx_by_cov: HashMap::default(),
             coverage_file: None,
             coverage_saved: 0.0,
             survey_file: None,
             survey_saved: 0.0,
-            cov_writer: crate::persist::Writer::default(),
             survey_writer: crate::persist::Writer::default(),
             queries: None,
             two_site: TwoSite::Off,
@@ -657,7 +664,8 @@ impl Engine {
 
     /// Start from the coverage maps in `path`, without saving there (replay).
     pub fn load_coverage(mut self, path: &str) -> anyhow::Result<Engine> {
-        self.coverage = Coverage::load(path)?;
+        let c = Coverage::load(path)?;
+        self.coverage.inline_mut().expect("maps loaded before their thread starts").set(c);
         Ok(self)
     }
 
@@ -676,9 +684,11 @@ impl Engine {
         self
     }
 
-    /// Move the workers to their own threads (after the last `with_*`).
+    /// Move the workers and the coverage maps to their own threads (after
+    /// the last `with_*`).
     pub fn spawn_workers(&mut self) {
         self.workers.spawn();
+        self.coverage.spawn();
     }
 
     /// `run` moves the workers to their own threads.
@@ -711,6 +721,7 @@ impl Engine {
     pub fn flush(&mut self) {
         self.workers.flush();
         self.drain_effects();
+        self.coverage.flush();
         self.flush_two_site_dump();
     }
 
@@ -727,8 +738,12 @@ impl Engine {
             let e = (now / COVERAGE_SNAPSHOT_S).floor() as i64;
             if self.cov_epoch != Some(e) {
                 self.cov_epoch = Some(e);
-                let c = Arc::new(self.coverage.clone());
-                self.workers.broadcast(|| ToWorker::Coverage(c.clone()));
+                // Taken where this request sits in the maps' stream; each
+                // worker waits for it where this message sits in its own.
+                let (txs, rxs): (Vec<_>, Vec<_>) = (0..self.workers.len()).map(|_| std::sync::mpsc::channel()).unzip();
+                self.coverage.send(ToCoverage::Snapshot(txs));
+                let mut rxs = rxs.into_iter();
+                self.workers.broadcast(|| ToWorker::CoverageFrom(rxs.next().unwrap()));
             }
         }
     }
@@ -745,8 +760,8 @@ impl Engine {
                 r.used += 1;
             }
         }
-        for (c, now) in fx.fixes {
-            self.coverage.count_fix(c, now);
+        for (id, now) in fx.fixes {
+            self.coverage.send(ToCoverage::CountFix { id, now });
         }
         if let Some(w) = self.two_site_dump.as_mut() {
             for line in fx.dump {
@@ -772,8 +787,8 @@ impl Engine {
     }
 
     /// Save the coverage maps now (replay calls this at the end).
-    pub fn save_coverage(&self, path: &str) -> anyhow::Result<()> {
-        self.coverage.save(path)
+    pub fn save_coverage(&mut self, path: &str) -> anyhow::Result<()> {
+        self.coverage.save_now(path)
     }
 
     /// Keep receiver coverage maps in `path` (gzip'd JSON): loaded now if it
@@ -782,7 +797,7 @@ impl Engine {
         match Coverage::load(path) {
             Ok(c) => {
                 tracing::info!(path, maps = c.receivers(), "coverage maps loaded");
-                self.coverage = c;
+                self.coverage.inline_mut().expect("maps loaded before their thread starts").set(c);
             }
             Err(e) => tracing::info!(path, error = %e, "no coverage maps loaded: starting empty"),
         }
@@ -817,9 +832,9 @@ impl Engine {
     }
 
     /// Save everything that has a file, now, on this thread (shutdown).
-    fn save_state_now(&self) {
-        if let Some(path) = &self.coverage_file {
-            match self.coverage.encode().and_then(|b| crate::persist::write_atomic(path, &b)) {
+    fn save_state_now(&mut self) {
+        if let Some(path) = self.coverage_file.clone() {
+            match self.coverage.save_now(&path) {
                 Ok(()) => tracing::info!(path, "coverage maps saved"),
                 Err(e) => tracing::warn!(path, error = %e, "coverage maps not saved"),
             }
@@ -869,13 +884,9 @@ impl Engine {
         self
     }
 
-    fn answer(&self, q: CovQuery) {
-        let now = unix_now();
-        let body = match q.what {
-            CovWhat::Map(id) => self.coverage.map_json(id, now).map(|v| v.to_string()),
-            CovWhat::Summary => Some(self.coverage.summary_json(now).to_string()),
-        };
-        let _ = q.reply.send(body);
+    /// Lightcone's questions are answered by the maps, on their thread.
+    fn answer(&mut self, q: CovQuery) {
+        self.coverage.send(ToCoverage::Query(q));
     }
 
     /// Send positions of aircraft that also broadcast ADS-B to `bench`.
@@ -924,6 +935,7 @@ impl Engine {
                         self.flush();
                         self.save_state_now();
                         self.workers.stop();
+                        self.coverage.stop();
                         return;
                     }
                 },
@@ -961,7 +973,7 @@ impl Engine {
                         r.info.alt = alt;
                         r.pos = llh_to_ecef(Llh { lat, lon, alt });
                         r.enu = Enu::at(r.pos);
-                        self.coverage.place(r.cov, lat, lon, now);
+                        self.coverage.send(ToCoverage::Place { id: r.cov, lat, lon, now });
                         self.survey.forget(r.cov);
                         // A new declared position: an old correction no
                         // longer applies.
@@ -1007,8 +1019,8 @@ impl Engine {
         if let Some(d) = self.applied.get(&cov) {
             r.pos = corrected(&r.enu, d);
         }
-        self.coverage.place(cov, r.info.lat, r.info.lon, now);
-        self.coverage.name(cov, &who_of(&r.info));
+        self.coverage.send(ToCoverage::Place { id: cov, lat: r.info.lat, lon: r.info.lon, now });
+        self.coverage.send(ToCoverage::Name { id: cov, who: who_of(&r.info) });
         self.rx_by_cov.insert(cov, key);
         r.cov = cov;
         self.rx_by_conn.insert(conn, key);
@@ -1053,7 +1065,7 @@ impl Engine {
             }
             if self.rx_by_cov.get(&r.cov) == Some(&k) {
                 self.rx_by_cov.remove(&r.cov);
-                self.coverage.unplace(r.cov);
+                self.coverage.send(ToCoverage::Unplace(r.cov));
             }
             for icao in r.seen {
                 if let Some(a) = self.aircraft.get_mut(&icao) {
@@ -1410,10 +1422,11 @@ impl Engine {
                     self.alt_dirty = true;
                 }
             }
-            let (rxs, by_cov) = (&self.rxs, &self.rx_by_cov);
-            self.coverage.observe(icao, llh.lat, llh.lon, alt_b as f64 * 0.3048, now, |id| {
-                by_cov.get(&id).and_then(|k| rxs.get(k)).is_some_and(|r| r.seen.contains(&icao))
-            });
+            if self.cov_last_sample.get(&icao).is_none_or(|t| now - t >= coverage::SAMPLE_EVERY) {
+                self.cov_last_sample.insert(icao, now);
+                let seeing = seeing_of(&self.aircraft, &self.rxs, &self.rx_by_cov, icao);
+                self.coverage.send(ToCoverage::Observe { icao, lat: llh.lat, lon: llh.lon, alt_m: alt_b as f64 * 0.3048, now, seeing });
+            }
         }
         let variant = &mut entry.variants[vi];
         if variant.obs.iter().any(|o| o.rx == k) {
@@ -1796,19 +1809,9 @@ impl Engine {
     }
 
     /// Coverage ids of the receivers that report seeing `icao`, as the 2-site
-    /// path asks it of each receiver near the aircraft.
+    /// path and the coverage maps ask it of each receiver near the aircraft.
     fn seeing_covs(&self, icao: u32) -> Vec<CovId> {
-        let Some(a) = self.aircraft.get(&icao) else { return Vec::new() };
-        let mut v: Vec<CovId> = a
-            .seen_by
-            .iter()
-            .filter_map(|k| self.rxs.get(k))
-            .filter(|r| r.seen.contains(&icao) && self.rx_by_cov.get(&r.cov) == Some(&r.key))
-            .map(|r| r.cov)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+        seeing_of(&self.aircraft, &self.rxs, &self.rx_by_cov, icao)
     }
 
     /// A due group: Mode A/C here; Mode S frozen into a job for the worker
@@ -2068,13 +2071,10 @@ impl Engine {
         self.send_serve_stats(now);
         // Encoded here, written by another thread: a slow volume must not
         // hold up the engine (persist.rs).
-        if let Some(path) = &self.coverage_file {
+        if let Some(path) = self.coverage_file.clone() {
             if now - self.coverage_saved >= COVERAGE_SAVE_EVERY {
                 self.coverage_saved = now;
-                match self.coverage.encode() {
-                    Ok(b) => self.cov_writer.spawn(path.clone(), b),
-                    Err(e) => tracing::warn!(path, error = %e, "coverage maps not encoded"),
-                }
+                self.coverage.send(ToCoverage::Save(path));
             }
         }
         if let Some(path) = &self.survey_file {
@@ -2194,8 +2194,8 @@ impl Engine {
         let q = |p: f64| if errs.is_empty() { 0.0 } else { errs[((errs.len() - 1) as f64 * p) as usize] };
         let mut s = self.stats.snapshot.lock().unwrap();
         s.receivers = self.rxs.len();
-        s.coverage_maps = self.coverage.receivers();
-        s.coverage_samples = self.coverage.samples;
+        s.coverage_maps = self.cov_shared.maps.load(Ordering::Relaxed);
+        s.coverage_samples = self.cov_shared.samples.load(Ordering::Relaxed);
         s.alt_model_cells = self.alt_model.cells();
         s.alt_model_samples = self.alt_model.samples();
         let served = self.rxs.values().filter(|r| r.info.serve.is_some());
@@ -2254,6 +2254,23 @@ impl Engine {
         diag.sort_by(|a, b| a.t.total_cmp(&b.t));
         *self.stats.debug.lock().unwrap() = diag.split_off(diag.len().saturating_sub(400));
     }
+}
+
+/// Coverage ids (sorted) of the receivers that report seeing `icao`: for each
+/// receiver id, `rx_by_cov` gives its receiver and that receiver's `seen`
+/// holds the aircraft.
+fn seeing_of(aircraft: &HashMap<u32, AcSync>, rxs: &HashMap<RxKey, Rx>, rx_by_cov: &HashMap<CovId, RxKey>, icao: u32) -> Vec<CovId> {
+    let Some(a) = aircraft.get(&icao) else { return Vec::new() };
+    let mut v: Vec<CovId> = a
+        .seen_by
+        .iter()
+        .filter_map(|k| rxs.get(k))
+        .filter(|r| r.seen.contains(&icao) && rx_by_cov.get(&r.cov) == Some(&r.key))
+        .map(|r| r.cov)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// Share of an aircraft's recent sync observations its clock pairs rejected

@@ -162,9 +162,10 @@ positions/minute on the busiest), no client errors.
 `mlat-ng replay --extract-dir` writes the per-receiver streams for such tests.
 
 Rollout (not done; needs the test's verdict first): per region through
-mlat-proxy's region map, `rest` first. That region's feeders go to
-`mlat-ng:30101` and must no longer be teed to the shadow hub (the engine
-would see them twice); readsb gets a `sbs_in_mlat` connector to mlat-ng's
+mlat-proxy's region map, `rest` first. That region's feeders go to the
+hybrid's `:30101`, and they stay teed to the shadow hub: the standby needs
+that copy, and the hybrid router drops it on the instance that serves them
+(see "Redundancy" below). readsb gets a `sbs_in_mlat` connector to mlat-ng's
 SBS output in place of the region's shard, with `--served-output-only` so
 that output carries only positions a served feeder contributed to (what the
 region's shard would have published; the other shards keep theirs).
@@ -174,6 +175,44 @@ Not yet: Mode A/C requests (`start_sending` with Mode A/C codes), the UDP
 transport (production listens TCP-only), and a per-aircraft cap on how many
 receivers are asked (mlat-server asks all of them; EU aircraft can be seen by
 80).
+
+## Redundancy: a warm standby
+
+Added 2026-11-01, M1, M2 and M5 of the redundancy design (nesso-infra:
+mlat-proxy's backend pools; design A). A served region runs on two hybrid
+instances, each fed the hub's shadow copy of every feeder and the Beast
+feed, so both have the whole network warm. mlat-proxy serves the region
+from one of them and moves its feeders to the other when the first one
+fails its health check or announces a drain. The README has the `/readyz`
+contract, the flags and the metrics.
+
+- **M1, readiness and drain** (`src/ready.rs`): `/readyz` answers 200 only
+  when the instance is warm (uptime, a live engine, usable clock pairs, and
+  with the feed a delivering cell and a registry). The serve listener is
+  bound only then, so a cold instance refuses and the proxy tries the other
+  one within the same client connection; after `--serve-gate-max-s` it is
+  bound anyway, so two cold instances cannot wait on each other. On SIGTERM
+  `/readyz` answers `503 draining`, the serve listener closes, and the
+  served feeders are kept until the proxy has moved them (at most
+  `--drain-max-s`); then the usual shutdown saves the state.
+- **M2, one receiver per served feeder** (`src/hybrid.rs`): the served
+  connection and the hub's copy of it have the same key. The router tells
+  them apart by the listener they came through, gives the key to the served
+  one (served > shadow > feed), and drops everything from the copy: the
+  served stream has the same lines and more. When the served connection
+  goes, the copy takes over and the feeder stays a receiver. Today that
+  handover still drops the receiver's clock pairs (Disconnect, then
+  Connect); keeping them is M3. The router exists only with `--hybrid`,
+  and `--listen` must run with `--shadow` (otherwise its connections look
+  served too): an instance without them must not get the copy of a feeder
+  it serves.
+- **M5, the gap from the server side** (`src/proto/session.rs`): every
+  served session's time to its first `start_sending` and first result
+  line, as histograms, and the sessions opened and closed. In a handover
+  each moved feeder starts a new session on the instance taking over.
+- **State**: two instances sharing a volume use their own state file paths
+  (`MLAT_NG_COVERAGE_FILE`, `MLAT_NG_SURVEY_FILE`); one writer per path. No
+  code change was needed for this.
 
 ## Receiver position calibration (survey)
 

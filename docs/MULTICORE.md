@@ -120,8 +120,8 @@ observations must be applied in time order. Together with grouping, that is
 
 | state | written by | read by | goes to |
 |---|---|---|---|
-| receivers (`rxs`: pos, jitter, noise, suspect, peers, WallMap, serve, tx) | connect/disconnect, sync, mlat, housekeeping, survey apply | build, normalise, bridges, emit, 2-site, serve | **stage 1**; jobs carry what they need |
-| clock pairs, sync table | sync, housekeeping, clock reset, position update | normalise (edges) | **stage 1**; edges frozen into the job |
+| receivers (`rxs`: pos, jitter, noise, suspect, peers, WallMap, serve, tx; parked ones too) | connect/disconnect (park, resume), sync, mlat, housekeeping, survey apply, expire | build, normalise, bridges, emit, 2-site, serve | **stage 1**; jobs carry what they need |
+| clock pairs (with any set-aside model), sync table | sync, housekeeping, clock reset, position update, park expiry | normalise (edges) | **stage 1**; edges frozen into the job |
 | groups being collected | mlat | process_due | **stage 1** |
 | aircraft, sync half: tracking, seen_by, sync_ok/bad, last_adsb, geo_baro, alt_ft/squawk/callsign* | seen/lost, sync, GeoBaro, housekeeping, frame decode* | serve, sync validation, altitude-model insert, existence checks | **stage 1** |
 | aircraft, track half: track, last_fix, last_out, ADS-B truth + history, Comm-B, 2-site records, alt_ft/squawk/callsign* | sync (forwarded), group processing, 2-site | group processing, emit, ADS-B check, 2-site | **worker owning the ICAO** |

@@ -146,6 +146,8 @@ impl SimAc {
 #[derive(Debug)]
 struct Scored {
     errs: Vec<f64>,
+    /// Fix time (s from the start) of each error.
+    times: Vec<f64>,
 }
 
 impl Scored {
@@ -154,9 +156,44 @@ impl Scored {
         e.sort_by(|a, b| a.partial_cmp(b).unwrap());
         e[((e.len() - 1) as f64 * q) as usize]
     }
+
+    /// The errors of fixes in [from, to).
+    fn between(&self, from: f64, to: f64) -> Scored {
+        let (times, errs) = self.times.iter().zip(&self.errs).filter(|(t, _)| (from..to).contains(*t)).map(|(t, e)| (*t, *e)).unzip();
+        Scored { errs, times }
+    }
 }
 
+/// What a run does beyond the plain one (`run_sim`).
+#[derive(Default)]
+struct Script {
+    /// Each receiver hears each ADS-B position pair with this probability
+    /// (every one when None): sync as sparse as a served feeder's.
+    sync_p: Option<f64>,
+    /// The engine's reconnect grace, when not its default.
+    grace: Option<f64>,
+    reconnect: Option<Reconnect>,
+}
+
+/// At `at` s every receiver loses its connection, and `gap` s later it is
+/// back as a new mlat-client session: a new connection id, the session's two
+/// clock announcements, its first aircraft report 5-22 s later. `restart`:
+/// its counter restarted meanwhile (readsb with it), by `RESTART_JUMP`.
+struct Reconnect {
+    at: f64,
+    gap: f64,
+    restart: bool,
+}
+
+/// Counter ticks a restarted receiver's clock moves by, at least (~-3.7 s
+/// at 12 MHz; each receiver by its own multiple).
+const RESTART_JUMP: f64 = -44_400_000.0;
+
 fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> (Scored, Arc<Stats>, Vec<String>) {
+    run_sim_with(seed, n_rx, jitter, duration, modeac, &Script::default())
+}
+
+fn run_sim_with(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool, script: &Script) -> (Scored, Arc<Stats>, Vec<String>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let epoch = 1_800_000_000.0;
     // Receivers in a ~150 km disc around Milan.
@@ -213,31 +250,27 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> 
     // Events, each with its server arrival time.
     let mut events: Vec<(f64, Event)> = Vec::new();
     let (tx, _rx) = mpsc::channel(1);
-    for (i, r) in rxs.iter().enumerate() {
-        let l = ecef_to_llh(r.pos);
-        events.push((
-            0.0,
-            Event::Connect {
-                conn: i as u64,
-                info: ReceiverInfo {
-                    user: format!("rx{i}"),
-                    uuid: None,
-                    lat: l.lat,
-                    lon: l.lon,
-                    alt: l.alt,
-                    clock: ClockType::Dump1090,
-                    privacy: false,
-                    source_ip: "127.0.0.1".into(),
-                    source_port: String::new(),
-                    client_version: "sim".into(),
-                    compress: "none",
-                    connection: String::new(),
-                    msgs: Default::default(),
-                    serve: None,
-                },
-                tx: tx.clone(),
-            },
-        ));
+    let info = |i: usize| {
+        let l = ecef_to_llh(rxs[i].pos);
+        ReceiverInfo {
+            user: format!("rx{i}"),
+            uuid: None,
+            lat: l.lat,
+            lon: l.lon,
+            alt: l.alt,
+            clock: ClockType::Dump1090,
+            privacy: false,
+            source_ip: "127.0.0.1".into(),
+            source_port: String::new(),
+            client_version: "sim".into(),
+            compress: "none",
+            connection: String::new(),
+            msgs: Default::default(),
+            serve: None,
+        }
+    };
+    for i in 0..rxs.len() {
+        events.push((0.0, Event::Connect { conn: i as u64, info: info(i), tx: tx.clone() }));
         events.push((0.01, Event::Seen { conn: i as u64, icao: acs.iter().map(|a| a.icao).collect() }));
     }
     let net = |rng: &mut StdRng| 0.02 + rng.gen::<f64>() * 0.08;
@@ -255,6 +288,9 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> 
                 } else if let Some((te, fe)) = last_even[ai].clone() {
                     let pe_e = llh_to_ecef(ac.llh(te));
                     for (ri, r) in rxs.iter().enumerate() {
+                        if script.sync_p.is_some_and(|p| rng.gen::<f64>() >= p) {
+                            continue;
+                        }
                         let ae = te + dist(&pe_e, &r.pos) / C_AIR;
                         let ao = t + dist(&pe, &r.pos) / C_AIR;
                         events.push((
@@ -297,11 +333,38 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> 
         odd = !odd;
         t += 0.25;
     }
+    if let Some(rc) = &script.reconnect {
+        // Nothing arrives while the receivers are away, nor before their new
+        // session has announced its input (mlat-client reads its receiver
+        // only once connected); afterwards they are new connections.
+        let (back, n) = (rc.at + rc.gap, rxs.len() as u64);
+        // Each counter restarts from its own value: the pairs' offsets move.
+        let jump = |conn: u64| if rc.restart { RESTART_JUMP * (1.0 + 0.37 * conn as f64) } else { 0.0 };
+        events.retain(|(at, _)| !(rc.at..back + 0.2).contains(at));
+        for (_, ev) in events.iter_mut().filter(|(at, _)| *at >= back) {
+            match ev {
+                Event::Sync { conn, et, ot, .. } => (*et, *ot, *conn) = (*et + jump(*conn), *ot + jump(*conn), *conn + n),
+                Event::Mlat { conn, t, .. } => (*t, *conn) = (*t + jump(*conn), *conn + n),
+                _ => {}
+            }
+        }
+        for i in 0..rxs.len() {
+            let conn = i as u64 + n;
+            events.push((rc.at, Event::Disconnect { conn: i as u64 }));
+            events.push((back, Event::Connect { conn, info: info(i), tx: tx.clone() }));
+            events.push((back + 0.05, Event::ClockReset { conn, reason: "clientmsg: input connected" }));
+            events.push((back + 0.1, Event::ClockReset { conn, reason: "clientmsg: clock_reset" }));
+            events.push((back + 5.0 + 17.0 * rng.gen::<f64>(), Event::Seen { conn, icao: acs.iter().map(|a| a.icao).collect() }));
+        }
+    }
     events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     let stats = Arc::new(Stats::default());
     let (out, mut sbs) = broadcast::channel(1 << 16);
     let mut eng = Engine::new(EngineConfig { shadow: true, mlat_delay: 0.9, holdout_every: 20 }, stats.clone(), out);
+    if let Some(g) = script.grace {
+        eng = eng.with_reconnect_grace(g);
+    }
     let mut next_tick = 0.0;
     let mut next_house = 10.0;
     for (at, ev) in events {
@@ -322,7 +385,7 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> 
     eng.tick_at(epoch + duration + 5.0, true);
 
     // Score the Mode-S-only aircraft after warm-up.
-    let mut errs = Vec::new();
+    let (mut errs, mut times) = (Vec::new(), Vec::new());
     let mut lines = Vec::new();
     while let Ok(line) = sbs.try_recv() {
         lines.push(line.to_string());
@@ -339,8 +402,9 @@ fn run_sim(seed: u64, n_rx: usize, jitter: f64, duration: f64, modeac: bool) -> 
         }
         let truth = ac.llh(t_fix);
         errs.push(haversine_m(lat, lon, truth.lat, truth.lon));
+        times.push(t_fix);
     }
-    (Scored { errs }, stats, lines)
+    (Scored { errs, times }, stats, lines)
 }
 
 #[test]
@@ -430,6 +494,60 @@ fn sparse_noisy_network_still_tracks() {
     let (p50, p90) = (s.quantile(0.5), s.quantile(0.9));
     eprintln!("sparse Mode-S-only error p50 {p50:.0} m p90 {p90:.0} m");
     assert!(p50 < 400.0 && p90 < 1500.0, "p50 {p50} p90 {p90}");
+}
+
+/// One takeover: every receiver gone at 120 s and back 3 s later as a new
+/// session (so every clock pair has both ends announced as reset), with sync
+/// as sparse as a served feeder's. Returns the scored fixes, the stats and
+/// the first fix after the return (s).
+fn takeover(grace: f64, restart: bool) -> (Scored, Arc<Stats>, f64) {
+    let script = Script { sync_p: Some(0.3), grace: Some(grace), reconnect: Some(Reconnect { at: 120.0, gap: 3.0, restart }) };
+    let (s, stats, _) = run_sim_with(31, 8, 0.3e-6, 200.0, false, &script);
+    let first = s.times.iter().copied().filter(|&t| t >= 123.0).fold(f64::INFINITY, f64::min) - 123.0;
+    (s, stats, first)
+}
+
+#[test]
+fn takeover_results_resume_sooner_and_no_worse() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let grace = crate::engine::RECONNECT_GRACE_S;
+    // Before (pairs, aircraft and rates dropped on disconnect), with the
+    // grace, and with the grace but every counter restarted meanwhile.
+    let ((cold, cs, cold_first), (warm, ws, warm_first), (moved, ms, moved_first)) = std::thread::scope(|sc| {
+        let c = sc.spawn(|| takeover(0.0, false));
+        let w = sc.spawn(|| takeover(grace, false));
+        let m = sc.spawn(|| takeover(grace, true));
+        (c.join().unwrap(), w.join().unwrap(), m.join().unwrap())
+    });
+    let q = |s: &Scored| match s.errs.len() {
+        0 => (0, f64::NAN, f64::NAN),
+        n => (n, s.quantile(0.5), s.quantile(0.9)),
+    };
+    for (name, s, first) in [("cold", &cold, cold_first), ("warm", &warm, warm_first), ("restart", &moved, moved_first)] {
+        eprintln!(
+            "{name}: first fix {first:.1} s after the return; next 10 s {:.0?}; then 50 s {:.0?}; whole run {:.0?} (n, p50 m, p90 m)",
+            q(&s.between(123.0, 133.0)),
+            q(&s.between(133.0, 183.0)),
+            q(s)
+        );
+    }
+    // Before: nothing until the sessions' first aircraft reports (5-22 s).
+    // With the grace: as soon as the pairs re-anchor; after a restart, as
+    // soon as fresh offsets converge (what they brought still counts).
+    assert!(warm_first <= 2.0 && warm_first + 3.0 <= cold_first, "warm {warm_first} cold {cold_first}");
+    assert!(moved_first + 2.0 <= cold_first, "restart {moved_first} cold {cold_first}");
+    assert_eq!(ws.rx_resumed.load(Relaxed), 8);
+    assert!(ws.pair_reanchors.load(Relaxed) >= 20, "{}", ws.pair_reanchors.load(Relaxed));
+    // A counter that moved is never re-anchored.
+    assert_eq!(ms.rx_resumed.load(Relaxed), 8);
+    assert_eq!(ms.pair_reanchors.load(Relaxed), 0);
+    assert_eq!(cs.rx_resumed.load(Relaxed), 0);
+    // No worse: where both have positions, and over the whole run.
+    let (c, w, m) = (q(&cold.between(133.0, 183.0)), q(&warm.between(133.0, 183.0)), q(&moved.between(133.0, 183.0)));
+    assert!(w.0 >= c.0 && w.1 <= c.1 + 3.0 && w.2 <= 1.2 * c.2, "{c:?} {w:?}");
+    assert!(m.0 >= c.0 && m.1 <= c.1 + 3.0 && m.2 <= 1.2 * c.2, "{c:?} {m:?}");
+    let (c, w) = (q(&cold), q(&warm));
+    assert!(w.0 > c.0 && w.1 <= c.1 + 2.0 && w.2 <= 1.1 * c.2, "{c:?} {w:?}");
 }
 
 /// DF17 airborne position frame, for other modules' tests.
@@ -581,7 +699,7 @@ fn run_feed_sim(seed: u64, n_rx: usize, forward_p: f64, duration: f64) -> (Score
     eng.tick_at(epoch + duration + 5.0, true);
 
     let score = |rx: &mut broadcast::Receiver<Arc<str>>, want_adsb: bool| {
-        let mut errs = Vec::new();
+        let (mut errs, mut times) = (Vec::new(), Vec::new());
         while let Ok(line) = rx.try_recv() {
             let f: Vec<&str> = line.trim_end().split(',').collect();
             let icao = u32::from_str_radix(f[4], 16).unwrap_or(0);
@@ -595,8 +713,9 @@ fn run_feed_sim(seed: u64, n_rx: usize, forward_p: f64, duration: f64) -> (Score
             }
             let truth = ac.llh(t_fix);
             errs.push(haversine_m(lat, lon, truth.lat, truth.lon));
+            times.push(t_fix);
         }
-        Scored { errs }
+        Scored { errs, times }
     };
     let modes_only = score(&mut sbs, false);
     let bench_s = score(&mut bench_rx, true);

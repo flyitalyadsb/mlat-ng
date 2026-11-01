@@ -213,9 +213,9 @@ contract, the flags and the metrics.
   them apart by the listener they came through, gives the key to the served
   one (served > shadow > feed), and drops everything from the copy: the
   served stream has the same lines and more. When the served connection
-  goes, the copy takes over and the feeder stays a receiver. Today that
-  handover still drops the receiver's clock pairs (Disconnect, then
-  Connect); keeping them is M3. The router exists only with `--hybrid`,
+  goes, the copy takes over and the feeder stays a receiver. That handover
+  is still a Disconnect and a Connect; M3 (below) is what keeps the
+  receiver's clock pairs across it. The router exists only with `--hybrid`,
   and `--listen` must run with `--shadow` (otherwise its connections look
   served too): an instance without them must not get the copy of a feeder
   it serves.
@@ -226,6 +226,82 @@ contract, the flags and the metrics.
 - **State**: two instances sharing a volume use their own state file paths
   (`MLAT_NG_COVERAGE_FILE`, `MLAT_NG_SURVEY_FILE`); one writer per path. No
   code change was needed for this.
+
+### M3: a takeover keeps the receiver's clock state
+
+Added 2026-11-01. Before it, the end of a connection was the end of the
+receiver: its clock pairs were dropped, and a pair needs 10 observations
+before it is used again. A served feeder moved to the standby went through
+that twice (the hub copy's leg ends, the feed takes the key, the served
+connection takes it back), and its new session was asked for nothing until
+its first aircraft report, 5-22 s after connecting.
+
+- **Park, then resume** (`src/engine.rs`, `disconnect` / `resume`). A
+  receiver whose connection ends leaves everything a connected receiver
+  takes part in (served count, coverage placement, the aircraft counts,
+  groups, bridges, `/receivers.json`, `/clients.json`), but keeps its clock
+  pairs and its own state for `--reconnect-grace-s` (20 s). A connection
+  with the same identity (the UUID key, which the feed receiver shares;
+  else the user name), the same clock type and the same place (within 1 m,
+  survey correction included) continues it: same engine receiver, same
+  pairs, epoch, noise scale, health, wall map; new connection info, nothing
+  requested. Anything else with that identity is a new receiver. After the
+  grace the parked receiver is dropped exactly as a disconnect dropped it.
+  This needs no router change: every handover the router makes (M2's
+  serve > shadow > feed, both ways) is a Disconnect followed by a Connect,
+  and so is a quick reconnect to the same instance. It replaces the
+  design's `Event::Rebind`.
+- **Re-anchoring, not blind reuse** (`src/clock.rs`, `reset_offset`). A
+  pair is two counters and two crystals; a reconnect does not say whether
+  the counter ran on. mlat-client cannot know either, so every new session
+  announces its input twice ("input connected", then a synthesised
+  "Decoder mode changed" clock reset; coordinator.py server_connected,
+  receiver.py start_connection). Each reset used to forget the offset and
+  keep the drift: 10 more observations. Now a converged pair is also set
+  aside, and the observations after the reset decide: if the first 4 (two
+  sync points) all pass its own 4-sigma gate, the counter did not move and
+  the whole model comes back, usable at once; the first one that does not
+  pass discards it, and the fresh offset goes on as before. A set-aside
+  model older than 45 s (`MAX_AGE`) is never restored. A sync observation
+  made before its receiver's last reset no longer pairs with one made
+  after it (`Rx::epoch`): old observations in the 10 s sync table must not
+  confirm a set-aside model, nor seed a fresh one. A second reset before
+  the pair re-converges now keeps the drift (it used to be lost). A
+  handover between a feeder's inputs (same readsb, same counter, no new
+  session) has no reset: the pairs simply go on, still gated as always.
+- **What the receiver reported** (`Inherited`). Its aircraft and rate
+  report come back with it and count at once, so a resumed served receiver
+  is asked for traffic in the same instant (sync from the kept rates, mlat
+  for wanted aircraft it sees) instead of at its first report. The new
+  session confirms them: an aircraft it does not report within 45 s (two
+  of mlat-client's reports) is dropped as lost, and the kept rates last
+  until its first real rate report (mlat-client's empty report right after
+  the handshake means "reports will follow", jsonclient.py, and no longer
+  replaces them).
+
+Expected effect on a served feeder's gap after a takeover (results are
+back when its pairs are usable and it is asked for traffic):
+
+| | before | with M3 |
+|---|---|---|
+| asked for traffic | at its first report, 5-22 s after reconnecting | on reconnecting |
+| its pairs usable | 10 fresh observations each, twice on a standby (feed, then served) | 4 observations each, if its counter ran on; 10 if it really restarted |
+| simulation (`sim::takeover_results_resume_sooner_and_no_worse`, every receiver reconnecting after 3 s, sparse sync) | first fix 10.3 s after the return | 0.3 s (1.3 s with every counter restarted) |
+
+Accuracy in that simulation does not change: once both runs have positions
+again (from 10 s after the return) p50 / p90 are 22 / 37 m before and
+22 / 34 m with M3, 21 / 33 m with restarted counters; the whole run 23 /
+37 m in both. The early positions only M3 has (the first 10 s) are 26 /
+49 m. Three other seeds agree (p50 the same or lower, p90 within 5 m
+either way). The replay of real
+captures (`mlat-ng replay --reconnect-grace-s 0|20`) has no scripted
+reconnects yet; the live measure is M5's `serve_first_result_seconds` on
+the instance taking over.
+
+Metrics: `mlat_ng_receivers_parked` (gauge, not in `mlat_ng_receivers`),
+`mlat_ng_receiver_parks_total`, `_resumes_total`, `_resumed_pairs_total`,
+`_resumes_refused_total` (same identity, another clock or place),
+`_parks_expired_total`, and `mlat_ng_pair_reanchors_total`.
 
 ## Receiver position calibration (survey)
 

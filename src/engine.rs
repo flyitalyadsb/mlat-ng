@@ -102,6 +102,21 @@ const SYNC_QUALITY_MIN_OBS: f32 = 20.0;
 /// more than this share of observations (mlat-server: a pairing's
 /// outlier_percent above 35).
 const BAD_PEER_REJECT: f64 = 0.35;
+/// A receiver whose connection ends keeps its clock pairs this long (s) for
+/// the same receiver to connect again (`park`, `resume`): mlat-client is back
+/// 2-4 s after losing a long-lived connection, 10-12 s after a short one
+/// (net.py), and the hybrid router moves a feeder between its inputs with a
+/// Disconnect and a Connect in one go. 0 = dropped at once, as before.
+pub const RECONNECT_GRACE_S: f64 = 20.0;
+/// What a resumed receiver brought over (`Inherited`) must be confirmed by
+/// its new session within this (s): mlat-client reports every 4th review of
+/// 4.5-5.5 s, the first after 1 to 4 reviews, and an aircraft needs two
+/// messages to be in a report, so two reports.
+const INHERIT_CONFIRM_S: f64 = 45.0;
+/// A connection with a parked receiver's identity continues it only with
+/// the same clock type and place (within this, m): its pairs were fitted to
+/// that place.
+const SAME_PLACE_M: f64 = 1.0;
 const MODEAC_BLACKLIST: [u16; 20] = [
     0x1200, 0x7000, 0x2000, 0x0000, 0x1000, 0x0002, 0x0004, 0x0006, 0x0040, 0x0060, 0x0020, 0x0030, 0x0010, 0x0410,
     0x0430, 0x0420, 0x0460, 0x0440, 0x0640, 0x0660,
@@ -136,6 +151,14 @@ struct Rx {
     tx: mpsc::Sender<ToClient>,
     suspect: bool,
     connected: f64,
+    /// When its connection ended, while it waits for the next one (`park`).
+    parked: Option<f64>,
+    /// Counts its clock resets: a sync observation from an earlier epoch
+    /// never meets a later one (the counter may have moved in between).
+    epoch: u32,
+    /// After a resume: what it brought over that its new session has not
+    /// confirmed yet.
+    inherited: Option<Inherited>,
     sync_msgs: u64,
     mlat_msgs: u64,
     /// Copies this receiver contributed to accepted multilateration updates.
@@ -157,6 +180,21 @@ struct Rx {
     mlat_interest: HashSet<u32>,
     /// `info.msgs` and the time at the last clients.json (its message_rate).
     msgs_mark: (u64, f64),
+}
+
+/// What a resumed receiver keeps from its previous connection only until its
+/// new session says otherwise. A new mlat-client session starts from nothing
+/// (coordinator.py server_connected) and reports every aircraft it sees
+/// again, and its rates; meanwhile the old ones let a served receiver be
+/// asked for traffic at once instead of at its first report (5-22 s).
+struct Inherited {
+    until: f64,
+    /// Aircraft the previous connection reported that this one has not.
+    seen: HashSet<u32>,
+    /// `rate` is still the previous connection's...
+    rate: bool,
+    /// ...and this session has sent mlat-client's empty first report.
+    marker: bool,
 }
 
 /// A receiver's clock mapped to wall time through its quickest deliveries:
@@ -215,6 +253,8 @@ struct SyncObs {
     tdb: f64,
     /// raw local time of B (for holdout evaluation)
     sb: f64,
+    /// the receiver's clock epoch (`Rx::epoch`) when it was made
+    epoch: u32,
 }
 
 struct Variant {
@@ -366,6 +406,18 @@ pub struct Stats {
     pub pair_rejects: AtomicU64,
     pub pair_resets: AtomicU64,
     pub pair_resets_drift: AtomicU64,
+    /// Pairs whose model an offset reset had set aside, back because the
+    /// observations after the reset agreed with it (clock.rs).
+    pub pair_reanchors: AtomicU64,
+    /// Receivers whose connection ended and that waited for the next one
+    /// (`park`); those a new connection continued (`resume`), and the clock
+    /// pairs they brought; connections with a parked receiver's identity but
+    /// another clock or place (new receivers); grace periods that ran out.
+    pub rx_parked: AtomicU64,
+    pub rx_resumed: AtomicU64,
+    pub rx_resumed_pairs: AtomicU64,
+    pub rx_resume_refused: AtomicU64,
+    pub rx_park_expired: AtomicU64,
     pub tracks_born: AtomicU64,
     pub tracks_refused_dof0: AtomicU64,
     pub outputs_held_no_fix: AtomicU64,
@@ -457,6 +509,8 @@ pub struct Stats {
 pub struct Snapshot {
     pub receivers: usize,
     pub receivers_suspect: usize,
+    /// Not connected, waiting for their next connection (not in `receivers`).
+    pub receivers_parked: usize,
     pub pairs: usize,
     pub pairs_usable: usize,
     pub sync_entries: usize,
@@ -561,6 +615,13 @@ pub struct Engine {
     /// `SAMPLE_EVERY`, applied here so only samples that count are sent).
     cov_last_sample: HashMap<u32, f64>,
     rx_by_cov: HashMap<CovId, RxKey>,
+    /// Receivers waiting for their next connection, by coverage identity
+    /// (`park`); when each one's wait ends, and when what resumed ones
+    /// brought over must have been confirmed (`Inherited`).
+    parked: HashMap<CovId, RxKey>,
+    park_due: VecDeque<(f64, RxKey)>,
+    inherit_due: VecDeque<(f64, RxKey)>,
+    reconnect_grace: f64,
     /// Where coverage maps are saved (and loaded from at start), if anywhere.
     coverage_file: Option<String>,
     coverage_saved: f64,
@@ -684,6 +745,10 @@ impl Engine {
             cov_shared,
             cov_last_sample: HashMap::default(),
             rx_by_cov: HashMap::default(),
+            parked: HashMap::default(),
+            park_due: VecDeque::new(),
+            inherit_due: VecDeque::new(),
+            reconnect_grace: RECONNECT_GRACE_S,
             coverage_file: None,
             coverage_saved: 0.0,
             survey_file: None,
@@ -919,6 +984,13 @@ impl Engine {
         self
     }
 
+    /// How long a receiver whose connection ended waits for the next one
+    /// with its clock pairs (`RECONNECT_GRACE_S`; 0 = not at all).
+    pub fn with_reconnect_grace(mut self, s: f64) -> Engine {
+        self.reconnect_grace = s.max(0.0);
+        self
+    }
+
     /// Answer coverage questions arriving on `rx` (see `CovQuery`).
     pub fn with_queries(mut self, rx: mpsc::Receiver<CovQuery>) -> Engine {
         self.queries = Some(rx);
@@ -994,7 +1066,7 @@ impl Engine {
     pub(crate) fn handle_at(&mut self, ev: Event, now: f64) {
         match ev {
             Event::Connect { conn, info, tx } => self.connect(conn, info, tx, now),
-            Event::Disconnect { conn } => self.disconnect(conn),
+            Event::Disconnect { conn } => self.disconnect(conn, now),
             Event::Sync { conn, et, ot, em, om } => self.on_sync(conn, et, ot, &em, &om, now),
             Event::Mlat { conn, t, msg, rx } => self.on_mlat(conn, t, &msg, rx.min(now)),
             Event::Seen { conn, icao } => self.on_seen(conn, &icao, now),
@@ -1026,6 +1098,10 @@ impl Engine {
     }
 
     fn connect(&mut self, conn: ConnId, info: ReceiverInfo, tx: mpsc::Sender<ToClient>, now: f64) {
+        if let Some(k) = self.parked_for(&info) {
+            self.resume(k, conn, info, tx, now);
+            return;
+        }
         let key = self.next_key;
         self.next_key += 1;
         let pos = llh_to_ecef(Llh { lat: info.lat, lon: info.lon, alt: info.alt });
@@ -1043,6 +1119,9 @@ impl Engine {
             tx,
             suspect: false,
             connected: now,
+            parked: None,
+            epoch: 0,
+            inherited: None,
             sync_msgs: 0,
             mlat_msgs: 0,
             used: 0,
@@ -1098,23 +1177,153 @@ impl Engine {
         }
     }
 
-    fn disconnect(&mut self, conn: ConnId) {
+    /// A connection ended. Everything a connected receiver takes part in ends
+    /// with it (`detach`); its clock pairs, and what it knows of its own
+    /// clock and traffic, wait `reconnect_grace` for the same receiver to
+    /// connect again (a parked receiver; `resume`). Rebuilding pairs costs a
+    /// served feeder its results for tens of seconds, and the end of a
+    /// connection is not the end of the receiver: mlat-client reconnects in
+    /// seconds, the hybrid router moves a feeder between its inputs with a
+    /// Disconnect and a Connect (hybrid.rs), and a takeover brings a served
+    /// feeder to the member that already tracks it through the shadow copy
+    /// (M3 in docs/PLAN.md, "Redundancy").
+    fn disconnect(&mut self, conn: ConnId, now: f64) {
         let Some(k) = self.rx_by_conn.remove(&conn) else { return };
+        self.detach(k);
+        if self.reconnect_grace <= 0.0 {
+            self.drop_rx(k);
+            return;
+        }
+        let Some(r) = self.rxs.get_mut(&k) else { return };
+        r.parked = Some(now);
+        r.inherited = None;
+        // One receiver waits per identity: a clone parked earlier goes now.
+        if let Some(old) = self.parked.insert(r.cov, k) {
+            self.drop_rx(old);
+        }
+        self.park_due.push_back((now + self.reconnect_grace, k));
+        self.stats.rx_parked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What ends with a connection either way: being served, the coverage
+    /// placement, the aircraft it reports seeing (they stay in its `seen`
+    /// for a resume, but count for nobody).
+    fn detach(&mut self, k: RxKey) {
+        let Some(r) = self.rxs.get_mut(&k) else { return };
+        if r.info.serve.take().is_some() {
+            self.served_n -= 1;
+        }
+        r.requested.clear();
+        r.sync_interest.clear();
+        r.mlat_interest.clear();
+        for icao in &r.seen {
+            if let Some(a) = self.aircraft.get_mut(icao) {
+                a.tracking = a.tracking.saturating_sub(1);
+                a.seen_by.remove(&k);
+            }
+        }
+        if self.rx_by_cov.get(&r.cov) == Some(&k) {
+            self.rx_by_cov.remove(&r.cov);
+            self.coverage.send(ToCoverage::Unplace(r.cov));
+        }
+    }
+
+    /// Forget a detached receiver and its clock pairs.
+    fn drop_rx(&mut self, k: RxKey) {
         self.drop_pairs(k);
-        if let Some(r) = self.rxs.remove(&k) {
-            if r.info.serve.is_some() {
-                self.served_n -= 1;
-            }
-            if self.rx_by_cov.get(&r.cov) == Some(&k) {
-                self.rx_by_cov.remove(&r.cov);
-                self.coverage.send(ToCoverage::Unplace(r.cov));
-            }
-            for icao in r.seen {
+        self.rxs.remove(&k);
+    }
+
+    /// The parked receiver a new connection continues: same identity (the
+    /// UUID key, as cov_id: a feeder's mlat-client and its feed receiver
+    /// share it), same clock type, same place. Same identity but another
+    /// clock or place is another receiver, or a moved one: it starts afresh
+    /// and the parked one waits on.
+    fn parked_for(&mut self, info: &ReceiverInfo) -> Option<RxKey> {
+        let cov = cov_id(info);
+        let k = *self.parked.get(&cov)?;
+        let mut pos = llh_to_ecef(Llh { lat: info.lat, lon: info.lon, alt: info.alt });
+        if let Some(d) = self.applied.get(&cov) {
+            pos = corrected(&Enu::at(pos), d);
+        }
+        let r = self.rxs.get(&k)?;
+        if r.info.clock != info.clock || dist(&r.pos, &pos) > SAME_PLACE_M {
+            self.stats.rx_resume_refused.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.parked.remove(&cov);
+        Some(k)
+    }
+
+    /// A parked receiver continues on a new connection. Kept: its clock
+    /// pairs and clock epoch, noise scale and health, wall map, place and
+    /// survey identity. New: the connection (info, tx), nothing requested.
+    ///
+    /// The pairs are physical (two counters, two crystals) and stay valid as
+    /// long as the counter runs on, which a reconnect alone does not tell:
+    /// mlat-client announces every new session with two clock resets, which
+    /// set each converged pair aside until the new observations confirm it
+    /// (clock.rs, `reset_offset`); a handover between a feeder's inputs
+    /// (same readsb, same counter, no new session) has no reset and goes on.
+    /// Its aircraft and rates come back as `Inherited`: counted again at
+    /// once, so that a served receiver is asked for traffic now, and dropped
+    /// unless its new session reports them.
+    fn resume(&mut self, k: RxKey, conn: ConnId, info: ReceiverInfo, tx: mpsc::Sender<ToClient>, now: f64) {
+        let Some(r) = self.rxs.get_mut(&k) else { return };
+        r.conn = conn;
+        r.user = Arc::from(info.user.as_str());
+        r.info = info;
+        r.tx = tx;
+        r.parked = None;
+        r.connected = now;
+        // clients.json's message_rate counts this connection's lines.
+        r.msgs_mark = (r.info.msgs.load(Ordering::Relaxed), now);
+        if !r.seen.is_empty() || r.rate.is_some() {
+            let until = now + INHERIT_CONFIRM_S;
+            r.inherited = Some(Inherited { until, seen: r.seen.clone(), rate: r.rate.is_some(), marker: false });
+            self.inherit_due.push_back((until, k));
+        }
+        for &icao in &r.seen {
+            let a = self.aircraft.entry(icao).or_default();
+            a.tracking += 1;
+            a.seen_by.insert(k);
+        }
+        let served = r.info.serve.is_some();
+        let (cov, lat, lon) = (r.cov, r.info.lat, r.info.lon);
+        self.coverage.send(ToCoverage::Place { id: cov, lat, lon, now });
+        self.coverage.send(ToCoverage::Name { id: cov, who: who_of(&r.info) });
+        self.stats.rx_resumed.fetch_add(1, Ordering::Relaxed);
+        self.stats.rx_resumed_pairs.fetch_add(r.peers.len() as u64, Ordering::Relaxed);
+        self.rx_by_cov.insert(cov, k);
+        self.rx_by_conn.insert(conn, k);
+        if served {
+            self.served_n += 1;
+            self.update_interest(k, now);
+        }
+    }
+
+    /// The new session had its time to report: inherited aircraft it did not
+    /// report are lost, and inherited rates it did not replace give way to
+    /// what it said itself (the empty first report, or nothing).
+    fn settle_inherited(&mut self, k: RxKey, due: f64, now: f64) {
+        let Some(r) = self.rxs.get_mut(&k) else { return };
+        if r.parked.is_some() || r.inherited.as_ref().map(|i| i.until) != Some(due) {
+            return;
+        }
+        let i = r.inherited.take().unwrap();
+        for icao in i.seen {
+            if r.seen.remove(&icao) {
                 if let Some(a) = self.aircraft.get_mut(&icao) {
                     a.tracking = a.tracking.saturating_sub(1);
                     a.seen_by.remove(&k);
                 }
             }
+        }
+        if i.rate {
+            r.rate = i.marker.then(HashMap::default);
+        }
+        if r.info.serve.is_some() {
+            self.update_interest(k, now);
         }
     }
 
@@ -1122,6 +1331,7 @@ impl Engine {
         let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
         if let Some(r) = self.rxs.get_mut(&k) {
             r.wall = WallMap::default();
+            r.epoch = r.epoch.wrapping_add(1);
         }
         let peers: Vec<RxKey> = self.rxs.get(&k).map(|r| r.peers.iter().copied().collect()).unwrap_or_default();
         for p in peers {
@@ -1136,6 +1346,9 @@ impl Engine {
         let Some(r) = self.rxs.get_mut(&k) else { return };
         let mut fresh = Vec::new();
         for &a in icao {
+            if let Some(i) = r.inherited.as_mut() {
+                i.seen.remove(&a);
+            }
             if r.seen.insert(a) {
                 let ac = self.aircraft.entry(a).or_default();
                 ac.tracking += 1;
@@ -1216,6 +1429,9 @@ impl Engine {
         let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
         let Some(r) = self.rxs.get_mut(&k) else { return };
         for &a in icao {
+            if let Some(i) = r.inherited.as_mut() {
+                i.seen.remove(&a);
+            }
             if r.seen.remove(&a) {
                 if let Some(ac) = self.aircraft.get_mut(&a) {
                     ac.tracking = ac.tracking.saturating_sub(1);
@@ -1235,7 +1451,18 @@ impl Engine {
     fn on_rate_report(&mut self, conn: ConnId, rates: Vec<(u32, f32)>, now: f64) {
         let Some(k) = self.rx_by_conn.get(&conn).copied() else { return };
         let Some(r) = self.rxs.get_mut(&k) else { return };
-        r.rate = Some(rates.into_iter().collect());
+        match r.inherited.as_mut().filter(|i| i.rate) {
+            // mlat-client's empty report right after the handshake means
+            // "reports will follow" (jsonclient.py; a real one is never
+            // empty, coordinator.py send_rate_report): the rates a resumed
+            // receiver brought stay until the first real one.
+            Some(i) if rates.is_empty() => i.marker = true,
+            Some(i) => {
+                i.rate = false;
+                r.rate = Some(rates.into_iter().collect());
+            }
+            None => r.rate = Some(rates.into_iter().collect()),
+        }
         if r.info.serve.is_some() {
             self.update_interest(k, now);
         }
@@ -1397,12 +1624,12 @@ impl Engine {
             return;
         }
         let (ta, tb, ma, mb) = if et < ot { (et, ot, em, om) } else { (ot, et, om, em) };
-        let (freq, rpos, tb_wall) = match self.rxs.get_mut(&k) {
+        let (freq, rpos, tb_wall, epoch) = match self.rxs.get_mut(&k) {
             Some(r) => {
                 r.sync_msgs += 1;
                 let tb_s = et.max(ot) / r.freq;
                 r.wall.observe(now, tb_s);
-                (r.freq, r.pos, r.wall.map(tb_s, now))
+                (r.freq, r.pos, r.wall.map(tb_s, now), r.epoch)
             }
             None => return,
         };
@@ -1429,7 +1656,7 @@ impl Engine {
         if da > MAX_RANGE || db > MAX_RANGE {
             return;
         }
-        let obs = SyncObs { rx: k, tda: ta / freq - da / C_AIR, tdb: tb / freq - db / C_AIR, sb: tb / freq };
+        let obs = SyncObs { rx: k, tda: ta / freq - da / C_AIR, tdb: tb / freq - db / C_AIR, sb: tb / freq, epoch };
         // Identical bytes can be two transmissions (a stationary aircraft
         // repeats itself): the measured interval tells them apart.
         let vi = match entry.variants.iter().position(|v| (v.interval - interval).abs() < 0.75e-3) {
@@ -1496,6 +1723,12 @@ impl Engine {
         variant.obs.push(obs);
         let (mut ok, mut bad) = (0, 0);
         for q in previous {
+            // Made before that receiver's last clock reset: its counter may
+            // have moved since, and a set-aside pair must be confirmed by
+            // new observations only (clock.rs).
+            if self.rxs.get(&q.rx).is_some_and(|r| r.epoch != q.epoch) {
+                continue;
+            }
             let (o, b) = self.pair_update(k, &obs, q, now, (pa, pb));
             ok += o;
             bad += b;
@@ -1513,6 +1746,10 @@ impl Engine {
         let pk = pair_key(k, q.rx);
         if !self.pairs.contains_key(&pk) {
             let (Some(r1), Some(r2)) = (self.rxs.get(&k), self.rxs.get(&q.rx)) else { return (0, 0) };
+            // A parked receiver keeps its pairs but gets no new ones.
+            if r2.parked.is_some() {
+                return (0, 0);
+            }
             let band = band_of(dist(&r1.pos, &r2.pos));
             let b = band as usize;
             let (c1, c2) = (r1.band_count[b], r2.band_count[b]);
@@ -1549,6 +1786,11 @@ impl Engine {
                 }
                 Outcome::Reset => self.stats.pair_resets.fetch_add(1, Ordering::Relaxed),
                 Outcome::ResetDrift => self.stats.pair_resets_drift.fetch_add(1, Ordering::Relaxed),
+                Outcome::Reanchored => {
+                    ok += 1;
+                    self.stats.pair_updates.fetch_add(1, Ordering::Relaxed);
+                    self.stats.pair_reanchors.fetch_add(1, Ordering::Relaxed)
+                }
             };
         }
         (ok, bad)
@@ -1726,7 +1968,7 @@ impl Engine {
         let mut copies = Vec::new();
         for &(k, s) in &g.copies {
             let Some(r) = self.rxs.get(&k) else { continue };
-            if r.suspect {
+            if r.suspect || r.parked.is_some() {
                 continue;
             }
             let idx = match keys.iter().position(|&x| x == k) {
@@ -1790,7 +2032,7 @@ impl Engine {
             for (i, &k) in keys.iter().enumerate() {
                 let Some(r) = self.rxs.get(&k) else { continue };
                 for &p in &r.peers {
-                    if keys.contains(&p) || self.rxs.get(&p).is_none_or(|x| x.suspect) {
+                    if keys.contains(&p) || self.rxs.get(&p).is_none_or(|x| x.suspect || x.parked.is_some()) {
                         continue;
                     }
                     if self.pairs.get(&pair_key(k, p)).is_some_and(|m| m.usable(now)) {
@@ -1871,7 +2113,8 @@ impl Engine {
         let Some(d) = modes::decode(&bytes) else { return };
         // The group's time by its receivers' clocks (WallMap): the earliest
         // mapped copy. None until some receiver's clock is mapped.
-        let t_rx = g.copies.iter().filter_map(|(k, cs)| self.rxs.get(k).and_then(|r| r.wall.map(*cs, now))).reduce(f64::min);
+        let mapped = |(k, cs): &(RxKey, f64)| self.rxs.get(k).filter(|r| r.parked.is_none())?.wall.map(*cs, now);
+        let t_rx = g.copies.iter().filter_map(mapped).reduce(f64::min);
         // The AP address of a corrupted frame is garbage; requiring that some
         // receiver reported the aircraft as seen filters those out.
         let known = self.aircraft.get(&d.address).map(|a| a.tracking > 0).unwrap_or(false);
@@ -2097,6 +2340,29 @@ impl Engine {
             self.sync_expiry.pop_front();
             self.sync.remove(&key);
         }
+        // Parked receivers whose wait is over (unless resumed meanwhile, or
+        // parked again since): dropped as a disconnect used to drop them.
+        while let Some(&(due, k)) = self.park_due.front() {
+            if due > now {
+                break;
+            }
+            self.park_due.pop_front();
+            let Some(r) = self.rxs.get(&k) else { continue };
+            if r.parked.is_some_and(|t| t + self.reconnect_grace <= now) {
+                if self.parked.get(&r.cov) == Some(&k) {
+                    self.parked.remove(&r.cov);
+                }
+                self.drop_rx(k);
+                self.stats.rx_park_expired.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        while let Some(&(due, k)) = self.inherit_due.front() {
+            if due > now {
+                break;
+            }
+            self.inherit_due.pop_front();
+            self.settle_inherited(k, due, now);
+        }
     }
 
     fn housekeeping(&mut self, now: f64) {
@@ -2209,6 +2475,7 @@ impl Engine {
         let receivers: Vec<crate::relay::registry::Entry> = self
             .rxs
             .values()
+            .filter(|r| r.parked.is_none())
             .filter_map(|r| {
                 let k = crate::relay::registry::key_of_uuid(r.info.uuid.as_deref()?)?;
                 Some(crate::relay::registry::Entry {
@@ -2308,7 +2575,8 @@ impl Engine {
         errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let q = |p: f64| if errs.is_empty() { 0.0 } else { errs[((errs.len() - 1) as f64 * p) as usize] };
         let mut s = self.stats.snapshot.lock().unwrap();
-        s.receivers = self.rxs.len();
+        s.receivers = self.rxs.len().saturating_sub(self.parked.len());
+        s.receivers_parked = self.parked.len();
         s.coverage_maps = self.cov_shared.maps.load(Ordering::Relaxed);
         s.coverage_samples = self.cov_shared.samples.load(Ordering::Relaxed);
         s.alt_model_cells = self.alt_model.cells();
@@ -2324,7 +2592,7 @@ impl Engine {
         s.serve_requested_sync = ws;
         s.serve_requested_mlat = wm;
         s.serve_mlat_wanted = self.interest.wanted().len();
-        s.receivers_suspect = self.rxs.values().filter(|r| r.suspect).count();
+        s.receivers_suspect = self.rxs.values().filter(|r| r.suspect && r.parked.is_none()).count();
         s.pairs = self.pairs.len();
         s.pairs_usable = self.pairs.values().filter(|m| m.usable(now)).count();
         s.sync_entries = self.sync.len();
@@ -2451,6 +2719,9 @@ pub(crate) fn fxhash(b: &[u8]) -> u64 {
     }
     h
 }
+
+#[cfg(test)]
+mod takeover_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2763,7 +3034,7 @@ mod tests {
         assert_eq!(v.as_object().unwrap().len(), 3);
         // Gone once they disconnect.
         for conn in [1, 2, 4] {
-            e.disconnect(conn);
+            e.disconnect(conn, now + 45.0);
         }
         assert_eq!(clients(&mut e, now + 50.0), serde_json::json!({}));
     }
@@ -2825,7 +3096,7 @@ mod tests {
         assert!(e.pairs.is_empty());
         // A reconnect comes back at the corrected place.
         let info = e.rxs[&a].info.clone();
-        e.disconnect(1);
+        e.disconnect(1, 200.0);
         let (tx, _) = mpsc::channel(1);
         e.connect(7, info, tx, 200.0);
         let k = e.rx_by_conn[&7];

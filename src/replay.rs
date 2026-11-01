@@ -138,6 +138,10 @@ pub struct ReplayArgs {
     /// every this many seconds (0 = off).
     #[arg(long, default_value_t = 0.0)]
     survey_apply_every: f64,
+    /// As the server's --reconnect-grace-s (0 = a disconnect drops the
+    /// receiver's clock pairs at once).
+    #[arg(long, default_value_t = crate::engine::RECONNECT_GRACE_S)]
+    reconnect_grace_s: f64,
     /// Seed of every hash map (hashing.rs). The output must not depend on
     /// it: two seeds giving different results is a bug.
     #[arg(long, default_value_t = 0)]
@@ -362,6 +366,7 @@ pub fn main(argv: Vec<String>) -> anyhow::Result<()> {
         .with_survey_apply((a.survey_apply_every > 0.0).then(|| crate::survey::ApplyCfg { every_s: a.survey_apply_every, ..Default::default() }))
         .with_two_site(a.two_site)
         .with_bench_two_sites(a.bench_two_sites)
+        .with_reconnect_grace(a.reconnect_grace_s)
         .with_serve_params(crate::interest::Params {
             no_adsb_mlat_s: a.serve_no_adsb_s,
             max_sync_rate: a.serve_max_sync_rate,

@@ -208,6 +208,14 @@ contract, the flags and the metrics.
   `/readyz` answers `503 draining`, the serve listener closes, and the
   served feeders are kept until the proxy has moved them (at most
   `--drain-max-s`); then the usual shutdown saves the state.
+  The warming criteria gate only the first 200 (`--ready-latch`, on by
+  default); after it, only draining and stalled answer 503. The 2026-11-01
+  failover harness (30 mlat-client 0.4.2, two hybrids, the hub, two proxies)
+  found why: the member that has just taken over answered `warming: usable
+  clock pairs 0.37-0.44 < 0.600` for about 4 s, from 4-6 s after the switch,
+  because the reconnecting feeders reset their pairs; the proxy marked it
+  down in 4 of 15 events. With a usable peer that moves every served feeder
+  back, and the next takeover can do the same.
 - **M2, one receiver per served feeder** (`src/hybrid.rs`): the served
   connection and the hub's copy of it have the same key. The router tells
   them apart by the listener they came through, gives the key to the served

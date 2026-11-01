@@ -84,6 +84,12 @@ struct Args {
     /// usable (0 = no check).
     #[arg(long, default_value_t = 0.6, env = "MLAT_NG_READY_MIN_USABLE")]
     ready_min_usable: f64,
+    /// Once /readyz has answered 200, keep answering it except when draining
+    /// or stalled: the uptime, usable-pairs and feed criteria gate only the
+    /// first 200 (a takeover's reconnect wave dips the usable share for a few
+    /// seconds). `--ready-latch false` re-checks them every time.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, env = "MLAT_NG_READY_LATCH")]
+    ready_latch: bool,
     /// Serve mode: seconds without an ADS-B position before an aircraft is
     /// multilaterated (mlat-server's MLAT_SERVER_NO_ADSB_MLAT_SECONDS).
     #[arg(long, default_value_t = 120.0, env = "MLAT_NG_SERVE_NO_ADSB_S")]
@@ -209,7 +215,12 @@ fn redundancy(args: &Args) -> anyhow::Result<(ready::ReadyConfig, std::time::Dur
     };
     anyhow::ensure!((0.0..=1.0).contains(&args.ready_min_usable), "--ready-min-usable must be in 0..1: {}", args.ready_min_usable);
     secs("--ready-min-uptime-s", args.ready_min_uptime_s)?;
-    let cfg = ready::ReadyConfig { min_uptime_s: args.ready_min_uptime_s, min_usable: args.ready_min_usable, feed: !args.feed.is_empty() };
+    let cfg = ready::ReadyConfig {
+        min_uptime_s: args.ready_min_uptime_s,
+        min_usable: args.ready_min_usable,
+        feed: !args.feed.is_empty(),
+        latch: args.ready_latch,
+    };
     Ok((cfg, secs("--serve-gate-max-s", args.serve_gate_max_s)?, secs("--drain-max-s", args.drain_max_s)?))
 }
 
@@ -273,7 +284,7 @@ fn main() -> anyhow::Result<()> {
     // Is this instance warm (src/ready.rs)? For /readyz and the serve gate.
     let verdict: Arc<dyn Fn() -> ready::Verdict + Send + Sync> = {
         let (st, fs, lc) = (stats.clone(), feed_stats.clone(), lifecycle.clone());
-        Arc::new(move || ready::assess(&ready_cfg, lc.is_draining(), &ready::Inputs::read(lc.uptime_s(), &st, fs.as_deref())))
+        Arc::new(move || lc.verdict(&ready_cfg, &ready::Inputs::read(lc.uptime_s(), &st, fs.as_deref())))
     };
     // The engine returns when every event sender is gone, after saving its
     // state; main waits for that (bounded) before exiting.
@@ -318,13 +329,15 @@ fn main() -> anyhow::Result<()> {
         let render_feed = feed_stats.clone();
         let render_hybrid = hybrid_stats.clone();
         let service = args.service.clone();
+        let render_lc = lifecycle.clone();
         let render: Arc<dyn Fn(&str) -> Option<(&'static str, String)> + Send + Sync> = Arc::new(move |path: &str| {
             match path {
                 "/healthz" => Some(("text/plain", "ok\n".into())),
-                "/metrics" => Some((
-                    "text/plain; version=0.0.4",
-                    render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref(), render_hybrid.as_deref()),
-                )),
+                "/metrics" => {
+                    let mut o = render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref(), render_hybrid.as_deref());
+                    render_lc.render_metrics(&mut o, &ready_cfg);
+                    Some(("text/plain; version=0.0.4", o))
+                }
                 "/receivers.json" => Some(("application/json", render_stats.registry_json.lock().unwrap().clone())),
                 "/clients.json" => Some(("application/json", render_stats.clients_json.lock().unwrap().clone())),
                 "/survey.json" => Some(("application/json", render_stats.survey_json.lock().unwrap().clone())),

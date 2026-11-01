@@ -50,17 +50,23 @@ poll. The proxy reads only the status, and whether the body starts with
 
 | Answer | When |
 |---|---|
-| `200 ok` | warm: up at least `--ready-min-uptime-s`, an engine snapshot younger than 10 s, at least `--ready-min-usable` of the clock pairs usable, and with `--feed` a cell that delivered frames in the last 30 s and a non-empty registry |
+| `200 ok` | warm: up at least `--ready-min-uptime-s`, an engine snapshot younger than 10 s, at least `--ready-min-usable` of the clock pairs usable, and with `--feed` a cell that delivered frames in the last 30 s and a non-empty registry. After the first 200, everything but draining and stalled (the latch) |
 | `503 draining` | after SIGTERM: the proxy leaves this instance at once |
 | `503 stalled: <why>` | the engine's snapshot is more than 10 s old |
-| `503 warming: <why>` | any other criterion not met |
+| `503 warming: <why>` | before the first 200, any other criterion not met |
 
-`/healthz` stays a constant `ok` (liveness).
+The warming criteria gate only the first 200, which also opens the serve
+listener: a takeover's reconnect wave resets the clock pairs of the feeders
+moving here, and their usable share dips for a few seconds. Re-checking it
+would make the proxy mark the member that just took over down, and move
+every served feeder back. The first 200 logs `ready: warm for the first
+time`. `/healthz` stays a constant `ok` (liveness).
 
 | Flag / env | Default | |
 |---|---|---|
 | `--ready-min-uptime-s` / `MLAT_NG_READY_MIN_UPTIME_S` | 120 | /readyz is 200 only after this many seconds |
 | `--ready-min-usable` / `MLAT_NG_READY_MIN_USABLE` | 0.6 | share of clock pairs that must be usable (0 = no check) |
+| `--ready-latch` / `MLAT_NG_READY_LATCH` | true | after the first 200, only draining and stalled answer 503; `false` re-checks the warming criteria every time |
 | `--serve-gate-max-s` / `MLAT_NG_SERVE_GATE_MAX_S` | 240 | `--serve-listen` is bound once /readyz would be 200, or after this many seconds anyway (0 = at start) |
 | `--drain-max-s` / `MLAT_NG_DRAIN_MAX_S` | 30 | after SIGTERM, how long the served feeders are kept while the proxy moves them |
 | `--reconnect-grace-s` / `MLAT_NG_RECONNECT_GRACE_S` | 20 | a receiver whose connection ends keeps its clock pairs this long for the same receiver to come back (a takeover, a handover between its inputs, a quick reconnect); 0 = dropped at once |
@@ -91,6 +97,7 @@ reported before ([M3](docs/PLAN.md#m3-a-takeover-keeps-the-receivers-clock-state
 | `mlat_ng_hybrid_shadow_of_served_dropped_total` | events from the shadow copy of a served feeder, dropped |
 | `mlat_ng_receivers_parked`; `mlat_ng_receiver_parks_total`, `_resumes_total`, `_resumed_pairs_total`, `_resumes_refused_total`, `_parks_expired_total` | receivers waiting for their next connection, and what became of them (M3) |
 | `mlat_ng_pair_reanchors_total` | clock pairs set aside by a clock reset and restored because the counter had not moved |
+| `mlat_ng_ready_latched`; `mlat_ng_ready_latch_held_total` | 1 once /readyz has answered 200 (with the latch on); verdicts the latch kept at 200 while a warming criterion was not met |
 
 Each served session also logs `served: first result` with `first_start_ms`
 and `first_result_ms`.

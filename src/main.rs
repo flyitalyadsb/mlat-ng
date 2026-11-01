@@ -101,6 +101,13 @@ struct Args {
     /// rollout: the map gets what that region's shard would have produced).
     #[arg(long, default_value_t = false, env = "MLAT_NG_SERVED_OUTPUT_ONLY")]
     served_output_only: bool,
+    /// Seconds a receiver whose connection ended keeps its clock pairs and
+    /// traffic state for the same receiver to connect again: a quick
+    /// reconnect, a handover between a feeder's inputs, a served feeder
+    /// moved here from the other member (M3 in docs/PLAN.md, "Redundancy").
+    /// 0 = drop them at once.
+    #[arg(long, default_value_t = engine::RECONNECT_GRACE_S, env = "MLAT_NG_RECONNECT_GRACE_S")]
+    reconnect_grace_s: f64,
     /// Move receivers to their reliable survey estimates (src/survey.rs):
     /// every 10 min, up to 25 receivers off by more than this many metres.
     #[arg(long, default_value_t = false, env = "MLAT_NG_SURVEY_APPLY")]
@@ -245,6 +252,7 @@ fn main() -> anyhow::Result<()> {
     eng = eng.with_two_site(args.two_site);
     eng = eng.with_served_output_only(args.served_output_only);
     eng = eng.with_survey_apply(args.survey_apply.then(|| survey::ApplyCfg { min_m: args.survey_apply_min_m, ..Default::default() }));
+    eng = eng.with_reconnect_grace(args.reconnect_grace_s);
     eng = eng.with_serve_params(serve_params(&args));
     eng = eng.with_workers(args.workers.max(1)).with_threads(args.workers > 0);
     let (q_tx, q_rx) = mpsc::channel(64);
@@ -462,6 +470,12 @@ fn render_metrics(
     m("pair_rejects_total", "counter", l(&s.pair_rejects));
     m("pair_resets_total", "counter", l(&s.pair_resets));
     m("pair_resets_drift_total", "counter", l(&s.pair_resets_drift));
+    m("pair_reanchors_total", "counter", l(&s.pair_reanchors));
+    m("receiver_parks_total", "counter", l(&s.rx_parked));
+    m("receiver_resumes_total", "counter", l(&s.rx_resumed));
+    m("receiver_resumed_pairs_total", "counter", l(&s.rx_resumed_pairs));
+    m("receiver_resumes_refused_total", "counter", l(&s.rx_resume_refused));
+    m("receiver_parks_expired_total", "counter", l(&s.rx_park_expired));
     m("tracks_born_total", "counter", l(&s.tracks_born));
     m("tracks_refused_dof0_total", "counter", l(&s.tracks_refused_dof0));
     m("outputs_held_no_fix_total", "counter", l(&s.outputs_held_no_fix));
@@ -498,6 +512,7 @@ fn render_metrics(
     let snap = s.snapshot.lock().unwrap().clone();
     m("receivers", "gauge", snap.receivers as f64);
     m("receivers_suspect", "gauge", snap.receivers_suspect as f64);
+    m("receivers_parked", "gauge", snap.receivers_parked as f64);
     m("coverage_maps", "gauge", snap.coverage_maps as f64);
     m("coverage_samples_total", "counter", snap.coverage_samples as f64);
     m("alt_model_cells", "gauge", snap.alt_model_cells as f64);

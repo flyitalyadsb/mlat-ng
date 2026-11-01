@@ -30,6 +30,14 @@
 //! calibration (with the 250 ns dump1090 jitter, types.rs) took published p50
 //! from 116 to 101 m (10-minute capture) and brought the solver's error
 //! estimate close to the real error.
+//!
+//! Re-anchoring (2026-11-01). Most offset resets are not clock jumps: every
+//! new mlat-client session announces its receiver input twice ("input
+//! connected", then a synthesised "Decoder mode changed" clock_reset;
+//! mlat-client coordinator.py server_connected, receiver.py
+//! start_connection), whether or not the readsb behind it restarted. So a
+//! reset sets a converged model aside instead of throwing it away; the
+//! observations after it decide (`reset_offset`, `observe`).
 
 use crate::types::ClockType;
 
@@ -68,6 +76,11 @@ pub const MIN_UPDATES: u32 = 10;
 pub const MAX_SIGMA: f64 = 1.5e-6;
 /// Not updated for this long: the pair is not used (and is expired later).
 pub const MAX_AGE: f64 = 45.0;
+/// Observations after an offset reset that must all pass the gate of the
+/// model it set aside before that model comes back: at least two sync
+/// points (each gives a pair two observations), against the 10 a fresh
+/// offset needs.
+pub const REANCHOR_AGREE: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct PairModel {
@@ -95,6 +108,12 @@ pub struct PairModel {
     pub band: u8,
     /// (drift, its variance) to keep across the next init (offset reset)
     keep_drift: Option<(f64, f64)>,
+    /// The current state started from a kept drift (so it is worth keeping
+    /// again, even before the offset has converged).
+    drift_kept: bool,
+    /// The converged model the last offset reset set aside, and how many
+    /// observations since then passed its gate (`reset_offset`).
+    held: Option<Box<(PairModel, u32)>>,
     /// EWMA of the normalised innovation squared against the NOMINAL noise:
     /// ~1 when the receivers are as good as their clock type says, larger
     /// when they are noisier, smaller when better. The measurement noise used
@@ -118,6 +137,9 @@ pub enum Outcome {
     Reset,
     /// The pair restarted because its drift estimate left the physical range.
     ResetDrift,
+    /// The observations since the last offset reset agreed with the model it
+    /// had set aside: that model is back (this observation included).
+    Reanchored,
 }
 
 impl PairModel {
@@ -137,6 +159,8 @@ impl PairModel {
             reject_rate: 0.0,
             band,
             keep_drift: None,
+            drift_kept: false,
+            held: None,
             nis: 1.0,
             rej_nu: Vec::with_capacity(RESET_AFTER as usize),
             drift_rejects_in_row: 0,
@@ -157,6 +181,7 @@ impl PairModel {
     fn init(&mut self, s_a: f64, theta: f64, wall: f64) {
         self.base = theta;
         self.s_ref = s_a;
+        self.drift_kept = self.keep_drift.is_some();
         let (drift, pd) = self.keep_drift.take().unwrap_or((0.0, self.max_drift * self.max_drift));
         self.x = [0.0, drift];
         self.p = [[self.r_eff(), 0.0], [0.0, pd]];
@@ -186,6 +211,23 @@ impl PairModel {
 
     /// Observe theta (s) at a's clock time s_a (s).
     pub fn observe(&mut self, s_a: f64, theta: f64, wall: f64) -> Outcome {
+        // A model set aside by an offset reset: this observation passes its
+        // (mature) gate and updates it, or shows the counter moved and ends
+        // it. One older than MAX_AGE would not be usable anyway: it would
+        // come back on a few observations as a fresh one with a long record.
+        if let Some(h) = self.held.as_mut() {
+            if wall - h.0.updated_wall <= MAX_AGE && h.0.observe(s_a, theta, wall) == Outcome::Accepted {
+                h.1 += 1;
+                if h.1 >= REANCHOR_AGREE {
+                    let resets = self.resets;
+                    *self = self.held.take().unwrap().0;
+                    self.resets = resets;
+                    return Outcome::Reanchored;
+                }
+            } else {
+                self.held = None;
+            }
+        }
         if self.updates == 0 {
             self.init(s_a, theta, wall);
             return Outcome::Accepted;
@@ -290,9 +332,26 @@ impl PairModel {
 
     /// Forget the offset but keep the drift (the counter of one receiver was
     /// reset or jumped; its crystal did not change).
+    ///
+    /// A converged model is set aside, not lost: while the fresh offset
+    /// converges as before, each new observation is also checked against it
+    /// (`observe`). If the first `REANCHOR_AGREE` all pass its gate, the
+    /// counter did not move (a reconnect, not a restart) and it comes back
+    /// whole, usable at once; the first that does not pass discards it. A
+    /// reset before that keeps it and starts the count again: a session's two
+    /// announcements arrive back to back, sometimes with observations from
+    /// the receiver's Beast feed in between. Such a reset keeps the drift too
+    /// (it used to be lost once the fresh offset had taken it).
     pub fn reset_offset(&mut self) {
-        if self.updates >= MIN_UPDATES {
+        if self.updates >= MIN_UPDATES || (self.updates > 0 && self.drift_kept) {
             self.keep_drift = Some((self.x[1], self.p[1][1]));
+        }
+        if self.updates >= MIN_UPDATES {
+            let mut old = self.clone();
+            old.held = None;
+            self.held = Some(Box::new((old, 0)));
+        } else if let Some(h) = self.held.as_mut() {
+            h.1 = 0;
         }
         self.updates = 0;
         self.resets += 1;
@@ -469,5 +528,104 @@ mod tests {
         let (_, v0) = m.predict(s);
         let (_, v1) = m.predict(s + 30.0);
         assert!(v1 > v0 * 2.0, "{v0:e} {v1:e}");
+    }
+
+    /// A converged dump1090 pair: theta = 12_345.6789 + 37 ppm x (s - 1e6),
+    /// nominal noise, observed every ~0.5 s from wall time 0. Returns the
+    /// pair, its last clock time and the noise generator.
+    fn converged() -> (PairModel, f64, u64) {
+        let mut m = PairModel::new(ClockType::Dump1090, ClockType::Dump1090, 0);
+        let mut seed = 0x5eed_cafe_f00d_c10c_u64;
+        let mut s = 1_000_000.0;
+        for i in 0..120 {
+            s += 0.5;
+            m.observe(s, theta_at(s) + 0.35e-6 * gauss(&mut seed), i as f64 * 0.5);
+        }
+        assert!(m.usable(60.0));
+        (m, s, seed)
+    }
+
+    fn theta_at(s: f64) -> f64 {
+        12_345.678_9 + 37e-6 * (s - 1_000_000.0)
+    }
+
+    #[test]
+    fn a_counter_that_did_not_move_is_reanchored() {
+        let (mut m, mut s, mut seed) = converged();
+        let before = m.updates;
+        // A reconnect 8 s later: the session's two announcements, the
+        // receiver's counter running on.
+        m.reset_offset();
+        m.reset_offset();
+        assert!(!m.usable(68.0));
+        let mut out = Vec::new();
+        for i in 0..REANCHOR_AGREE {
+            s += 0.5;
+            out.push(m.observe(s + 8.0, theta_at(s + 8.0) + 0.35e-6 * gauss(&mut seed), 68.0 + i as f64 * 0.5));
+        }
+        assert_eq!(out.last(), Some(&Outcome::Reanchored), "{out:?}");
+        assert!(out[..out.len() - 1].iter().all(|o| *o == Outcome::Accepted), "{out:?}");
+        // The whole model is back: usable at once, with its record.
+        assert!(m.usable(70.0));
+        assert_eq!(m.updates, before + REANCHOR_AGREE);
+        assert_eq!(m.resets, 2);
+        let (pred, var) = m.predict(s + 9.0);
+        assert!((pred - theta_at(s + 9.0)).abs() < 0.3e-6 && var.sqrt() < 0.3e-6, "{:e} {:e}", pred - theta_at(s + 9.0), var.sqrt());
+    }
+
+    #[test]
+    fn a_counter_that_moved_is_never_reanchored() {
+        let (mut m, mut s, mut seed) = converged();
+        m.reset_offset();
+        // readsb restarted with the client: b's counter is 3.7 s behind
+        // where it was. Its crystal is the same, so the drift still holds.
+        let moved = |s: f64| theta_at(s) - 3.7;
+        let mut outcomes = Vec::new();
+        for i in 0..40 {
+            s += 0.5;
+            outcomes.push(m.observe(s, moved(s) + 0.35e-6 * gauss(&mut seed), 70.0 + i as f64 * 0.5));
+            if i == 0 {
+                assert!(m.held.is_none(), "the first observation shows the jump");
+            }
+        }
+        assert!(!outcomes.contains(&Outcome::Reanchored));
+        assert!(outcomes.iter().all(|o| *o == Outcome::Accepted), "{outcomes:?}");
+        assert!(m.usable(90.0));
+        assert!((m.predict(s + 1.0).0 - moved(s + 1.0)).abs() < 0.5e-6);
+        assert!((m.drift_ppm() - 37.0).abs() < 0.5, "drift {}", m.drift_ppm());
+    }
+
+    #[test]
+    fn a_stale_set_aside_model_does_not_come_back() {
+        let (mut m, mut s, mut seed) = converged();
+        m.reset_offset();
+        // Observations again only after MAX_AGE (from wall 60): the pair
+        // starts over as a fresh one, even though the counter did not move.
+        let mut outcomes = Vec::new();
+        for i in 0..12 {
+            s += 0.5;
+            outcomes.push(m.observe(s + 50.0, theta_at(s + 50.0) + 0.35e-6 * gauss(&mut seed), 110.0 + i as f64 * 0.5));
+        }
+        assert!(!outcomes.contains(&Outcome::Reanchored), "{outcomes:?}");
+        assert!(m.held.is_none());
+        assert_eq!(m.updates, 12);
+    }
+
+    #[test]
+    fn a_second_reset_keeps_the_drift() {
+        let (mut m, mut s, mut seed) = converged();
+        // Reset, the counter moved (the set-aside model goes), three
+        // observations of the fresh offset, then another reset before it
+        // converged: the drift is still the pair's, not a guess of 0.
+        m.reset_offset();
+        for i in 0..3 {
+            s += 0.5;
+            m.observe(s, theta_at(s) + 2.0 + 0.35e-6 * gauss(&mut seed), 70.0 + i as f64 * 0.5);
+        }
+        assert!(m.held.is_none());
+        m.reset_offset();
+        s += 0.5;
+        m.observe(s, theta_at(s) + 5.0, 72.0);
+        assert!((m.drift_ppm() - 37.0).abs() < 0.5, "drift {}", m.drift_ppm());
     }
 }

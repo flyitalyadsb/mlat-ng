@@ -36,6 +36,56 @@ primary instance's `/receivers.json`). With `--bench-sbs-listen`, positions of
 aircraft that also broadcast ADS-B go to a separate port, so they can be
 scored against their own ADS-B. See [docs/PLAN.md](docs/PLAN.md#feed-input).
 
+### Serving with a warm standby
+
+With `--serve-listen` ([serve mode](docs/PLAN.md#serve-mode)) a region can
+run on two hybrid instances: mlat-proxy serves it from one and moves its
+feeders to the other when that one fails or restarts. Both get the hub's
+shadow copy of every feeder, so the standby stays warm. See
+[docs/PLAN.md](docs/PLAN.md#redundancy-a-warm-standby).
+
+`GET /readyz` on the HTTP port is what the proxy and the readiness probe
+poll. The proxy reads only the status, and whether the body starts with
+`draining`:
+
+| Answer | When |
+|---|---|
+| `200 ok` | warm: up at least `--ready-min-uptime-s`, an engine snapshot younger than 10 s, at least `--ready-min-usable` of the clock pairs usable, and with `--feed` a cell that delivered frames in the last 30 s and a non-empty registry |
+| `503 draining` | after SIGTERM: the proxy leaves this instance at once |
+| `503 stalled: <why>` | the engine's snapshot is more than 10 s old |
+| `503 warming: <why>` | any other criterion not met |
+
+`/healthz` stays a constant `ok` (liveness).
+
+| Flag / env | Default | |
+|---|---|---|
+| `--ready-min-uptime-s` / `MLAT_NG_READY_MIN_UPTIME_S` | 120 | /readyz is 200 only after this many seconds |
+| `--ready-min-usable` / `MLAT_NG_READY_MIN_USABLE` | 0.6 | share of clock pairs that must be usable (0 = no check) |
+| `--serve-gate-max-s` / `MLAT_NG_SERVE_GATE_MAX_S` | 240 | `--serve-listen` is bound once /readyz would be 200, or after this many seconds anyway (0 = at start) |
+| `--drain-max-s` / `MLAT_NG_DRAIN_MAX_S` | 30 | after SIGTERM, how long the served feeders are kept while the proxy moves them |
+
+On SIGTERM: `/readyz` answers `503 draining`, the serve listener closes (new
+connects are refused), and the served feeders keep being served until none
+is left or `--drain-max-s` passes. Then the process stops as before and
+saves its state. Two instances on one volume need their own
+`MLAT_NG_COVERAGE_FILE` and `MLAT_NG_SURVEY_FILE` paths.
+
+A served feeder also arrives as the hub's shadow copy. With `--hybrid`, and
+`--shadow` on `--listen` (that is how the copy is told from the served
+connection), the router counts the two as one receiver and drops the copy.
+Without `--hybrid` there is no router: do not tee a served feeder to the
+instance that serves it.
+
+| Metric | |
+|---|---|
+| `mlat_ng_serve_first_start_seconds`, `mlat_ng_serve_first_result_seconds` | histograms: seconds from a served session's start to its first `start_sending` / result line |
+| `mlat_ng_serve_sessions_opened_total`, `_closed_total`, `_closed_no_result_total`; `mlat_ng_serve_sessions_active` | served connections |
+| `mlat_ng_hybrid_owner_serve`, `mlat_ng_hybrid_served_with_shadow` | keys owned by a served connection, and of those the ones whose shadow copy is connected too |
+| `mlat_ng_hybrid_shadow_of_served_dropped_total` | events from the shadow copy of a served feeder, dropped |
+
+Each served session also logs `served: first result` with `first_start_ms`
+and `first_result_ms`.
+
 ### Replay
 
 ```sh
@@ -63,6 +113,7 @@ positions: keep them out of the repository.
 | `src/track.rs` | EKF tracks with fix and direct TDOA updates |
 | `src/engine.rs` | the single owner of all state: sync, holdout, groups, tracks, Mode A/C |
 | `src/output.rs` | SBS server, HTTP server |
+| `src/ready.rs` | `/readyz`, the gated serve listener, the drain on SIGTERM |
 | `src/relay/` | feed input: Beast parser, receiver registry, frames-to-events adapter, cell readers |
 | `src/replay.rs` | offline replay of feed captures |
 | `src/sim.rs` | end-to-end simulation test |

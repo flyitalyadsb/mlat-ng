@@ -18,6 +18,18 @@
 //!   one takes over with its own Connect (the engine re-syncs its clock).
 //! - Connections without a usable UUID, and a second mlat-client with a key
 //!   already taken by another client (a cloned UUID), pass through untouched.
+//!
+//! A served feeder (M2 in docs/PLAN.md, "Redundancy") reaches a serving
+//! instance twice: on `--serve-listen`, and as the copy mlat-shadow-hub tees
+//! to `--listen` so that the standby instance stays warm. Both are
+//! mlat-client connections with one key; the listener tells them apart
+//! (`ReceiverInfo::serve`, set only off a shadow listener: `--listen` must
+//! run with `--shadow`).
+//! The served connection owns the key (Serve > shadow client > feed), and
+//! everything from its shadow copy is dropped: the served stream carries
+//! the same lines and more (the hub forwards them or drops some), so there
+//! is nothing to merge. When the served connection goes (the proxy moved the
+//! feeder), the shadow copy takes over and the feeder stays a receiver here.
 
 use crate::hashing::{HashMap, HashSet};
 use std::collections::VecDeque;
@@ -51,12 +63,33 @@ pub struct RouterStats {
     pub handovers: AtomicU64,
     /// Events the engine queue could not take.
     pub engine_full: AtomicU64,
+    /// Keys owned by a served connection, and of those the ones whose
+    /// shadow copy is connected too.
+    pub owner_serve: AtomicU64,
+    pub served_with_shadow: AtomicU64,
+    /// Events from the shadow copy of a served feeder, dropped.
+    pub shadow_of_served_dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Src {
     Client,
     Feed,
+    /// An mlat-client on `--serve-listen`. Both listeners feed the router as
+    /// `Client`; on_connect tells this one by its handshake.
+    Serve,
+}
+
+impl Src {
+    /// Who owns a key that several inputs have: the served connection (it is
+    /// asked and answered), the shadow client, the feed.
+    fn rank(self) -> u8 {
+        match self {
+            Src::Feed => 0,
+            Src::Client => 1,
+            Src::Serve => 2,
+        }
+    }
 }
 
 struct Side {
@@ -69,6 +102,7 @@ struct Side {
 struct Slot {
     client: Option<Side>,
     feed: Option<Side>,
+    serve: Option<Side>,
     owner: Option<(ConnId, Src)>,
     seen: HashSet<(u64, u64)>,
     order: VecDeque<(u64, (u64, u64))>,
@@ -80,6 +114,7 @@ impl Slot {
         match s {
             Src::Client => self.client.as_ref(),
             Src::Feed => self.feed.as_ref(),
+            Src::Serve => self.serve.as_ref(),
         }
     }
 
@@ -141,6 +176,7 @@ impl Router {
     }
 
     fn on_connect(&mut self, src: Src, side: Side, out: &mut Vec<Event>) {
+        let src = if src == Src::Client && side.info.serve.is_some() { Src::Serve } else { src };
         let Some(key) = side.info.uuid.as_deref().and_then(key_of_uuid) else {
             self.passthrough.insert(side.conn);
             out.push(connect(&side));
@@ -160,10 +196,11 @@ impl Router {
                 slot.owner = Some((side.conn, src));
                 out.push(connect(&side));
             }
-            (Some((fc, Src::Feed)), Src::Client) => {
-                // The client takes over: it can be sent requests and results.
+            (Some((fc, o)), _) if src.rank() > o.rank() => {
+                // The client takes over (the served one from its shadow
+                // copy too): it can be sent requests and results.
                 out.push(Event::Disconnect { conn: fc });
-                slot.owner = Some((side.conn, Src::Client));
+                slot.owner = Some((side.conn, src));
                 slot.forget();
                 out.push(connect(&side));
                 self.stats.handovers.fetch_add(1, Ordering::Relaxed);
@@ -173,6 +210,7 @@ impl Router {
         match src {
             Src::Client => slot.client = Some(side),
             Src::Feed => slot.feed = Some(side),
+            Src::Serve => slot.serve = Some(side),
         }
     }
 
@@ -189,22 +227,21 @@ impl Router {
         match src {
             Src::Client => slot.client = None,
             Src::Feed => slot.feed = None,
+            Src::Serve => slot.serve = None,
         }
         if slot.owner.map(|o| o.0) == Some(conn) {
             out.push(Event::Disconnect { conn });
             slot.owner = None;
             slot.forget();
-            let other = match src {
-                Src::Client => Src::Feed,
-                Src::Feed => Src::Client,
-            };
-            if let Some((c, ev)) = slot.side(other).map(|s| (s.conn, connect(s))) {
+            // The best input left takes over.
+            let next = [Src::Serve, Src::Client, Src::Feed].into_iter().find_map(|o| slot.side(o).map(|s| (o, s.conn, connect(s))));
+            if let Some((other, c, ev)) = next {
                 slot.owner = Some((c, other));
                 out.push(ev);
                 self.stats.handovers.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if slot.client.is_none() && slot.feed.is_none() {
+        if slot.client.is_none() && slot.feed.is_none() && slot.serve.is_none() {
             self.slots.remove(&key);
         }
     }
@@ -220,14 +257,20 @@ impl Router {
             | Event::PositionUpdate { conn, .. } => *conn,
             _ => return,
         };
-        let Some(&(key, _)) = self.conn_key.get(&conn) else {
+        let Some(&(key, src)) = self.conn_key.get(&conn) else {
             out.push(ev);
             return;
         };
         let Some(slot) = self.slots.get_mut(&key) else { return };
-        let Some((owner, _)) = slot.owner else { return };
+        let Some((owner, osrc)) = slot.owner else { return };
         let from_owner = owner == conn;
         let st = &self.stats;
+        // The shadow copy of a served feeder: all of it is in the served
+        // stream already.
+        if osrc == Src::Serve && src == Src::Client {
+            st.shadow_of_served_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         match ev {
             Event::Mlat { t, msg, rx, .. } => {
                 if !slot.first(t as u64, fxhash(&msg)) {
@@ -272,20 +315,28 @@ impl Router {
     }
 
     fn gauges(&self) {
-        let (mut merged, mut oc, mut of) = (0, 0, 0);
+        let (mut merged, mut oc, mut of, mut os, mut sw) = (0, 0, 0, 0, 0);
         for s in self.slots.values() {
-            if s.client.is_some() && s.feed.is_some() {
+            if (s.client.is_some() || s.serve.is_some()) && s.feed.is_some() {
                 merged += 1;
             }
             match s.owner {
                 Some((_, Src::Client)) => oc += 1,
                 Some((_, Src::Feed)) => of += 1,
+                Some((_, Src::Serve)) => {
+                    os += 1;
+                    if s.client.is_some() {
+                        sw += 1;
+                    }
+                }
                 None => {}
             }
         }
         self.stats.merged.store(merged, Ordering::Relaxed);
         self.stats.owner_client.store(oc, Ordering::Relaxed);
         self.stats.owner_feed.store(of, Ordering::Relaxed);
+        self.stats.owner_serve.store(os, Ordering::Relaxed);
+        self.stats.served_with_shadow.store(sw, Ordering::Relaxed);
         self.stats.passthrough_conns.store(self.passthrough.len() as u64, Ordering::Relaxed);
     }
 }
@@ -340,6 +391,9 @@ pub fn render_metrics(o: &mut String, s: &RouterStats) {
         ("hybrid_secondary_dropped_total", l(&s.secondary_dropped)),
         ("hybrid_handovers_total", l(&s.handovers)),
         ("hybrid_engine_full_total", l(&s.engine_full)),
+        ("hybrid_owner_serve", l(&s.owner_serve)),
+        ("hybrid_served_with_shadow", l(&s.served_with_shadow)),
+        ("hybrid_shadow_of_served_dropped_total", l(&s.shadow_of_served_dropped)),
     ] {
         let _ = writeln!(o, "mlat_ng_{m} {v}");
     }

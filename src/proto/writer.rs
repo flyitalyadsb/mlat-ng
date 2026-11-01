@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval_at, sleep_until, timeout, Instant, MissedTickBehavior};
 
 use super::framing::Deflater;
+use super::session::{Sent, Session};
 use super::Limits;
 use crate::types::ToClient;
 
@@ -30,6 +31,8 @@ pub(super) struct WriterCfg {
     pub return_results: bool,
     /// The client asked for stats (`send_stats`: `if self.return_stats`).
     pub return_stats: bool,
+    /// Serve mode: the session's first request and result (session.rs).
+    pub session: Option<Session>,
 }
 
 /// Bytes waiting for the socket, plus zlib2 lines waiting for their flush.
@@ -51,16 +54,16 @@ impl Out {
         self.buf.len() - self.pos
     }
 
-    /// Queue one newline-terminated line. Past the backlog cap a line is
-    /// dropped whole (for zlib2 before it reaches the compressor, so the
-    /// stream the client inflates never has a hole).
-    fn queue(&mut self, line: Vec<u8>) {
+    /// Queue one newline-terminated line; false if it was dropped. Past the
+    /// backlog cap a line is dropped whole (for zlib2 before it reaches the
+    /// compressor, so the stream the client inflates never has a hole).
+    fn queue(&mut self, line: Vec<u8>) -> bool {
         if !self.writable || line.len() > MAX_OUT_LINE {
-            return;
+            return false;
         }
         if self.deflater.is_some() {
             if self.backlog() + self.zbytes + line.len() > self.cap {
-                return;
+                return false;
             }
             self.zbytes += line.len();
             self.zlines.push(line);
@@ -69,11 +72,12 @@ impl Out {
             }
         } else {
             if self.backlog() + line.len() > self.cap {
-                return;
+                return false;
             }
             self.compact();
             self.buf.extend_from_slice(&line);
         }
+        true
     }
 
     /// Compress the pending zlib2 lines into frames.
@@ -164,7 +168,7 @@ pub(super) async fn run(
     mut rx: mpsc::Receiver<ToClient>,
     close_tx: oneshot::Sender<()>,
     reply: Vec<u8>,
-    cfg: WriterCfg,
+    mut cfg: WriterCfg,
     limits: Arc<Limits>,
 ) {
     let mut o = Out {
@@ -202,13 +206,20 @@ pub(super) async fn run(
                 // primary does the steering; never ask for anything.
                 Some(m) => {
                     if !cfg.shadow {
+                        let what = Sent::of(&m);
                         if let Some(line) = engine_line(m, cfg.return_results, cfg.return_stats) {
-                            o.queue(line);
+                            if o.queue(line) {
+                                if let Some(s) = cfg.session.as_mut() {
+                                    s.sent(what);
+                                }
+                            }
                         }
                     }
                 }
             },
-            _ = hb.tick() => o.queue(heartbeat_line()),
+            _ = hb.tick() => {
+                o.queue(heartbeat_line());
+            }
             () = sleep_until(flush_at.unwrap_or_else(Instant::now)), if flush_at.is_some() => o.flush_zlib(),
         }
     }

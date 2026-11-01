@@ -3,6 +3,9 @@
 //! The network layer parses everything off the engine thread and hands the
 //! engine only typed, validated events. The engine never touches sockets.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 /// Receiver clock families, with the parameters every clock-sync decision
@@ -101,9 +104,19 @@ pub struct ReceiverInfo {
     pub privacy: bool,
     /// Address from the PROXY v1 line when present, else the TCP peer.
     pub source_ip: String,
+    /// Port from the same place, a string as mlat-server keeps it.
+    pub source_port: String,
     pub client_version: String,
     /// Negotiated compression: "zlib2" | "zlib" | "none".
     pub compress: &'static str,
+    /// mlat-server's `connection_info` ("<user> v<version> <clock_type>
+    /// <client_version> tcp <compress>"), for clients.json.
+    pub connection: String,
+    /// Lines this connection has read so far (all kinds, as mlat-server's
+    /// `message_counter`), counted by the connection task; the engine turns
+    /// it into clients.json's `message_rate`. Never moves for inputs that are
+    /// not an mlat-client connection.
+    pub msgs: Arc<AtomicU64>,
     /// Set when this server is the receiver's real server (serve mode): the
     /// engine then chooses its traffic and answers it. None = shadow, or an
     /// input that is not an mlat-client (the Beast feed).

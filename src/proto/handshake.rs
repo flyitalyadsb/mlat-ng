@@ -40,6 +40,8 @@ pub(crate) struct Accepted {
     pub privacy: bool,
     pub client_version: String,
     pub compress: &'static str,
+    /// mlat-server's `connection_info` (clients.json `connection`).
+    pub connection: String,
     pub return_results: bool,
     /// The layout results go out in when `return_results` (default "old").
     pub result_format: ResultFormat,
@@ -49,17 +51,17 @@ pub(crate) struct Accepted {
     pub notes: Vec<&'static str>,
 }
 
-/// The source address of a PROXY v1 line (`PROXY TCP4 src dst sport dport`).
-/// mlat-server takes `line.split(' ')[2]` and also reads `[4]`, so a line
+/// The source address and port of a PROXY v1 line (`PROXY TCP4 src dst
+/// sport dport`). mlat-server takes `line.split(' ')[2]` and `[4]`, so a line
 /// with fewer than five space-separated fields (`PROXY UNKNOWN`) raises
 /// IndexError and the connection is closed: None here.
-pub(crate) fn parse_proxy(line: &[u8]) -> Option<String> {
+pub(crate) fn parse_proxy(line: &[u8]) -> Option<(String, String)> {
     let s = std::str::from_utf8(line).ok()?;
     let parts: Vec<&str> = s.split(' ').collect();
     if parts.len() < 5 {
         return None;
     }
-    Some(parts[2].to_string())
+    Some((parts[2].to_string(), parts[4].trim_end().to_string()))
 }
 
 /// Judge one handshake line (as read, newline included).
@@ -184,6 +186,9 @@ fn check(hs: &Value) -> Result<Accepted, Refusal> {
     // Receiver() calls make_clock(), which raises NotImplementedError for an
     // unknown type: not caught, so no deny is sent.
     let clock = ClockType::parse(&clock_type).ok_or(Refusal::Fatal("unknown clock type"))?;
+    // conn_info, with the version and clock type as sent; always "tcp": no
+    // UDP transport is offered.
+    let connection = format!("{user} v{} {clock_type} {client_version} tcp {compress}", py::str(version));
 
     Ok(Accepted {
         user,
@@ -195,6 +200,7 @@ fn check(hs: &Value) -> Result<Accepted, Refusal> {
         privacy,
         client_version,
         compress,
+        connection,
         return_results,
         result_format,
         return_stats,
@@ -356,6 +362,13 @@ mod tests {
         assert_eq!(a.clock, ClockType::Dump1090);
         assert!(!a.return_results && !a.privacy);
         assert_eq!(a.client_version, "0.3.91");
+        assert_eq!(a.connection, "milano-1 v3 dump1090 0.3.91 tcp zlib2");
+        // The version and clock type as the client wrote them.
+        let mut v = with("version", json!(2));
+        v["clock_type"] = json!("unknown");
+        v["compress"] = json!(["none"]);
+        assert_eq!(accept(v).connection, "milano-1 v2 unknown 0.3.91 tcp none");
+        assert_eq!(accept(without("client_version")).connection, "milano-1 v3 dump1090 unknown tcp zlib2");
     }
 
     #[test]
@@ -463,8 +476,10 @@ mod tests {
 
     #[test]
     fn proxy_lines() {
-        assert_eq!(parse_proxy(b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 30005\r\n").as_deref(), Some("203.0.113.7"));
-        assert_eq!(parse_proxy(b"PROXY TCP6 2001:db8::1 2001:db8::2 51234 30005\r\n").as_deref(), Some("2001:db8::1"));
+        let ip_port = |ip: &str, port: &str| Some((ip.to_string(), port.to_string()));
+        assert_eq!(parse_proxy(b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 30005\r\n"), ip_port("203.0.113.7", "51234"));
+        assert_eq!(parse_proxy(b"PROXY TCP6 2001:db8::1 2001:db8::2 51234 30005\r\n"), ip_port("2001:db8::1", "51234"));
+        assert_eq!(parse_proxy(b"PROXY TCP4 203.0.113.7 10.0.0.1 51234\r\n"), ip_port("203.0.113.7", "51234"));
         assert_eq!(parse_proxy(b"PROXY UNKNOWN\r\n"), None);
         assert_eq!(parse_proxy(b"PROXY TCP4 1.2.3.4 5.6.7.8\r\n"), None);
     }

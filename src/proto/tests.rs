@@ -303,7 +303,9 @@ async fn roundtrip(mode: &'static str) {
     assert_eq!((info.lat, info.lon, info.alt), (45.4642, 9.19, 120.0));
     assert_eq!(info.clock, ClockType::Dump1090);
     assert_eq!(info.source_ip, "127.0.0.1");
+    assert_eq!(info.source_port, c.s.local_addr().unwrap().port().to_string());
     assert_eq!(info.client_version, "0.3.91");
+    assert_eq!(info.connection, format!("test-feeder v3 dump1090 0.3.91 tcp {mode}"));
 
     // Two separate writes, so zlib modes span frames of one stream.
     c.send(&["{\"rate_report\":{}}", &format!("{{\"sync\":{{\"et\":1000,\"em\":\"{L14}\",\"ot\":2000,\"om\":\"{L14}\"}}}}")]).await;
@@ -332,6 +334,8 @@ async fn roundtrip(mode: &'static str) {
     assert_eq!(h.n(|c| &c.msgs_bad), 0);
     assert_eq!(h.n(|c| &c.active), 0);
     assert_eq!(h.n(|c| &c.disconnects), 1);
+    // The connection's own count: every line, heartbeat included.
+    assert_eq!(info.msgs.load(Ordering::Relaxed), 8);
 }
 
 #[tokio::test]
@@ -487,12 +491,42 @@ async fn proxy_v1_line_sets_source_ip() {
     assert_eq!(c.reply().await["compress"], "none");
     let (_, info, _) = h.connected().await;
     assert_eq!(info.source_ip, "203.0.113.7");
+    assert_eq!(info.source_port, "51234");
 
     let mut first = b"PROXY TCP6 2001:db8::7 2001:db8::1 51234 30005\r\n".to_vec();
     first.extend(hs_line(&["none"], |_| {}));
     let _c = Client::connect(h.addr, &first).await;
     let (_, info, _) = h.connected().await;
     assert_eq!(info.source_ip, "2001:db8::7");
+    assert_eq!(info.source_port, "51234");
+}
+
+/// A served client behind the proxy, on through the engine: clients.json
+/// has the PROXY line's address and port and the client's own line rate.
+#[tokio::test]
+async fn served_client_in_clients_json_with_its_proxy_source() {
+    use crate::engine::{Engine, EngineConfig, Stats};
+    let mut h = start_with(false, fast_limits(), 4096).await;
+    let mut first = b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 30101\r\n".to_vec();
+    first.extend(hs_line(&["none"], |_| {}));
+    let mut c = Client::connect(h.addr, &first).await;
+    assert_eq!(c.reply().await["compress"], "none");
+    let (conn, info, tx) = h.connected().await;
+    assert!(info.serve.is_some());
+    let stats = Arc::new(Stats::default());
+    let (out, _) = tokio::sync::broadcast::channel(16);
+    let mut e = Engine::new(EngineConfig { shadow: false, mlat_delay: 1.0, holdout_every: 0 }, stats.clone(), out);
+    e.handle_at(Event::Connect { conn, info, tx }, 1000.0);
+    c.send(&["{\"heartbeat\":{\"client_time\":1729760000.123}}"; 30]).await;
+    h.wait_for(|c| &c.msgs_other, 30).await;
+    e.tick_at(1015.0, true);
+    let v: Value = serde_json::from_str(&stats.clients_json.lock().unwrap()).unwrap();
+    let x = &v["test-feeder"];
+    assert_eq!(x["source_ip"], "203.0.113.7");
+    assert_eq!(x["source_port"], "51234");
+    assert_eq!(x["message_rate"], 2);
+    assert_eq!(x["connection"], "test-feeder v3 dump1090 0.3.91 tcp none");
+    assert_eq!(x["uuid"], "6a9423e0-7ba6-4672-81a4-81b715ac1ad2");
 }
 
 #[tokio::test]

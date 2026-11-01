@@ -136,6 +136,16 @@ network's data (mixed mode).
   whose copies made it, in the layout each client asked for ("old" or
   "ecef"), and a `{"stats": ...}` line every 15 s (sync peers, bad-sync
   timeout, outlier share) for clients that asked.
+- **Feeder list**: `/clients.json` on the HTTP port is mlat-server's
+  clients.json (same keys, types and order) for the served receivers only,
+  rewritten every 10 s: name, uuid, declared position, privacy, source
+  address and port (from the PROXY line), lines per second, clock pairs,
+  bad-sync timeout and outlier share (the stats line's values), and the
+  sync / mlat aircraft chosen. `bad_peer_list` holds the peers whose pair
+  rejects more than 35% (mlat-server also counts jumps and large offset
+  errors, which mlat-ng's pairs do not flag); a name already listed comes
+  back as `<name>_<uid>` (mlat-server renames such a newcomer). Shadow
+  receivers are not in it: their address is the hub's.
 - **Hybrid**: the router already makes a feeder's mlat-client the owner of
   its key, so a served client merged with its own Beast feed is the one that
   is asked and answered.

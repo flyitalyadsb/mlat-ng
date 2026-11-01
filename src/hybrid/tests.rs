@@ -13,8 +13,11 @@ fn info(uuid: Option<&str>) -> ReceiverInfo {
         clock: ClockType::Dump1090,
         privacy: false,
         source_ip: "x".into(),
+        source_port: String::new(),
         client_version: "x".into(),
         compress: "none",
+        connection: String::new(),
+        msgs: Default::default(),
         serve: None,
     }
 }

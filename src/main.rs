@@ -51,7 +51,7 @@ struct Args {
     /// BaseStation (SBS) results listen address.
     #[arg(long, default_value = "0.0.0.0:31003", env = "MLAT_NG_SBS_LISTEN")]
     sbs_listen: String,
-    /// HTTP /metrics, /healthz, /state.json.
+    /// HTTP /metrics, /healthz, /state.json, /receivers.json, /clients.json.
     #[arg(long, default_value = "0.0.0.0:9100", env = "MLAT_NG_HTTP_LISTEN")]
     http_listen: String,
     /// Shadow mode: never ask clients for traffic, never send results. The
@@ -279,6 +279,7 @@ fn main() -> anyhow::Result<()> {
                     render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref(), render_hybrid.as_deref()),
                 )),
                 "/receivers.json" => Some(("application/json", render_stats.registry_json.lock().unwrap().clone())),
+                "/clients.json" => Some(("application/json", render_stats.clients_json.lock().unwrap().clone())),
                 "/survey.json" => Some(("application/json", render_stats.survey_json.lock().unwrap().clone())),
                 "/debug.json" => {
                     let d = render_stats.debug.lock().unwrap().clone();

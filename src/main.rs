@@ -51,7 +51,7 @@ struct Args {
     /// BaseStation (SBS) results listen address.
     #[arg(long, default_value = "0.0.0.0:31003", env = "MLAT_NG_SBS_LISTEN")]
     sbs_listen: String,
-    /// HTTP /metrics, /healthz, /state.json.
+    /// HTTP /metrics, /healthz, /state.json, /receivers.json, /clients.json.
     #[arg(long, default_value = "0.0.0.0:9100", env = "MLAT_NG_HTTP_LISTEN")]
     http_listen: String,
     /// Shadow mode: never ask clients for traffic, never send results. The
@@ -72,6 +72,11 @@ struct Args {
     /// (MLAT_SERVER_MAX_SYNC_RATE).
     #[arg(long, default_value_t = 12.0, env = "MLAT_NG_SERVE_MAX_SYNC_RATE")]
     serve_max_sync_rate: f64,
+    /// Serve mode: an aircraft seen by two receivers is asked for
+    /// multilateration 15 s out of every this many seconds, even with ADS-B
+    /// (MLAT_SERVER_FORCE_MLAT_INTERVAL).
+    #[arg(long, default_value_t = 600.0, env = "MLAT_NG_SERVE_FORCE_MLAT_INTERVAL")]
+    serve_force_mlat_interval: f64,
     /// Publish only positions a served receiver contributed to (a region's
     /// rollout: the map gets what that region's shard would have produced).
     #[arg(long, default_value_t = false, env = "MLAT_NG_SERVED_OUTPUT_ONLY")]
@@ -148,6 +153,17 @@ struct Args {
     workers: usize,
 }
 
+/// Serve mode's selection parameters from the flags; the rest are
+/// mlat-server's defaults.
+fn serve_params(args: &Args) -> interest::Params {
+    interest::Params {
+        no_adsb_mlat_s: args.serve_no_adsb_s,
+        max_sync_rate: args.serve_max_sync_rate,
+        force_mlat_interval: args.serve_force_mlat_interval,
+        ..interest::Params::default()
+    }
+}
+
 fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
     s.split(',')
         .filter(|x| !x.trim().is_empty())
@@ -195,11 +211,7 @@ fn main() -> anyhow::Result<()> {
     eng = eng.with_two_site(args.two_site);
     eng = eng.with_served_output_only(args.served_output_only);
     eng = eng.with_survey_apply(args.survey_apply.then(|| survey::ApplyCfg { min_m: args.survey_apply_min_m, ..Default::default() }));
-    eng = eng.with_serve_params(interest::Params {
-        no_adsb_mlat_s: args.serve_no_adsb_s,
-        max_sync_rate: args.serve_max_sync_rate,
-        ..interest::Params::default()
-    });
+    eng = eng.with_serve_params(serve_params(&args));
     eng = eng.with_workers(args.workers.max(1)).with_threads(args.workers > 0);
     let (q_tx, q_rx) = mpsc::channel(64);
     eng = eng.with_queries(q_rx);
@@ -267,6 +279,7 @@ fn main() -> anyhow::Result<()> {
                     render_metrics(&render_stats, &render_counters, &service, render_feed.as_deref(), render_hybrid.as_deref()),
                 )),
                 "/receivers.json" => Some(("application/json", render_stats.registry_json.lock().unwrap().clone())),
+                "/clients.json" => Some(("application/json", render_stats.clients_json.lock().unwrap().clone())),
                 "/survey.json" => Some(("application/json", render_stats.survey_json.lock().unwrap().clone())),
                 "/debug.json" => {
                     let d = render_stats.debug.lock().unwrap().clone();
@@ -489,4 +502,29 @@ fn render_metrics(
         hybrid::render_metrics(&mut o, h);
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn serve_force_mlat_interval_flag() {
+        // Unset: mlat-server's default, and the other serve tunables keep
+        // theirs.
+        let p = serve_params(&Args::try_parse_from(["mlat-ng"]).unwrap());
+        assert_eq!(p.force_mlat_interval, 600.0);
+        assert_eq!(p.force_mlat_interval, interest::Params::default().force_mlat_interval);
+        assert_eq!((p.no_adsb_mlat_s, p.max_sync_rate), (120.0, 12.0));
+        let p = serve_params(&Args::try_parse_from(["mlat-ng", "--serve-force-mlat-interval", "1200"]).unwrap());
+        assert_eq!(p.force_mlat_interval, 1200.0);
+        assert_eq!(p.max_sync_ac, interest::Params::default().max_sync_ac);
+        assert!(Args::try_parse_from(["mlat-ng", "--serve-force-mlat-interval", "ten"]).is_err());
+        // Its environment variable (read from the definition: setting one
+        // would race the other tests' reads of the environment).
+        let cmd = Args::command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "serve_force_mlat_interval").unwrap();
+        assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some("MLAT_NG_SERVE_FORCE_MLAT_INTERVAL"));
+    }
 }

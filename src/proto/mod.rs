@@ -91,7 +91,7 @@ mod conn;
 mod framing;
 mod handshake;
 mod messages;
-mod py;
+pub(crate) mod py;
 mod writer;
 
 #[cfg(test)]

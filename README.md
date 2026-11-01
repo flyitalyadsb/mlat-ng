@@ -24,7 +24,7 @@ Every flag also reads an environment variable (`MLAT_NG_*`, see `--help`).
 |---|---|
 | 30100 | mlat-client connections (PROXY v1 line accepted) |
 | 31003 | BaseStation (SBS) MSG,3 results, mlat-server's layout; Mode A/C tracks as `~F0xxxx` |
-| 9100 | `/metrics` (Prometheus), `/state.json`, `/healthz`, `/receivers.json` (receiver positions by UUID; cluster-internal) |
+| 9100 | `/metrics` (Prometheus), `/state.json`, `/healthz`, `/receivers.json` (receiver positions by UUID; cluster-internal), `/clients.json` (served feeders in mlat-server's clients.json layout, source addresses included; cluster-internal) |
 | 31004 | bench SBS output, feed mode only (`--bench-sbs-listen`) |
 
 ### Feed mode

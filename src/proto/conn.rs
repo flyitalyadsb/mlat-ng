@@ -48,7 +48,8 @@ pub(super) async fn run(
 
     // Behind the proxy every TCP peer is the proxy: log the PROXY source.
     let mut source_ip = peer.ip().to_string();
-    let a = match handshake_phase(&mut rd, &mut inb, &mut source_ip, &limits, &counters.bytes_in).await {
+    let mut source_port = peer.port().to_string();
+    let a = match handshake_phase(&mut rd, &mut inb, (&mut source_ip, &mut source_port), &limits, &counters.bytes_in).await {
         Hs::Accept(a) => a,
         // PR #14: a TCP probe (connect, send nothing, leave) is not an event.
         Hs::Probe => {
@@ -68,6 +69,7 @@ pub(super) async fn run(
         }
     };
 
+    let msgs = Arc::new(AtomicU64::new(0));
     let info = ReceiverInfo {
         user: a.user.clone(),
         uuid: a.uuid.clone(),
@@ -77,8 +79,11 @@ pub(super) async fn run(
         clock: a.clock,
         privacy: a.privacy,
         source_ip,
+        source_port,
         client_version: a.client_version.clone(),
         compress: a.compress,
+        connection: a.connection.clone(),
+        msgs: msgs.clone(),
         serve: (!cfg.shadow).then(|| ServeOpts { results: a.result_format, stats: py::truthy(Some(&a.return_stats)) }),
     };
     Counters::inc(&counters.handshake_ok);
@@ -100,9 +105,9 @@ pub(super) async fn run(
     };
     let writer = tokio::spawn(writer::run(wr, rx, close_tx, reply, wcfg, limits.clone()));
 
-    let mut sink = Sink { conn, engine: &engine, n: Local::default(), rx_time: 0.0 };
+    let mut sink = Sink { conn, engine: &engine, n: Local::default(), msgs: &msgs, rx_time: 0.0 };
     let end = read_messages(&mut rd, &mut inb, &mut sink, &counters, &limits, &a, close_rx).await;
-    sink.n.flush(&counters);
+    sink.flush(&counters);
     writer.abort();
 
     counters.active.fetch_sub(1, Ordering::Relaxed);
@@ -118,8 +123,9 @@ enum Hs {
     Deny(String),
 }
 
-/// Read and judge the handshake; a PROXY line replaces `source_ip`.
-async fn handshake_phase(rd: &mut OwnedReadHalf, inb: &mut InBuf, source_ip: &mut String, limits: &Limits, bytes_in: &AtomicU64) -> Hs {
+/// Read and judge the handshake; a PROXY line replaces `source` (address,
+/// port).
+async fn handshake_phase(rd: &mut OwnedReadHalf, inb: &mut InBuf, source: (&mut String, &mut String), limits: &Limits, bytes_in: &AtomicU64) -> Hs {
     let mut line = match read_line(rd, inb, limits, bytes_in).await {
         Ok(Some(l)) => l,
         Ok(None) => return Hs::Probe,
@@ -130,7 +136,7 @@ async fn handshake_phase(rd: &mut OwnedReadHalf, inb: &mut InBuf, source_ip: &mu
             return Hs::Deny("Badly formatted handshake: 'ascii' codec can't decode the PROXY line".into());
         }
         match handshake::parse_proxy(&line) {
-            Some(ip) => *source_ip = ip,
+            Some((ip, port)) => (*source.0, *source.1) = (ip, port),
             None => return Hs::Failed("malformed PROXY line"),
         }
         line = match read_line(rd, inb, limits, bytes_in).await {
@@ -232,12 +238,23 @@ struct Sink<'a> {
     conn: ConnId,
     engine: &'a mpsc::Sender<Event>,
     n: Local,
+    /// This connection's own line count (`ReceiverInfo::msgs`).
+    msgs: &'a AtomicU64,
     /// Wall-clock arrival of the current read, unix seconds (mlat-server
     /// takes time.time() per mlat message; one read is well under 1 ms).
     rx_time: f64,
 }
 
 impl Sink<'_> {
+    /// The local counts to the connection's own count and the shared ones.
+    fn flush(&mut self, c: &Counters) {
+        let lines = self.n.sync + self.n.mlat + self.n.other;
+        if lines > 0 {
+            self.msgs.fetch_add(lines, Ordering::Relaxed);
+        }
+        self.n.flush(c);
+    }
+
     fn line(&mut self, line: &[u8]) {
         let conn = self.conn;
         let ev = match messages::parse(line) {
@@ -335,7 +352,7 @@ async fn read_messages(
         if progressed {
             last = Instant::now();
         }
-        sink.n.flush(counters);
+        sink.flush(counters);
 
         tokio::select! {
             r = inb.fill(rd) => match r {

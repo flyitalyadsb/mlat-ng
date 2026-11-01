@@ -38,7 +38,7 @@
 //! why only then).
 
 use crate::hashing::{HashMap, HashSet};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -98,6 +98,10 @@ const WALLMAP_MIN_OBS: u32 = 20;
 /// sync-point share of an aircraft is judged over this many observations.
 const SERVE_STATS_EVERY: f64 = 15.0;
 const SYNC_QUALITY_MIN_OBS: f32 = 20.0;
+/// clients.json `bad_peer_list`: peers whose converged clock pair rejects
+/// more than this share of observations (mlat-server: a pairing's
+/// outlier_percent above 35).
+const BAD_PEER_REJECT: f64 = 0.35;
 const MODEAC_BLACKLIST: [u16; 20] = [
     0x1200, 0x7000, 0x2000, 0x0000, 0x1000, 0x0002, 0x0004, 0x0006, 0x0040, 0x0060, 0x0020, 0x0030, 0x0010, 0x0410,
     0x0430, 0x0420, 0x0460, 0x0440, 0x0640, 0x0660,
@@ -146,11 +150,13 @@ struct Rx {
     /// Its clock to wall time (2-site records, ADS-B truth).
     wall: WallMap,
     /// Serve mode: its last rate report (None = it never sent one), what it
-    /// is currently asked for, and how that splits into sync and mlat.
+    /// is currently asked for, and the sync and mlat choices behind that.
     rate: Option<HashMap<u32, f32>>,
     requested: HashSet<u32>,
-    want_sync: usize,
-    want_mlat: usize,
+    sync_interest: HashSet<u32>,
+    mlat_interest: HashSet<u32>,
+    /// `info.msgs` and the time at the last clients.json (its message_rate).
+    msgs_mark: (u64, f64),
 }
 
 /// A receiver's clock mapped to wall time through its quickest deliveries:
@@ -434,6 +440,10 @@ pub struct Stats {
     /// `/receivers.json`: mlat-client receivers with a UUID and their
     /// positions, for the feed instance (cluster-internal only).
     pub registry_json: Mutex<String>,
+    /// `/clients.json`: the served receivers in mlat-server's clients.json
+    /// layout (cluster-internal only: source addresses, and the positions of
+    /// receivers that asked for privacy).
+    pub clients_json: Mutex<String>,
     /// `/survey.json`: each receiver's position correction estimate
     /// (cluster-internal: identities, corrections relative to declared
     /// positions).
@@ -486,6 +496,39 @@ pub struct Snapshot {
     pub serve_requested_sync: usize,
     pub serve_requested_mlat: usize,
     pub serve_mlat_wanted: usize,
+}
+
+/// One receiver in `/clients.json`: mlat-server's entry (coordinator.py
+/// `_write_state`, flyitalyadsb/mlat-server master 33c3361), same keys,
+/// types and order. Its users (stats-api) read user, uuid, privacy,
+/// source_ip, lat/lon/alt, message_rate, peer_count, outlier_percent and
+/// bad_sync_timeout.
+#[derive(serde::Serialize)]
+struct ClientRow {
+    user: String,
+    uid: RxKey,
+    /// The handshake's string uuid, null for none, a placeholder or a
+    /// non-string one (mlat-server shows those as sent).
+    uuid: Option<String>,
+    /// "lat,lon", 6 decimals.
+    coords: String,
+    lat: f64,
+    lon: f64,
+    alt: f64,
+    privacy: bool,
+    connection: String,
+    source_ip: String,
+    source_port: String,
+    /// Lines per second from the client since the previous snapshot.
+    message_rate: u64,
+    peer_count: usize,
+    bad_sync_timeout: u32,
+    outlier_percent: f64,
+    /// Python's str() of a list of peer names.
+    bad_peer_list: String,
+    /// Addresses, lowercase hex, sorted.
+    sync_interest: Vec<String>,
+    mlat_interest: Vec<String>,
 }
 
 pub struct Engine {
@@ -613,6 +656,7 @@ fn pair_key(a: RxKey, b: RxKey) -> (RxKey, RxKey) {
 impl Engine {
     pub fn new(cfg: EngineConfig, stats: Arc<Stats>, out: broadcast::Sender<Arc<str>>) -> Engine {
         stats.snapshot.lock().unwrap().started = unix_now();
+        *stats.clients_json.lock().unwrap() = "{}".into();
         let workers = Pool::new(vec![Worker::new(stats.clone(), out.clone())]);
         let (coverage, cov_shared) = CovHandle::new(Coverage::default());
         Engine {
@@ -1005,8 +1049,9 @@ impl Engine {
             wall: WallMap::default(),
             rate: None,
             requested: HashSet::default(),
-            want_sync: 0,
-            want_mlat: 0,
+            sync_interest: HashSet::default(),
+            mlat_interest: HashSet::default(),
+            msgs_mark: (0, now),
         };
         let cov = cov_id(&r.info);
         let mut r = r;
@@ -1156,7 +1201,7 @@ impl Engine {
             if r.tx.try_send(ToClient::StartSending(list.clone())).is_ok() {
                 self.stats.serve_start_lines.fetch_add(1, Ordering::Relaxed);
                 self.stats.serve_fast_starts.fetch_add(list.len() as u64, Ordering::Relaxed);
-                r.want_mlat += list.len();
+                r.mlat_interest.extend(list.iter().copied());
                 r.requested.extend(list);
             } else {
                 self.stats.serve_send_full.fetch_add(1, Ordering::Relaxed);
@@ -1221,7 +1266,6 @@ impl Engine {
         let wanted: HashSet<u32> = sync.union(&mlat).copied().collect();
         let (start, stop) = interest::diff(&r.requested, &wanted);
         let tx = r.tx.clone();
-        let (n_sync, n_mlat) = (sync.len(), mlat.len());
         let mut requested = r.requested.clone();
         if !start.is_empty() {
             if tx.try_send(ToClient::StartSending(start.clone())).is_ok() {
@@ -1243,8 +1287,8 @@ impl Engine {
         }
         if let Some(r) = self.rxs.get_mut(&k) {
             r.requested = requested;
-            r.want_sync = n_sync;
-            r.want_mlat = n_mlat;
+            r.sync_interest = sync;
+            r.mlat_interest = mlat;
         }
     }
 
@@ -1256,33 +1300,34 @@ impl Engine {
             return;
         }
         self.serve_stats_at = now;
-        let mut reject: HashMap<RxKey, (f64, u32)> = HashMap::default();
-        for ((a, b), m) in self.pairs_sorted() {
-            if m.updates < crate::clock::MIN_UPDATES {
-                continue;
-            }
-            for k in [a, b] {
-                let e = reject.entry(*k).or_insert((0.0, 0));
-                e.0 += m.reject_rate;
-                e.1 += 1;
-            }
-        }
         for r in self.rxs.values() {
             if !r.info.serve.is_some_and(|o| o.stats) {
                 continue;
             }
-            let (sum, n) = reject.get(&r.key).copied().unwrap_or((0.0, 0));
-            let outlier = if n > 0 { (1000.0 * sum / n as f64).round() / 10.0 } else { 0.0 };
             let line = format!(
                 "{{\"stats\":{{\"peer_count\":{},\"bad_sync_timeout\":{},\"outlier_percent\":{}}}}}",
                 r.peers.len(),
-                if r.suspect { 150 } else { 0 },
-                outlier
+                bad_sync_timeout(r),
+                outlier_percent(&self.converged_pairs(r))
             );
             if r.tx.try_send(ToClient::StatsLine(line)).is_ok() {
                 self.stats.serve_stats_lines.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Receiver `r`'s converged clock pairs as (peer, reject rate), in peer
+    /// order: sums over them must not depend on the set's order.
+    fn converged_pairs(&self, r: &Rx) -> Vec<(RxKey, f64)> {
+        let mut v: Vec<(RxKey, f64)> = r
+            .peers
+            .iter()
+            .filter_map(|&p| self.pairs.get(&pair_key(r.key, p)).map(|m| (p, m)))
+            .filter(|(_, m)| m.updates >= crate::clock::MIN_UPDATES)
+            .map(|(p, m)| (p, m.reject_rate))
+            .collect();
+        v.sort_unstable_by_key(|x| x.0);
+        v
     }
 
     // ---------------------------------------------------------------- sync --
@@ -2153,6 +2198,7 @@ impl Engine {
             self.group_due.clear();
         }
         self.render_registry(now);
+        self.render_clients(now);
     }
 
     /// Receivers with a UUID, keyed as readsb keys the feed (first 64 bits).
@@ -2175,6 +2221,73 @@ impl Engine {
             .collect();
         let doc = crate::relay::registry::Doc { generated: now, receivers };
         *self.stats.registry_json.lock().unwrap() = serde_json::to_string(&doc).unwrap_or_default();
+    }
+
+    /// mlat-server's clients.json for the served receivers, rewritten every
+    /// housekeeping (mlat-server: every 15 s), for what reads production's
+    /// (stats-api: who feeds, from which address). Shadow receivers are left
+    /// out: their address is the hub's, and production lists them already.
+    ///
+    /// Names are unique keys there: mlat-server renames a newcomer whose
+    /// name is taken, mlat-ng keeps both, so a later receiver (higher uid)
+    /// with a name already listed appears as `<name>_<uid>`.
+    fn render_clients(&mut self, now: f64) {
+        let mut served: Vec<&Rx> = self.rxs.values().filter(|r| r.info.serve.is_some()).collect();
+        served.sort_unstable_by_key(|r| r.key);
+        let hex = |set: &HashSet<u32>| -> Vec<String> {
+            let mut v: Vec<u32> = set.iter().copied().collect();
+            v.sort_unstable();
+            v.into_iter().map(|a| format!("{a:06x}")).collect()
+        };
+        let mut doc: BTreeMap<String, ClientRow> = BTreeMap::new();
+        let mut marks = Vec::with_capacity(served.len());
+        for r in served {
+            let msgs = r.info.msgs.load(Ordering::Relaxed);
+            let (m0, t0) = r.msgs_mark;
+            // Half to even, as Python's round().
+            let message_rate = if now > t0 { (msgs.saturating_sub(m0) as f64 / (now - t0)).round_ties_even() as u64 } else { 0 };
+            marks.push((r.key, (msgs, now)));
+            let pairs = self.converged_pairs(r);
+            // mlat-server's bad peers also include pairs that jumped or whose
+            // offset error is large; mlat-ng's pairs keep no such flags.
+            let bad: Vec<serde_json::Value> = pairs
+                .iter()
+                .filter(|x| x.1 > BAD_PEER_REJECT)
+                .filter_map(|x| self.rxs.get(&x.0))
+                .map(|p| serde_json::Value::String(p.info.user.clone()))
+                .collect();
+            let mut name = r.info.user.clone();
+            while doc.contains_key(&name) {
+                name = format!("{name}_{}", r.key);
+            }
+            let row = ClientRow {
+                user: name.clone(),
+                uid: r.key,
+                uuid: r.info.uuid.clone(),
+                coords: format!("{:.6},{:.6}", r.info.lat, r.info.lon),
+                lat: r.info.lat,
+                lon: r.info.lon,
+                alt: r.info.alt,
+                privacy: r.info.privacy,
+                connection: r.info.connection.clone(),
+                source_ip: r.info.source_ip.clone(),
+                source_port: r.info.source_port.clone(),
+                message_rate,
+                peer_count: r.peers.len(),
+                bad_sync_timeout: bad_sync_timeout(r),
+                outlier_percent: outlier_percent(&pairs),
+                bad_peer_list: crate::proto::py::repr(&serde_json::Value::Array(bad)),
+                sync_interest: hex(&r.sync_interest),
+                mlat_interest: hex(&r.mlat_interest),
+            };
+            doc.insert(name, row);
+        }
+        for (k, m) in marks {
+            if let Some(r) = self.rxs.get_mut(&k) {
+                r.msgs_mark = m;
+            }
+        }
+        *self.stats.clients_json.lock().unwrap() = serde_json::to_string(&doc).unwrap_or_default();
     }
 
     fn publish(&self, queue_depth: usize) {
@@ -2201,8 +2314,8 @@ impl Engine {
         let (mut n, mut ws, mut wm) = (0, 0, 0);
         for r in served {
             n += 1;
-            ws += r.want_sync;
-            wm += r.want_mlat;
+            ws += r.sync_interest.len();
+            wm += r.mlat_interest.len();
         }
         s.serve_receivers = n;
         s.serve_requested_sync = ws;
@@ -2272,6 +2385,26 @@ fn seeing_of(aircraft: &HashMap<u32, AcSync>, rxs: &HashMap<RxKey, Rx>, rx_by_co
     v
 }
 
+/// mlat-server's `bad_sync_timeout` (seconds left of a bad-clock timeout):
+/// mlat-ng distrusts a clock without a timer, so 150 while it does.
+fn bad_sync_timeout(r: &Rx) -> u32 {
+    if r.suspect {
+        150
+    } else {
+        0
+    }
+}
+
+/// mlat-server's `outlier_percent`, here the mean reject share of the
+/// receiver's converged pairs (`Engine::converged_pairs`), percent to 0.1.
+fn outlier_percent(pairs: &[(RxKey, f64)]) -> f64 {
+    if pairs.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = pairs.iter().map(|x| x.1).sum();
+    (1000.0 * sum / pairs.len() as f64).round() / 10.0
+}
+
 /// Share of an aircraft's recent sync observations its clock pairs rejected
 /// (0 until there are enough of them).
 fn sync_bad_share(a: &AcSync) -> f64 {
@@ -2337,8 +2470,11 @@ mod tests {
             clock: ClockType::Dump1090,
             privacy: false,
             source_ip: "test".into(),
+            source_port: String::new(),
             client_version: "test".into(),
             compress: "none",
+            connection: String::new(),
+            msgs: Default::default(),
             serve: None,
         };
         e.connect(conn, info, tx, 0.0);
@@ -2423,8 +2559,11 @@ mod tests {
             clock: ClockType::Dump1090,
             privacy: false,
             source_ip: "test".into(),
+            source_port: String::new(),
             client_version: "test".into(),
             compress: "none",
+            connection: String::new(),
+            msgs: Default::default(),
             serve: Some(crate::types::ServeOpts { results: ResultFormat::Ecef, stats: true }),
         };
         e.connect(conn, info, tx, now);
@@ -2467,6 +2606,10 @@ mod tests {
         assert!(a2.contains(&0x222222), "sync aircraft shared with a peer: {a2:x?}");
         assert!(rx3.try_recv().is_err(), "a shadow connection is never asked");
         assert!(e.stats.serve_start_lines.load(Ordering::Relaxed) >= 2);
+        // The choices behind the requests are kept (clients.json).
+        let k2 = e.rx_by_conn[&2];
+        assert!(e.rxs[&k2].sync_interest.contains(&0x222222) && e.rxs[&k2].mlat_interest.contains(&0x111111));
+        assert!(e.rxs[&e.rx_by_conn[&3]].sync_interest.is_empty());
     }
 
     #[test]
@@ -2502,6 +2645,123 @@ mod tests {
         // Not again before 15 s.
         e.send_serve_stats(110.0);
         assert!(rx1.try_recv().is_err());
+    }
+
+    /// clients.json as the HTTP side serves it, rendered at `now`.
+    fn clients(e: &mut Engine, now: f64) -> serde_json::Value {
+        e.render_clients(now);
+        serde_json::from_str(&e.stats.clients_json.lock().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn clients_json_is_mlat_servers_for_served_receivers_only() {
+        let mut e = engine();
+        assert_eq!(*e.stats.clients_json.lock().unwrap(), "{}");
+        let now = 10_000.0;
+        let (a, _rx1) = add_served(&mut e, 1, 9.0, now);
+        let (b, _rx2) = add_served(&mut e, 2, 9.5, now);
+        let c = add_rx(&mut e, 3, 9.2);
+        // 0x111111, seen by both served receivers without ADS-B, is wanted.
+        for conn in [1, 2, 3] {
+            e.handle_at(Event::Seen { conn, icao: vec![0x111111] }, now + conn as f64);
+        }
+        // What the connection put in a's handshake info (PROXY line
+        // included), and what it has read since.
+        let r = e.rxs.get_mut(&a).unwrap();
+        r.info.uuid = Some("6a9423e0-7ba6-4672-81a4-81b715ac1ad2".into());
+        r.info.source_ip = "203.0.113.7".into();
+        r.info.source_port = "51234".into();
+        r.info.connection = "srv1 v3 dump1090 0.4.2 tcp zlib2".into();
+        r.info.privacy = true;
+        r.info.msgs.store(300, Ordering::Relaxed);
+        r.sync_interest = [0x4ca123, 0x00abcd].into_iter().collect();
+        r.mlat_interest = [0x111111].into_iter().collect();
+        let off: HashMap<RxKey, f64> = [(a, 0.0), (b, 1e-6), (c, 2e-6)].into_iter().collect();
+        add_pair(&mut e, a, b, &off, now);
+        add_pair(&mut e, a, c, &off, now);
+        e.pairs.get_mut(&pair_key(a, b)).unwrap().reject_rate = 0.1;
+        // The shadow peer rejects half: a bad peer of a's.
+        e.pairs.get_mut(&pair_key(a, c)).unwrap().reject_rate = 0.5;
+
+        let v = clients(&mut e, now + 30.0);
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["srv1", "srv2"], "served receivers only");
+        let x = &v["srv1"];
+        // Every key of mlat-server's entry, in its order, with its type.
+        type IsType = fn(&serde_json::Value) -> bool;
+        let layout: [(&str, IsType); 18] = [
+            ("user", |v| v.is_string()),
+            ("uid", |v| v.is_u64()),
+            ("uuid", |v| v.is_string() || v.is_null()),
+            ("coords", |v| v.is_string()),
+            ("lat", |v| v.is_f64()),
+            ("lon", |v| v.is_f64()),
+            ("alt", |v| v.is_f64()),
+            ("privacy", |v| v.is_boolean()),
+            ("connection", |v| v.is_string()),
+            ("source_ip", |v| v.is_string()),
+            ("source_port", |v| v.is_string()),
+            ("message_rate", |v| v.is_u64()),
+            ("peer_count", |v| v.is_u64()),
+            ("bad_sync_timeout", |v| v.is_u64()),
+            ("outlier_percent", |v| v.is_f64()),
+            ("bad_peer_list", |v| v.is_string()),
+            ("sync_interest", |v| v.as_array().is_some_and(|a| a.iter().all(|s| s.is_string()))),
+            ("mlat_interest", |v| v.as_array().is_some_and(|a| a.iter().all(|s| s.is_string()))),
+        ];
+        for row in [x, &v["srv2"]] {
+            assert_eq!(row.as_object().unwrap().len(), layout.len(), "{row}");
+            for (k, ok) in &layout {
+                assert!(ok(&row[*k]), "{k}: {}", row[*k]);
+            }
+        }
+        let text = e.stats.clients_json.lock().unwrap().clone();
+        let pos: Vec<usize> = layout.iter().map(|(k, _)| text.find(&format!("\"{k}\"")).unwrap()).collect();
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "{text}");
+        assert_eq!(x["user"], "srv1");
+        assert_eq!(x["uid"], a);
+        assert_eq!(x["uuid"], "6a9423e0-7ba6-4672-81a4-81b715ac1ad2");
+        assert!(v["srv2"]["uuid"].is_null());
+        assert_eq!(x["coords"], "45.000000,9.000000");
+        assert_eq!((x["lat"].as_f64(), x["lon"].as_f64(), x["alt"].as_f64()), (Some(45.0), Some(9.0), Some(100.0)));
+        assert_eq!(x["privacy"], true);
+        assert_eq!(x["connection"], "srv1 v3 dump1090 0.4.2 tcp zlib2");
+        assert_eq!(x["source_ip"], "203.0.113.7");
+        assert_eq!(x["source_port"], "51234");
+        // 300 lines in the 30 s since it connected.
+        assert_eq!(x["message_rate"], 10);
+        assert_eq!(x["peer_count"], 2);
+        assert_eq!(x["bad_sync_timeout"], 0);
+        assert_eq!(x["outlier_percent"], 30.0);
+        assert_eq!(x["bad_peer_list"], "['rx3']");
+        assert_eq!(x["sync_interest"], serde_json::json!(["00abcd", "4ca123"]));
+        assert_eq!(x["mlat_interest"], serde_json::json!(["111111"]));
+        // b's choices came from the selection itself.
+        assert_eq!(v["srv2"]["mlat_interest"], serde_json::json!(["111111"]));
+        assert_eq!(v["srv2"]["bad_peer_list"], "[]");
+        assert_eq!(v["srv2"]["message_rate"], 0);
+
+        // The next snapshot counts only what came since the last; a
+        // distrusted clock shows mlat-ng's timeout; a second "srv1" (a
+        // later uid) is listed under a name of its own.
+        let r = e.rxs.get_mut(&a).unwrap();
+        r.info.msgs.store(360, Ordering::Relaxed);
+        r.suspect = true;
+        let (d, _rx4) = add_served(&mut e, 4, 9.7, now + 35.0);
+        e.rxs.get_mut(&d).unwrap().info.user = "srv1".into();
+        let v = clients(&mut e, now + 40.0);
+        assert_eq!(v["srv1"]["message_rate"], 6);
+        assert_eq!(v["srv1"]["bad_sync_timeout"], 150);
+        assert_eq!(v["srv1"]["uid"], a);
+        let renamed = format!("srv1_{d}");
+        assert_eq!(v[&renamed]["user"], renamed.as_str());
+        assert_eq!(v[&renamed]["uid"], d);
+        assert_eq!(v.as_object().unwrap().len(), 3);
+        // Gone once they disconnect.
+        for conn in [1, 2, 4] {
+            e.disconnect(conn);
+        }
+        assert_eq!(clients(&mut e, now + 50.0), serde_json::json!({}));
     }
 
     #[test]

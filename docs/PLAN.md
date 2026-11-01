@@ -123,16 +123,29 @@ network's data (mixed mode).
   so feeders send what they already send to production. mlat: an aircraft
   seen by >= 2 receivers without an ADS-B position for 120 s (or with >10%
   of its sync points rejected, or in its periodic forced window) is asked
-  from every receiver that sees it. sync: from each receiver's rate report,
-  aircraft scored by the product of the two receivers' rates, greedy until
-  every peer has enough shared rate or 12 positions/s, at least 3. A
-  receiver with a distrusted clock gets 3 sync aircraft and no mlat.
+  from every receiver that sees it (the forced window comes every
+  `--serve-force-mlat-interval` seconds, default 600 as mlat-server's;
+  production's shards set MLAT_SERVER_FORCE_MLAT_INTERVAL=1200). sync: from
+  each receiver's rate report, aircraft scored by the product of the two
+  receivers' rates, greedy until every peer has enough shared rate or 12
+  positions/s, at least 3. A receiver with a distrusted clock gets 3 sync
+  aircraft and no mlat.
   Beyond mlat-server: an aircraft is asked for the moment it becomes wanted,
   not at each receiver's next rate report (~18 s).
 - **Results**: every published position goes back to the served receivers
   whose copies made it, in the layout each client asked for ("old" or
   "ecef"), and a `{"stats": ...}` line every 15 s (sync peers, bad-sync
   timeout, outlier share) for clients that asked.
+- **Feeder list**: `/clients.json` on the HTTP port is mlat-server's
+  clients.json (same keys, types and order) for the served receivers only,
+  rewritten every 10 s: name, uuid, declared position, privacy, source
+  address and port (from the PROXY line), lines per second, clock pairs,
+  bad-sync timeout and outlier share (the stats line's values), and the
+  sync / mlat aircraft chosen. `bad_peer_list` holds the peers whose pair
+  rejects more than 35% (mlat-server also counts jumps and large offset
+  errors, which mlat-ng's pairs do not flag); a name already listed comes
+  back as `<name>_<uid>` (mlat-server renames such a newcomer). Shadow
+  receivers are not in it: their address is the hub's.
 - **Hybrid**: the router already makes a feeder's mlat-client the owner of
   its key, so a served client merged with its own Beast feed is the one that
   is asked and answered.

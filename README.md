@@ -63,6 +63,7 @@ poll. The proxy reads only the status, and whether the body starts with
 | `--ready-min-usable` / `MLAT_NG_READY_MIN_USABLE` | 0.6 | share of clock pairs that must be usable (0 = no check) |
 | `--serve-gate-max-s` / `MLAT_NG_SERVE_GATE_MAX_S` | 240 | `--serve-listen` is bound once /readyz would be 200, or after this many seconds anyway (0 = at start) |
 | `--drain-max-s` / `MLAT_NG_DRAIN_MAX_S` | 30 | after SIGTERM, how long the served feeders are kept while the proxy moves them |
+| `--reconnect-grace-s` / `MLAT_NG_RECONNECT_GRACE_S` | 20 | a receiver whose connection ends keeps its clock pairs this long for the same receiver to come back (a takeover, a handover between its inputs, a quick reconnect); 0 = dropped at once |
 
 On SIGTERM: `/readyz` answers `503 draining`, the serve listener closes (new
 connects are refused), and the served feeders keep being served until none
@@ -76,12 +77,20 @@ connection), the router counts the two as one receiver and drops the copy.
 Without `--hybrid` there is no router: do not tee a served feeder to the
 instance that serves it.
 
+When a feeder moves (to the standby, between its inputs, or back after a
+quick reconnect) the engine keeps its receiver: its clock pairs are set
+aside at the new session's clock reset and come back after two sync points
+if its counter ran on, and it is asked for traffic at once from what it
+reported before ([M3](docs/PLAN.md#m3-a-takeover-keeps-the-receivers-clock-state)).
+
 | Metric | |
 |---|---|
 | `mlat_ng_serve_first_start_seconds`, `mlat_ng_serve_first_result_seconds` | histograms: seconds from a served session's start to its first `start_sending` / result line |
 | `mlat_ng_serve_sessions_opened_total`, `_closed_total`, `_closed_no_result_total`; `mlat_ng_serve_sessions_active` | served connections |
 | `mlat_ng_hybrid_owner_serve`, `mlat_ng_hybrid_served_with_shadow` | keys owned by a served connection, and of those the ones whose shadow copy is connected too |
 | `mlat_ng_hybrid_shadow_of_served_dropped_total` | events from the shadow copy of a served feeder, dropped |
+| `mlat_ng_receivers_parked`; `mlat_ng_receiver_parks_total`, `_resumes_total`, `_resumed_pairs_total`, `_resumes_refused_total`, `_parks_expired_total` | receivers waiting for their next connection, and what became of them (M3) |
+| `mlat_ng_pair_reanchors_total` | clock pairs set aside by a clock reset and restored because the counter had not moved |
 
 Each served session also logs `served: first result` with `first_start_ms`
 and `first_result_ms`.

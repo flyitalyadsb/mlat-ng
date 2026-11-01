@@ -185,3 +185,142 @@ fn pairs_sharing_the_even_half_are_different_sync_points() {
     assert_eq!(shape(&out), vec![("sync", 100), ("sync", 100)]);
     assert_eq!(r.stats.dup_sync.load(Ordering::Relaxed), 0);
 }
+
+// ---------------------------------------------------------------- M2 --
+// A served feeder and the hub's shadow copy of it (M2).
+
+const UUID: &str = "01234567-89ab-cdef-0000-000000000000";
+
+/// The Connect of a served connection (`--serve-listen`): it reaches the
+/// router as a Client, like the shadow copy.
+fn served_ev(conn: ConnId, uuid: Option<&str>) -> Event {
+    let (tx, _) = mpsc::channel(1);
+    let serve = Some(crate::types::ServeOpts { results: crate::types::ResultFormat::Ecef, stats: false });
+    Event::Connect { conn, info: ReceiverInfo { serve, ..info(uuid) }, tx }
+}
+
+fn gauge(r: &Router, f: impl Fn(&RouterStats) -> &AtomicU64) -> u64 {
+    f(&r.stats).load(Ordering::Relaxed)
+}
+
+#[test]
+fn a_served_feeder_and_its_shadow_copy_are_one_receiver() {
+    // Served first (the proxy opens the shadow legs after choosing).
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    r.on_event(Src::Client, conn_ev(2, Some(UUID)), &mut out);
+    assert_eq!(shape(&out), vec![("connect", 1)], "the shadow copy is no second receiver");
+    out.clear();
+    r.on_event(Src::Client, mlat(2, 1000.0, 7), &mut out); // the copy
+    r.on_event(Src::Client, mlat(1, 1000.0, 7), &mut out);
+    r.on_event(Src::Client, Event::Seen { conn: 2, icao: vec![1] }, &mut out);
+    r.on_event(Src::Client, Event::RateReport { conn: 2, rates: vec![(1, 1.0)] }, &mut out);
+    r.on_event(Src::Client, Event::ClockReset { conn: 2, reason: "x" }, &mut out);
+    r.on_event(Src::Client, Event::Sync { conn: 2, et: 10.0, ot: 20.0, em: vec![1; 14], om: vec![2; 14] }, &mut out);
+    r.on_event(Src::Client, Event::Seen { conn: 1, icao: vec![1] }, &mut out);
+    assert_eq!(shape(&out), vec![("mlat", 1), ("seen", 1)], "only the served stream reaches the engine");
+    assert_eq!(gauge(&r, |s| &s.shadow_of_served_dropped), 5);
+    assert_eq!(gauge(&r, |s| &s.dup_mlat), 0, "dropped whole, never deduplicated");
+    assert_eq!(gauge(&r, |s| &s.passthrough_conns), 0);
+    assert_eq!((gauge(&r, |s| &s.owner_serve), gauge(&r, |s| &s.owner_client), gauge(&r, |s| &s.served_with_shadow)), (1, 0, 1));
+
+    // Shadow first (a standby taking over): the served connection takes
+    // the key from it, as a client takes it from the feed.
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Client, conn_ev(2, Some(UUID)), &mut out);
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    assert_eq!(shape(&out), vec![("connect", 2), ("disconnect", 2), ("connect", 1)]);
+    assert_eq!(gauge(&r, |s| &s.handovers), 1);
+    out.clear();
+    r.on_event(Src::Client, mlat(2, 5.0, 1), &mut out);
+    r.on_event(Src::Client, mlat(1, 6.0, 2), &mut out);
+    assert_eq!(shape(&out), vec![("mlat", 1)]);
+}
+
+#[test]
+fn the_shadow_copy_leaving_changes_nothing_while_served() {
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    r.on_event(Src::Client, conn_ev(2, Some(UUID)), &mut out);
+    out.clear();
+    r.on_event(Src::Client, Event::Disconnect { conn: 2 }, &mut out);
+    assert!(out.is_empty(), "{:?}", shape(&out));
+    assert_eq!(gauge(&r, |s| &s.served_with_shadow), 0);
+    r.on_event(Src::Client, mlat(1, 1.0, 1), &mut out);
+    assert_eq!(shape(&out), vec![("mlat", 1)]);
+}
+
+#[test]
+fn when_the_served_connection_goes_the_shadow_copy_takes_over() {
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    r.on_event(Src::Client, conn_ev(2, Some(UUID)), &mut out);
+    out.clear();
+    // The proxy moved the feeder to the other instance.
+    r.on_event(Src::Client, Event::Disconnect { conn: 1 }, &mut out);
+    assert_eq!(shape(&out), vec![("disconnect", 1), ("connect", 2)]);
+    out.clear();
+    r.on_event(Src::Client, mlat(2, 1.0, 1), &mut out);
+    r.on_event(Src::Client, Event::Seen { conn: 2, icao: vec![1] }, &mut out);
+    assert_eq!(shape(&out), vec![("mlat", 2), ("seen", 2)], "the copy is now the receiver");
+    assert_eq!((gauge(&r, |s| &s.owner_serve), gauge(&r, |s| &s.owner_client)), (0, 1));
+    // It comes back (the proxy moved it back): served again.
+    out.clear();
+    r.on_event(Src::Client, served_ev(3, Some(UUID)), &mut out);
+    assert_eq!(shape(&out), vec![("disconnect", 2), ("connect", 3)]);
+}
+
+#[test]
+fn served_shadow_and_feed_rank_serve_then_shadow_then_feed() {
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Feed, conn_ev(100, Some(KEY)), &mut out);
+    r.on_event(Src::Client, conn_ev(2, Some(UUID)), &mut out);
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    assert_eq!(shape(&out), vec![("connect", 100), ("disconnect", 100), ("connect", 2), ("disconnect", 2), ("connect", 1)]);
+    out.clear();
+    // The feed still merges into the served receiver; the copy does not.
+    r.on_event(Src::Feed, mlat(100, 1000.0, 7), &mut out);
+    r.on_event(Src::Client, mlat(1, 1000.0, 7), &mut out);
+    r.on_event(Src::Client, mlat(2, 2000.0, 8), &mut out);
+    assert_eq!(shape(&out), vec![("mlat", 1)]);
+    assert_eq!((gauge(&r, |s| &s.dup_mlat), gauge(&r, |s| &s.remapped), gauge(&r, |s| &s.merged)), (1, 1, 1));
+    out.clear();
+    r.on_event(Src::Client, Event::Disconnect { conn: 1 }, &mut out);
+    r.on_event(Src::Client, Event::Disconnect { conn: 2 }, &mut out);
+    r.on_event(Src::Feed, Event::Disconnect { conn: 100 }, &mut out);
+    assert_eq!(shape(&out), vec![("disconnect", 1), ("connect", 2), ("disconnect", 2), ("connect", 100), ("disconnect", 100)]);
+    assert!(r.slots.is_empty() && r.conn_key.is_empty());
+}
+
+#[test]
+fn a_cloned_uuid_on_serve_passes_through_as_before() {
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    r.on_event(Src::Client, served_ev(3, Some(UUID)), &mut out); // another feeder, same UUID
+    r.on_event(Src::Client, served_ev(4, None), &mut out); // no UUID
+    r.on_event(Src::Client, mlat(3, 1.0, 1), &mut out);
+    r.on_event(Src::Client, Event::Disconnect { conn: 3 }, &mut out);
+    assert_eq!(shape(&out), vec![("connect", 1), ("connect", 3), ("connect", 4), ("mlat", 3), ("disconnect", 3)]);
+    assert_eq!(gauge(&r, |s| &s.passthrough_conns), 1);
+    assert_eq!(gauge(&r, |s| &s.shadow_of_served_dropped), 0);
+}
+
+#[test]
+fn router_metrics_include_the_serve_gauges() {
+    let mut r = router();
+    let mut out = Vec::new();
+    r.on_event(Src::Client, served_ev(1, Some(UUID)), &mut out);
+    r.on_event(Src::Client, conn_ev(2, Some(UUID)), &mut out);
+    r.on_event(Src::Client, mlat(2, 1.0, 1), &mut out);
+    let mut o = String::new();
+    render_metrics(&mut o, &r.stats);
+    for want in ["mlat_ng_hybrid_owner_serve 1\n", "mlat_ng_hybrid_served_with_shadow 1\n", "mlat_ng_hybrid_shadow_of_served_dropped_total 1\n"] {
+        assert!(o.contains(want), "missing {want:?} in\n{o}");
+    }
+}

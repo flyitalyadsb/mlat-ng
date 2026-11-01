@@ -219,19 +219,25 @@ pub fn coverage_route(path: &str) -> Option<CovWhat> {
     (!user.is_empty()).then(|| CovWhat::Map(cov_id_of(None, &user)))
 }
 
+/// `/readyz`'s answer: Ok = 200 with this body, Err = 503 with it.
+pub type Readyz = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+
 /// Minimal HTTP/1.0 server: GET /metrics, /healthz, /state.json. The render
 /// callback is called per request on a worker thread (cheap: it formats
 /// counters that the engine publishes once a second). /coverage/* is asked
-/// to the engine thread through `queries`, when given.
+/// to the engine thread through `queries`, when given; /readyz to `ready`
+/// (ready.rs), the one path that can answer 503.
 pub async fn http_server(
     listener: TcpListener,
     render: Arc<dyn Fn(&str) -> Option<(&'static str, String)> + Send + Sync>,
     queries: Option<mpsc::Sender<CovQuery>>,
+    ready: Option<Readyz>,
 ) {
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
         let render = render.clone();
         let queries = queries.clone();
+        let ready = ready.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let n = match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
@@ -244,9 +250,14 @@ pub async fn http_server(
                 (Some(q), true) => ask_coverage(q, &path).await,
                 _ => render(&path),
             };
-            let (status, ctype, body) = match answer {
-                Some((ct, b)) => ("200 OK", ct, b),
-                None => ("404 Not Found", "text/plain", "not found\n".to_string()),
+            let readyz = ready.as_ref().filter(|_| path == "/readyz");
+            let (status, ctype, body) = match (readyz, answer) {
+                (Some(r), _) => match r() {
+                    Ok(b) => ("200 OK", "text/plain", b),
+                    Err(b) => ("503 Service Unavailable", "text/plain", b),
+                },
+                (None, Some((ct, b))) => ("200 OK", ct, b),
+                (None, None) => ("404 Not Found", "text/plain", "not found\n".to_string()),
             };
             let head = format!(
                 "HTTP/1.0 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -269,6 +280,45 @@ async fn ask_coverage(q: &mpsc::Sender<CovQuery>, path: &str) -> Option<(&'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One GET on a fresh connection: (status line, body).
+    async fn get(addr: std::net::SocketAddr, path: &str) -> (String, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).await.unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).await.unwrap();
+        let (head, body) = r.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap().to_string(), body.to_string())
+    }
+
+    /// /readyz on the wire, as the proxy's health check and the kubelet read
+    /// it: 200 or 503, and the body.
+    #[tokio::test]
+    async fn readyz_answers_200_or_503_with_its_body() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let state = Arc::new(std::sync::Mutex::new(Err::<String, String>("warming: up 3 s of 120\n".into())));
+        let st = state.clone();
+        let ready: Readyz = Arc::new(move || st.lock().unwrap().clone());
+        let healthz = |p: &str| (p == "/healthz").then(|| ("text/plain", "ok\n".to_string()));
+        tokio::spawn(http_server(l, Arc::new(healthz), None, Some(ready)));
+        assert_eq!(get(addr, "/readyz").await, ("HTTP/1.0 503 Service Unavailable".into(), "warming: up 3 s of 120\n".into()));
+        *state.lock().unwrap() = Ok("ok\n".into());
+        assert_eq!(get(addr, "/readyz").await, ("HTTP/1.0 200 OK".into(), "ok\n".into()));
+        *state.lock().unwrap() = Err("draining\n".into());
+        assert_eq!(get(addr, "/readyz?x=1").await, ("HTTP/1.0 503 Service Unavailable".into(), "draining\n".into()));
+        // /healthz stays a constant ok, whatever readiness says.
+        assert_eq!(get(addr, "/healthz").await, ("HTTP/1.0 200 OK".into(), "ok\n".into()));
+        assert_eq!(get(addr, "/nope").await.0, "HTTP/1.0 404 Not Found");
+    }
+
+    #[tokio::test]
+    async fn without_a_readiness_callback_readyz_is_not_found() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(http_server(l, Arc::new(|_: &str| None), None, None));
+        assert_eq!(get(addr, "/readyz").await.0, "HTTP/1.0 404 Not Found");
+    }
 
     #[test]
     fn coverage_routes() {

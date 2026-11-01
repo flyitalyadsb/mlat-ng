@@ -861,3 +861,52 @@ async fn zlib2_output_stream_is_continuous() {
     assert!(c.frames >= 6, "{} frames", c.frames);
     assert!(c.max_frame >= 32768 - 2 && c.max_frame < 65536, "largest frame {}", c.max_frame);
 }
+
+/// Served sessions on the wire (session.rs): a served client's first
+/// start_sending and first result are timed once, its close is counted; a
+/// shadow connection is no session at all.
+#[tokio::test]
+async fn served_sessions_are_timed_to_their_first_request_and_result() {
+    let mut h = start_with(false, fast_limits(), 64).await;
+    let mut c = Client::connect(h.addr, &hs_line(offer("none"), |v| v["return_results"] = json!(true))).await;
+    c.reply().await;
+    let (conn, _, tx) = h.connected().await;
+    assert_eq!(h.c.serve.active(), 1);
+    tx.send(ToClient::StopSending(vec![1])).await.unwrap();
+    tx.send(ToClient::StartSending(vec![0x4ca123])).await.unwrap();
+    tx.send(ToClient::StartSending(vec![0x4ca124])).await.unwrap();
+    tx.send(ToClient::ResultLine("{\"result\":{\"@\":1.5,\"addr\":\"4ca123\"}}".into())).await.unwrap();
+    tx.send(ToClient::ResultLine("{\"result\":{\"@\":2.5,\"addr\":\"4ca123\"}}".into())).await.unwrap();
+    c.read_for(Duration::from_millis(100)).await;
+    assert_eq!(c.server_lines().len(), 5);
+    let mut o = String::new();
+    h.c.serve.render(&mut o);
+    assert!(o.contains("mlat_ng_serve_first_start_seconds_count 1\n"), "{o}");
+    assert!(o.contains("mlat_ng_serve_first_result_seconds_count 1\n"), "{o}");
+    c.s.shutdown().await.unwrap();
+    h.until_disconnect(conn).await;
+    // The writer is aborted after the reader's Disconnect: its session
+    // closes a moment later.
+    let deadline = Instant::now() + WAIT;
+    while h.c.serve.active() > 0 {
+        assert!(Instant::now() < deadline, "the session never closed");
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(h.n(|c| &c.serve.closed), 1);
+    assert_eq!(h.n(|c| &c.serve.closed_no_result), 0);
+
+    // A served client that leaves before any result.
+    let mut c = Client::connect(h.addr, &hs_line(offer("none"), |_| {})).await;
+    c.reply().await;
+    let (conn, _, _tx) = h.connected().await;
+    c.s.shutdown().await.unwrap();
+    h.until_disconnect(conn).await;
+    h.wait_for(|c| &c.serve.closed_no_result, 1).await;
+    assert_eq!(h.n(|c| &c.serve.opened), 2);
+
+    // Shadow connections are not served sessions.
+    let mut h = start().await;
+    let _c = Client::ready(h.addr, "none").await;
+    h.connected().await;
+    assert_eq!(h.n(|c| &c.serve.opened), 0);
+}

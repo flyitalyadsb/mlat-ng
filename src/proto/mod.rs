@@ -93,6 +93,8 @@ mod handshake;
 mod messages;
 mod py;
 mod writer;
+// Served sessions, timed (M5 in docs/PLAN.md, "Redundancy").
+pub mod session;
 
 #[cfg(test)]
 mod tests;
@@ -131,6 +133,9 @@ pub struct Counters {
     pub dropped_full: AtomicU64,
     /// Bytes read from clients, compressed as on the wire.
     pub bytes_in: AtomicU64,
+    /// Connections on a serve-mode listener: open, closed, and how long each
+    /// waited for its first request and result (session.rs).
+    pub serve: session::ServeSessions,
 }
 
 impl Counters {

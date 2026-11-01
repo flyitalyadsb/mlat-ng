@@ -23,6 +23,7 @@ mod norm;
 mod output;
 mod persist;
 mod proto;
+mod ready;
 mod relay;
 mod replay;
 #[cfg(test)]
@@ -64,6 +65,25 @@ struct Args {
     /// shadow copy of everyone else. Empty = off.
     #[arg(long, default_value = "", env = "MLAT_NG_SERVE_LISTEN")]
     serve_listen: String,
+    /// --serve-listen opens once /readyz would answer 200, or after this
+    /// many seconds anyway, so that two cold instances cannot wait on each
+    /// other (src/ready.rs); 0 = open at start, without a gate.
+    #[arg(long, default_value_t = 240.0, env = "MLAT_NG_SERVE_GATE_MAX_S")]
+    serve_gate_max_s: f64,
+    /// On SIGTERM /readyz says draining and --serve-listen closes; the
+    /// feeders already served keep being served for up to this many seconds
+    /// while mlat-proxy moves them to the other instance, then the process
+    /// stops as before.
+    #[arg(long, default_value_t = 30.0, env = "MLAT_NG_DRAIN_MAX_S")]
+    drain_max_s: f64,
+    /// /readyz answers 200 only after this many seconds (the hub's reconnect
+    /// backoff, the feed's registry).
+    #[arg(long, default_value_t = 120.0, env = "MLAT_NG_READY_MIN_UPTIME_S")]
+    ready_min_uptime_s: f64,
+    /// /readyz answers 200 only with at least this share of the clock pairs
+    /// usable (0 = no check).
+    #[arg(long, default_value_t = 0.6, env = "MLAT_NG_READY_MIN_USABLE")]
+    ready_min_usable: f64,
     /// Serve mode: seconds without an ADS-B position before an aircraft is
     /// multilaterated (mlat-server's MLAT_SERVER_NO_ADSB_MLAT_SECONDS).
     #[arg(long, default_value_t = 120.0, env = "MLAT_NG_SERVE_NO_ADSB_S")]
@@ -158,6 +178,18 @@ fn parse_cells(s: &str) -> anyhow::Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// /readyz's criteria and the serve gate's and drain's limits, checked.
+fn redundancy(args: &Args) -> anyhow::Result<(ready::ReadyConfig, std::time::Duration, std::time::Duration)> {
+    let secs = |name: &str, v: f64| {
+        anyhow::ensure!(v.is_finite() && v >= 0.0, "{name} must be a number of seconds >= 0: {v}");
+        Ok(std::time::Duration::from_secs_f64(v))
+    };
+    anyhow::ensure!((0.0..=1.0).contains(&args.ready_min_usable), "--ready-min-usable must be in 0..1: {}", args.ready_min_usable);
+    secs("--ready-min-uptime-s", args.ready_min_uptime_s)?;
+    let cfg = ready::ReadyConfig { min_uptime_s: args.ready_min_uptime_s, min_usable: args.ready_min_usable, feed: !args.feed.is_empty() };
+    Ok((cfg, secs("--serve-gate-max-s", args.serve_gate_max_s)?, secs("--drain-max-s", args.drain_max_s)?))
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -170,8 +202,10 @@ fn main() -> anyhow::Result<()> {
         return replay::main(argv[1..].to_vec());
     }
     let args = Args::parse();
+    let lifecycle = Arc::new(ready::Lifecycle::default());
     hashing::set_seed(args.hash_seed.unwrap_or_else(rand::random));
     let cells = parse_cells(&args.feed)?;
+    let (ready_cfg, serve_gate_max, drain_max) = redundancy(&args)?;
     tracing::info!(?args, "mlat-ng {} starting", env!("CARGO_PKG_VERSION"));
 
     let (ev_tx, ev_rx) = mpsc::channel(args.queue);
@@ -216,6 +250,11 @@ fn main() -> anyhow::Result<()> {
     let feed_stats = feed_cfg.as_ref().map(|c| Arc::new(relay::FeedStats::new(c)));
     anyhow::ensure!(!args.hybrid || feed_cfg.is_some(), "--hybrid needs --feed");
     let hybrid_stats = args.hybrid.then(|| Arc::new(hybrid::RouterStats::default()));
+    // Is this instance warm (src/ready.rs)? For /readyz and the serve gate.
+    let verdict: Arc<dyn Fn() -> ready::Verdict + Send + Sync> = {
+        let (st, fs, lc) = (stats.clone(), feed_stats.clone(), lifecycle.clone());
+        Arc::new(move || ready::assess(&ready_cfg, lc.is_draining(), &ready::Inputs::read(lc.uptime_s(), &st, fs.as_deref())))
+    };
     // The engine returns when every event sender is gone, after saving its
     // state; main waits for that (bounded) before exiting.
     let (engine_done, engine_done_rx) = std::sync::mpsc::channel::<()>();
@@ -279,25 +318,62 @@ fn main() -> anyhow::Result<()> {
                 _ => None,
             }
         });
-        tokio::spawn(output::http_server(http_l, render, Some(q_tx)));
+        let readyz: output::Readyz = {
+            let v = verdict.clone();
+            Arc::new(move || v().http())
+        };
+        tokio::spawn(output::http_server(http_l, render, Some(q_tx), Some(readyz)));
 
-        if !args.serve_listen.is_empty() {
-            let serve_l = TcpListener::bind(&args.serve_listen).await?;
-            tracing::info!(serve = %args.serve_listen, "serve listener: feeders here are served by this engine");
+        // The serve listener opens once warm and closes on a drain
+        // (src/ready.rs); a bind error stops the process, as it did when it
+        // was bound at start.
+        let serve_task = (!args.serve_listen.is_empty()).then(|| {
+            tracing::info!(serve = %args.serve_listen, gate_max_s = args.serve_gate_max_s, "serve listener opens once warm");
             let scfg = Arc::new(proto::ListenConfig { shadow: false, motd: args.motd.clone(), source_url: args.source_url.clone() });
-            let (stx, sc) = (client_tx.clone(), counters.clone());
-            tokio::spawn(async move {
-                if let Err(e) = proto::serve(serve_l, scfg, stx, sc).await {
-                    tracing::error!(error = %e, "serve listener stopped");
-                }
-            });
-        }
+            let (stx, sc, v) = (client_tx.clone(), counters.clone(), verdict.clone());
+            let serve = move |l| proto::serve(l, scfg, stx, sc);
+            tokio::spawn(ready::serve_gated(args.serve_listen.clone(), lifecycle.clone(), move || v(), serve_gate_max, ready::POLL, serve))
+        });
+        let serve_failed = async {
+            match serve_task {
+                Some(t) => match t.await {
+                    Ok(Ok(())) => anyhow::bail!("serve listener stopped"),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(e.into()),
+                },
+                None => std::future::pending().await,
+            }
+        };
         let cfg = Arc::new(proto::ListenConfig { shadow: args.shadow, motd: args.motd, source_url: args.source_url });
+        // Its own task: the shadow listener keeps accepting while draining.
+        let mut client_task = tokio::spawn(proto::serve(client_l, cfg, client_tx, counters.clone()));
         tokio::select! {
-            r = proto::serve(client_l, cfg, client_tx, counters) => r,
-            _ = tokio::signal::ctrl_c() => { tracing::info!("SIGINT"); Ok(()) }
-            _ = sigterm() => { tracing::info!("SIGTERM"); Ok(()) }
+            r = &mut client_task => return r?,
+            r = serve_failed => return r,
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT"),
+            _ = sigterm() => tracing::info!("SIGTERM"),
         }
+        // Drain: /readyz says so and the serve listener closes at once; the
+        // served feeders stay until mlat-proxy has moved them (it closes
+        // their connections here once the other instance is usable), or
+        // --drain-max-s. A second signal stops waiting.
+        lifecycle.drain();
+        if !args.serve_listen.is_empty() {
+            let t0 = std::time::Instant::now();
+            tracing::info!(served = counters.serve.active(), max_s = args.drain_max_s, "draining: /readyz answers draining, serve listener closed");
+            let left = tokio::select! {
+                n = ready::wait_served(|| counters.serve.active(), drain_max, ready::POLL / 10) => n,
+                _ = tokio::signal::ctrl_c() => counters.serve.active(),
+                _ = sigterm() => counters.serve.active(),
+            };
+            let waited_s = t0.elapsed().as_secs_f64();
+            if left == 0 {
+                tracing::info!(waited_s, "drained: no served feeder left");
+            } else {
+                tracing::warn!(waited_s, served = left, "drain over with served feeders still connected");
+            }
+        }
+        Ok(())
     });
     // Stop the network side: its tasks hold the engine's event senders, so
     // the engine sees its input close, saves and returns.
@@ -488,5 +564,6 @@ fn render_metrics(
     if let Some(h) = hybrid {
         hybrid::render_metrics(&mut o, h);
     }
+    c.serve.render(&mut o);
     o
 }

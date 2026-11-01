@@ -429,6 +429,9 @@ pub struct Stats {
     pub survey_apply_too_big: AtomicU64,
     /// Snapshot for /state.json and the gauges, rewritten every second.
     pub snapshot: Mutex<Snapshot>,
+    /// unix ms of the last snapshot: /readyz calls the engine stalled when
+    /// it stops moving (ready.rs).
+    pub snapshot_ms: AtomicU64,
     /// Worst recent ADS-B-checked updates, for /debug.json.
     pub debug: Mutex<Vec<Diag>>,
     /// `/receivers.json`: mlat-client receivers with a UUID and their
@@ -2252,6 +2255,7 @@ impl Engine {
         let mut diag: Vec<Diag> = self.diag(|d| d.diag_bad.iter().cloned().collect());
         diag.sort_by(|a, b| a.t.total_cmp(&b.t));
         *self.stats.debug.lock().unwrap() = diag.split_off(diag.len().saturating_sub(400));
+        self.stats.snapshot_ms.store((now * 1000.0) as u64, Ordering::Relaxed);
     }
 }
 

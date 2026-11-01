@@ -18,6 +18,7 @@ use super::framing::{FrameError, InBuf, Inflater};
 use super::handshake::{self, Accepted, Outcome};
 use super::messages::{self, Msg};
 use super::py;
+use super::session::Session;
 use super::writer::{self, WriterCfg};
 use super::{Counters, Limits, ListenConfig};
 use crate::types::{ConnId, Event, ReceiverInfo, ServeOpts};
@@ -88,6 +89,8 @@ pub(super) async fn run(
         return; // the engine is gone: the process is shutting down
     }
     counters.active.fetch_add(1, Ordering::Relaxed);
+    // Serve mode: time to the first request and result (session.rs).
+    let session = (!cfg.shadow).then(|| Session::open(counters.clone(), conn, &a.user));
 
     let mut reply = handshake::accept_line(&a, &cfg).into_bytes();
     reply.push(b'\n');
@@ -97,6 +100,7 @@ pub(super) async fn run(
         shadow: cfg.shadow,
         return_results: a.return_results,
         return_stats: py::truthy(Some(&a.return_stats)),
+        session,
     };
     let writer = tokio::spawn(writer::run(wr, rx, close_tx, reply, wcfg, limits.clone()));
 

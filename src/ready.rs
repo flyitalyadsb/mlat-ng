@@ -21,6 +21,15 @@
 //! the last `FEED_FRESH_S` seconds and a non-empty registry; and at least
 //! `--ready-min-usable` of the clock pairs usable.
 //!
+//! Those warming criteria gate only the first 200 (`--ready-latch`, on by
+//! default). Once ready, only draining and stalled take the 200 away: a
+//! takeover's reconnect wave resets the clock pairs of every feeder that
+//! moves here, and the usable share dips under its threshold for a few
+//! seconds (the 2026-11-01 failover harness: 0.37-0.44 for about 4 s,
+//! starting 4-6 s after the switch). Answering `warming` then made the proxy
+//! mark the member that had just taken over down; with a usable peer it
+//! would move every served feeder back.
+//!
 //! The serve listener is bound only once warm, or after
 //! `--serve-gate-max-s` anyway: a cold instance refuses, so the proxy's
 //! connect fails at once and it tries the other instance within the same
@@ -31,7 +40,7 @@
 //! passes, and then the process stops as before (state saved).
 
 use std::future::Future;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,6 +66,8 @@ pub struct ReadyConfig {
     pub min_usable: f64,
     /// `--feed` is on: a delivering cell and a registry are needed too.
     pub feed: bool,
+    /// Once ready, stay ready unless draining or stalled (`Lifecycle::verdict`).
+    pub latch: bool,
 }
 
 /// What readiness is judged on, read at each question.
@@ -147,20 +158,59 @@ pub fn assess(cfg: &ReadyConfig, draining: bool, i: &Inputs) -> Verdict {
     Verdict::Ready
 }
 
-/// The process as `/readyz` and the serve listener see it: started, then
-/// (once, for good) draining.
+/// The process as `/readyz` and the serve listener see it: started, ready
+/// once, then (once, for good) draining.
 pub struct Lifecycle {
     started: Instant,
     draining: watch::Sender<bool>,
+    /// Set by the first Ready verdict, for good.
+    ready_once: AtomicBool,
+    /// Verdicts the latch turned from warming into ready.
+    latch_held: AtomicU64,
 }
 
 impl Default for Lifecycle {
     fn default() -> Self {
-        Lifecycle { started: Instant::now(), draining: watch::Sender::new(false) }
+        Lifecycle { started: Instant::now(), draining: watch::Sender::new(false), ready_once: AtomicBool::new(false), latch_held: AtomicU64::new(0) }
     }
 }
 
 impl Lifecycle {
+    /// What `/readyz` and the serve gate answer: `assess`, with the latch.
+    /// The first Ready sets it (and is logged); from then on a `warming`
+    /// verdict answers Ready, while draining and stalled still answer 503.
+    pub fn verdict(&self, cfg: &ReadyConfig, i: &Inputs) -> Verdict {
+        match assess(cfg, self.is_draining(), i) {
+            Verdict::Ready => {
+                if !self.ready_once.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        uptime_s = i.uptime_s.round(),
+                        pairs = i.pairs,
+                        pairs_usable = i.pairs_usable,
+                        latch = cfg.latch,
+                        "ready: warm for the first time"
+                    );
+                }
+                Verdict::Ready
+            }
+            Verdict::Warming(_) if cfg.latch && self.ready_once.load(Ordering::Relaxed) => {
+                self.latch_held.fetch_add(1, Ordering::Relaxed);
+                Verdict::Ready
+            }
+            v => v,
+        }
+    }
+
+    /// `mlat_ng_ready_latched` (1 once ready, with the latch on) and
+    /// `mlat_ng_ready_latch_held_total`.
+    pub fn render_metrics(&self, o: &mut String, cfg: &ReadyConfig) {
+        use std::fmt::Write as _;
+        let latched = cfg.latch && self.ready_once.load(Ordering::Relaxed);
+        let _ = writeln!(o, "# TYPE mlat_ng_ready_latched gauge\nmlat_ng_ready_latched {}", latched as u8);
+        let held = self.latch_held.load(Ordering::Relaxed);
+        let _ = writeln!(o, "# TYPE mlat_ng_ready_latch_held_total counter\nmlat_ng_ready_latch_held_total {held}");
+    }
+
     pub fn uptime_s(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
@@ -247,7 +297,7 @@ mod tests {
     use tokio::net::TcpStream;
 
     fn cfg() -> ReadyConfig {
-        ReadyConfig { min_uptime_s: 120.0, min_usable: 0.6, feed: true }
+        ReadyConfig { min_uptime_s: 120.0, min_usable: 0.6, feed: true, latch: true }
     }
 
     fn warm() -> Inputs {
@@ -331,6 +381,81 @@ mod tests {
         // drained() resolves, now and for anyone who asks later.
         tokio::time::timeout(Duration::from_secs(1), lc.drained()).await.unwrap();
         assert!(lc.uptime_s() >= 0.0);
+    }
+
+    fn metrics(lc: &Lifecycle, c: &ReadyConfig) -> String {
+        let mut o = String::new();
+        lc.render_metrics(&mut o, c);
+        o
+    }
+
+    /// The latch (the 2026-11-01 harness's A1): after the first 200, a
+    /// takeover's dip of the usable share keeps answering 200; draining and
+    /// stalled still answer 503; before the first 200, warming is a 503.
+    #[test]
+    fn once_ready_a_dip_of_the_usable_share_stays_ready() {
+        let lc = Lifecycle::default();
+        let c = cfg();
+        // 0.394 of the pairs usable, as measured after a takeover.
+        let dip = Inputs { pairs: 434, pairs_usable: 171, ..warm() };
+        // Before the first 200: warming, and nothing latched.
+        let v = lc.verdict(&c, &Inputs { uptime_s: 30.0, ..warm() });
+        assert_eq!(v.http(), Err("warming: up 30 s of 120\n".into()));
+        assert_eq!(lc.verdict(&c, &dip).http(), Err("warming: usable clock pairs 0.394 < 0.600 (171 of 434)\n".into()));
+        assert!(metrics(&lc, &c).contains("mlat_ng_ready_latched 0\n"));
+        // The first 200 latches.
+        assert_eq!(lc.verdict(&c, &warm()).http(), Ok("ok\n".into()));
+        assert!(metrics(&lc, &c).contains("mlat_ng_ready_latched 1\n"));
+        // A takeover's dip, and the other warming criteria: still 200.
+        for i in [dip.clone(), Inputs { pairs: 0, pairs_usable: 0, ..warm() }, Inputs { cells_fresh: 0, ..warm() }, Inputs { registry: 0, ..warm() }]
+        {
+            let v = lc.verdict(&c, &i);
+            assert_eq!(v.http(), Ok("ok\n".into()), "{i:?}");
+            assert_eq!(proxy_sees(&v.http()), "ok");
+        }
+        assert!(metrics(&lc, &c).contains("mlat_ng_ready_latch_held_total 4\n"));
+        // Stalled still takes the 200 away, latched or not, and gives it back.
+        let v = lc.verdict(&c, &Inputs { snapshot_age_s: Some(12.0), ..dip.clone() });
+        assert_eq!(v.http(), Err("stalled: engine snapshot 12 s old\n".into()));
+        assert_eq!(proxy_sees(&v.http()), "fail");
+        assert!(lc.verdict(&c, &dip).is_ready());
+        // Draining wins over everything, for good.
+        lc.drain();
+        for i in [warm(), dip.clone(), Inputs { snapshot_age_s: Some(60.0), ..warm() }] {
+            let v = lc.verdict(&c, &i);
+            assert_eq!(v.http(), Err("draining\n".into()));
+            assert_eq!(proxy_sees(&v.http()), "draining");
+        }
+    }
+
+    #[test]
+    fn without_the_latch_a_dip_is_warming_again() {
+        let lc = Lifecycle::default();
+        let c = ReadyConfig { latch: false, ..cfg() };
+        assert!(lc.verdict(&c, &warm()).is_ready());
+        let v = lc.verdict(&c, &Inputs { pairs: 434, pairs_usable: 171, ..warm() });
+        assert!(matches!(v, Verdict::Warming(_)), "{v:?}");
+        let m = metrics(&lc, &c);
+        assert!(m.contains("mlat_ng_ready_latched 0\n") && m.contains("mlat_ng_ready_latch_held_total 0\n"), "{m}");
+    }
+
+    /// The serve gate goes through the same verdict: its first Ready latches.
+    #[tokio::test]
+    async fn the_gate_opening_latches_readiness() {
+        let addr = free_addr().await;
+        let lc = Arc::new(Lifecycle::default());
+        let c = cfg();
+        let (l2, poll) = (lc.clone(), Duration::from_millis(10));
+        let task = tokio::spawn(serve_gated(addr.clone(), lc.clone(), move || l2.verdict(&c, &warm()), Duration::from_secs(60), poll, hold));
+        for _ in 0..200 {
+            if TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(lc.verdict(&c, &Inputs { pairs_usable: 0, ..warm() }).is_ready());
+        lc.drain();
+        task.await.unwrap().unwrap();
     }
 
     /// A free loopback address (bound, then released).
@@ -491,8 +616,11 @@ mod tests {
     fn flags_defaults_env_names_and_checks() {
         let a = crate::Args::try_parse_from(["mlat-ng"]).unwrap();
         let (c, gate, drain) = crate::redundancy(&a).unwrap();
-        assert_eq!((c.min_uptime_s, c.min_usable, c.feed), (120.0, 0.6, false));
+        assert_eq!((c.min_uptime_s, c.min_usable, c.feed, c.latch), (120.0, 0.6, false, true));
         assert_eq!((gate.as_secs(), drain.as_secs()), (240, 30));
+        let a = crate::Args::try_parse_from(["mlat-ng", "--ready-latch", "false"]).unwrap();
+        assert!(!crate::redundancy(&a).unwrap().0.latch);
+        assert!(crate::Args::try_parse_from(["mlat-ng", "--ready-latch", "maybe"]).is_err());
         let set = ["mlat-ng", "--feed", "a=x:1", "--serve-gate-max-s", "0", "--drain-max-s", "5", "--ready-min-usable", "0.8"];
         let a = crate::Args::try_parse_from(set).unwrap();
         let (c, gate, drain) = crate::redundancy(&a).unwrap();
@@ -509,6 +637,7 @@ mod tests {
             ("drain_max_s", "MLAT_NG_DRAIN_MAX_S"),
             ("ready_min_uptime_s", "MLAT_NG_READY_MIN_UPTIME_S"),
             ("ready_min_usable", "MLAT_NG_READY_MIN_USABLE"),
+            ("ready_latch", "MLAT_NG_READY_LATCH"),
         ] {
             let arg = cmd.get_arguments().find(|a| a.get_id() == id).unwrap();
             assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env));

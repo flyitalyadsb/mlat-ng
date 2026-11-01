@@ -123,10 +123,13 @@ network's data (mixed mode).
   so feeders send what they already send to production. mlat: an aircraft
   seen by >= 2 receivers without an ADS-B position for 120 s (or with >10%
   of its sync points rejected, or in its periodic forced window) is asked
-  from every receiver that sees it. sync: from each receiver's rate report,
-  aircraft scored by the product of the two receivers' rates, greedy until
-  every peer has enough shared rate or 12 positions/s, at least 3. A
-  receiver with a distrusted clock gets 3 sync aircraft and no mlat.
+  from every receiver that sees it (the forced window comes every
+  `--serve-force-mlat-interval` seconds, default 600 as mlat-server's;
+  production's shards set MLAT_SERVER_FORCE_MLAT_INTERVAL=1200). sync: from
+  each receiver's rate report, aircraft scored by the product of the two
+  receivers' rates, greedy until every peer has enough shared rate or 12
+  positions/s, at least 3. A receiver with a distrusted clock gets 3 sync
+  aircraft and no mlat.
   Beyond mlat-server: an aircraft is asked for the moment it becomes wanted,
   not at each receiver's next rate report (~18 s).
 - **Results**: every published position goes back to the served receivers

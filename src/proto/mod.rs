@@ -64,9 +64,10 @@
 //!   slips through mlat-server's range checks.
 //! - A PROXY line followed by EOF is a quiet probe, not a denied handshake.
 //! - The name-collision rules of PR #14 (identity.py: refuse a live
-//!   duplicate, rename another receiver) need the receiver registry and are
-//!   the engine's; the random suffix of a name under 3 characters cannot
-//!   match the primary's anyway.
+//!   duplicate, replace a quiet one, rename another receiver) run on the
+//!   serve listener only (identity.rs): a shadow connection is a copy whose
+//!   primary already applied them. The random suffix of a name under 3
+//!   characters cannot match the primary's anyway.
 //! - `reconnect_in` is a fixed 10 / 900 (mlat-server adds +-10% jitter).
 //! - The idle close happens 150 s after the last line or frame; mlat-server
 //!   checks on its 30 s heartbeat tick, so somewhere in 150..180 s.
@@ -90,6 +91,7 @@ use crate::types::Event;
 mod conn;
 mod framing;
 mod handshake;
+mod identity;
 mod messages;
 pub(crate) mod py;
 mod writer;
@@ -99,6 +101,8 @@ pub mod session;
 #[cfg(test)]
 mod tests;
 
+pub use identity::Registry;
+
 #[derive(Debug, Clone)]
 pub struct ListenConfig {
     /// Never ask clients for traffic, never send results (see module docs).
@@ -106,6 +110,9 @@ pub struct ListenConfig {
     pub motd: String,
     /// AGPL notice URL appended to the motd.
     pub source_url: String,
+    /// The names connected here, for PR #14's duplicate checks
+    /// (identity.rs). Set on the serve listener, None on a shadow one.
+    pub identity: Option<Arc<Registry>>,
 }
 
 /// Lock-free counters exported on /metrics by main.rs.
@@ -133,6 +140,13 @@ pub struct Counters {
     pub dropped_full: AtomicU64,
     /// Bytes read from clients, compressed as on the wire.
     pub bytes_in: AtomicU64,
+    /// Serve listener, PR #14 (identity.rs): handshakes refused as a second
+    /// live client of a connected receiver (also in handshake_failed), quiet
+    /// connections replaced by their receiver's new one, and newcomers
+    /// renamed because another receiver had the name.
+    pub dup_refused: AtomicU64,
+    pub dup_replaced: AtomicU64,
+    pub dup_renamed: AtomicU64,
     /// Connections on a serve-mode listener: open, closed, and how long each
     /// waited for its first request and result (session.rs).
     pub serve: session::ServeSessions,

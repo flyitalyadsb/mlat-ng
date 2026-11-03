@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Instant};
 
 use super::framing::{Inflater, SYNC_TRAILER};
-use super::{serve_with, Counters, Limits, ListenConfig};
+use super::{serve_with, Counters, Limits, ListenConfig, Registry};
 use crate::types::{ClockType, ConnId, Event, ReceiverInfo, ToClient};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -228,11 +228,16 @@ fn fast_limits() -> Limits {
 }
 
 async fn start_with(shadow: bool, limits: Limits, cap: usize) -> H {
+    // A serve listener checks duplicates, as main.rs sets it up.
+    start_full(shadow, (!shadow).then(|| Arc::new(Registry::default())), limits, cap).await
+}
+
+async fn start_full(shadow: bool, identity: Option<Arc<Registry>>, limits: Limits, cap: usize) -> H {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let (tx, ev) = mpsc::channel(cap);
     let c = Arc::new(Counters::default());
-    let cfg = Arc::new(ListenConfig { shadow, motd: "test motd".into(), source_url: "https://example.org/mlat-ng".into() });
+    let cfg = Arc::new(ListenConfig { shadow, motd: "test motd".into(), source_url: "https://example.org/mlat-ng".into(), identity });
     tokio::spawn(serve_with(l, cfg, tx, c.clone(), Arc::new(limits)));
     H { addr, ev, c }
 }
@@ -943,4 +948,110 @@ async fn served_sessions_are_timed_to_their_first_request_and_result() {
     let _c = Client::ready(h.addr, "none").await;
     h.connected().await;
     assert_eq!(h.n(|c| &c.serve.opened), 0);
+}
+
+// ------------------------------------------------------------ PR #14 duplicates (identity.rs)
+
+/// A second live client of a served receiver is refused, with mlat-server's
+/// message and a retry of ~45 s + 15 s; the first one is never touched.
+#[tokio::test]
+async fn served_live_duplicate_is_refused_and_the_first_keeps_running() {
+    let mut h = start_with(false, fast_limits(), 4096).await;
+    let mut c1 = Client::ready(h.addr, "none").await;
+    let (conn1, info1, _tx) = h.connected().await;
+    assert_eq!(info1.user, "test-feeder");
+    c1.send(&["{\"heartbeat\":{\"client_time\":1729760000.123}}"]).await;
+    h.wait_for(|c| &c.msgs_other, 1).await;
+
+    let mut c2 = Client::connect(h.addr, &hs_line(&["none"], |_| {})).await;
+    let r = c2.reply().await;
+    let reason = r["deny"][0].as_str().unwrap();
+    assert_eq!(reason, "Receiver test-feeder is already connected to this server and still sending. Are two MLAT clients \
+of this receiver pointed here (e.g. both ports 30100 and 31090, or a second host)? Keep one.");
+    let retry = r["reconnect_in"].as_f64().unwrap();
+    assert!((54.0..=66.0).contains(&retry), "{retry}");
+    assert_eq!(retry.fract(), 0.0);
+    c2.expect_closed().await;
+    assert_eq!((h.n(|c| &c.dup_refused), h.n(|c| &c.handshake_failed)), (1, 1));
+    // No Connect for the duplicate, no Disconnect for the first.
+    sleep(Duration::from_millis(50)).await;
+    h.assert_no_event();
+    assert!(!c1.read_for(Duration::from_millis(50)).await, "the first client was closed");
+
+    // Once the first has gone, the receiver connects again at once.
+    drop(c1);
+    h.until_disconnect(conn1).await;
+    let _c3 = Client::ready(h.addr, "none").await;
+    let (_, info3, _) = h.connected().await;
+    assert_eq!(info3.user, "test-feeder");
+}
+
+/// The receiver coming back over a new connection while the old one is quiet
+/// (half-open) takes over: the old one is closed, and the engine sees its
+/// Disconnect before the new Connect (one receiver, never two).
+#[tokio::test]
+async fn served_quiet_duplicate_is_replaced_disconnect_first() {
+    let reg = Arc::new(Registry::with_windows(0.2, 0.1));
+    let mut h = start_full(false, Some(reg), fast_limits(), 4096).await;
+    let mut c1 = Client::ready(h.addr, "none").await;
+    let (conn1, _, _) = h.connected().await;
+    sleep(Duration::from_millis(300)).await;
+
+    let mut c2 = Client::connect(h.addr, &hs_line(&["none"], |_| {})).await;
+    assert_eq!(c2.reply().await["compress"], "none");
+    c1.expect_closed().await;
+    assert!(h.until_disconnect(conn1).await.is_empty());
+    let (conn2, info2, _) = h.connected().await;
+    assert_ne!(conn2, conn1);
+    assert_eq!(info2.user, "test-feeder");
+    assert_eq!((h.n(|c| &c.dup_replaced), h.n(|c| &c.dup_refused)), (1, 0));
+}
+
+/// A line or frame keeps a connection live: a client that keeps talking is
+/// never replaced, however long it has been connected.
+#[tokio::test]
+async fn served_connection_that_keeps_sending_stays_live() {
+    let reg = Arc::new(Registry::with_windows(0.2, 0.1));
+    let mut h = start_full(false, Some(reg), fast_limits(), 4096).await;
+    let mut c1 = Client::ready(h.addr, "none").await;
+    h.connected().await;
+    for _ in 0..5 {
+        sleep(Duration::from_millis(80)).await;
+        c1.send(&["{\"heartbeat\":{\"client_time\":1729760000.123}}"]).await;
+    }
+    h.wait_for(|c| &c.msgs_other, 5).await;
+    let mut c2 = Client::connect(h.addr, &hs_line(&["none"], |_| {})).await;
+    assert!(c2.reply().await["deny"].is_array());
+    assert_eq!(h.n(|c| &c.dup_refused), 1);
+}
+
+/// Another receiver asking for a name already connected is renamed, told so
+/// in its motd, and listed under its new name (clients.json is by name).
+#[tokio::test]
+async fn served_other_receiver_with_the_name_is_renamed() {
+    let mut h = start_with(false, fast_limits(), 4096).await;
+    let _c1 = Client::ready(h.addr, "none").await;
+    h.connected().await;
+    let line = hs_line(&["none"], |v| v["uuid"] = json!("0b5c6f0e-1d3a-4f6b-9a2e-3c4d5e6f7a8b"));
+    let mut c2 = Client::connect(h.addr, &line).await;
+    let r = c2.reply().await;
+    let (_, info2, _) = h.connected().await;
+    let n = info2.user.clone();
+    assert!(n.starts_with("test-feeder_") && n.len() == "test-feeder_".len() + 3, "{n}");
+    assert!(r["motd"].as_str().unwrap().contains(&format!("The name test-feeder is taken by another receiver: you are connected as {n}.")));
+    assert_eq!(info2.connection, format!("{n} v3 dump1090 0.3.91 tcp none"));
+    assert_eq!(h.n(|c| &c.dup_renamed), 1);
+}
+
+/// A shadow listener takes every copy mlat-shadow-hub sends: its primary has
+/// already applied the checks.
+#[tokio::test]
+async fn shadow_listener_does_not_check_duplicates() {
+    let mut h = start().await;
+    let _c1 = Client::ready(h.addr, "none").await;
+    let _c2 = Client::ready(h.addr, "none").await;
+    let (a, _, _) = h.connected().await;
+    let (b, _, _) = h.connected().await;
+    assert_ne!(a, b);
+    assert_eq!(h.n(|c| &c.dup_refused) + h.n(|c| &c.dup_renamed), 0);
 }

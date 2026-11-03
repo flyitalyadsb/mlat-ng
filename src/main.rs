@@ -363,7 +363,14 @@ fn main() -> anyhow::Result<()> {
         // was bound at start.
         let serve_task = (!args.serve_listen.is_empty()).then(|| {
             tracing::info!(serve = %args.serve_listen, gate_max_s = args.serve_gate_max_s, "serve listener opens once warm");
-            let scfg = Arc::new(proto::ListenConfig { shadow: false, motd: args.motd.clone(), source_url: args.source_url.clone() });
+            // One registry for the listener's life: it stays across a reopen,
+            // like the connections it tracks (identity.rs, PR #14's checks).
+            let scfg = Arc::new(proto::ListenConfig {
+                shadow: false,
+                motd: args.motd.clone(),
+                source_url: args.source_url.clone(),
+                identity: Some(Arc::new(proto::Registry::default())),
+            });
             let (stx, sc, v) = (client_tx.clone(), counters.clone(), verdict.clone());
             let serve = move |l| proto::serve(l, scfg, stx, sc);
             tokio::spawn(ready::serve_gated(args.serve_listen.clone(), lifecycle.clone(), move || v(), serve_gate_max, ready::POLL, serve))
@@ -378,7 +385,7 @@ fn main() -> anyhow::Result<()> {
                 None => std::future::pending().await,
             }
         };
-        let cfg = Arc::new(proto::ListenConfig { shadow: args.shadow, motd: args.motd, source_url: args.source_url });
+        let cfg = Arc::new(proto::ListenConfig { shadow: args.shadow, motd: args.motd, source_url: args.source_url, identity: None });
         // Its own task: the shadow listener keeps accepting while draining.
         let mut client_task = tokio::spawn(proto::serve(client_l, cfg, client_tx, counters.clone()));
         tokio::select! {
@@ -468,6 +475,9 @@ fn render_metrics(
     m("conn_accepted_total", "counter", l(&c.accepted));
     m("conn_handshake_ok_total", "counter", l(&c.handshake_ok));
     m("conn_handshake_failed_total", "counter", l(&c.handshake_failed));
+    m("serve_duplicate_refused_total", "counter", l(&c.dup_refused));
+    m("serve_duplicate_replaced_total", "counter", l(&c.dup_replaced));
+    m("serve_renamed_total", "counter", l(&c.dup_renamed));
     m("conn_disconnects_total", "counter", l(&c.disconnects));
     m("conn_active", "gauge", l(&c.active));
     m("msgs_sync_total", "counter", l(&c.msgs_sync));

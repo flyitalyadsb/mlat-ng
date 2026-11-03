@@ -47,8 +47,9 @@ pub(crate) struct Accepted {
     pub result_format: ResultFormat,
     /// `hs.get('return_stats', False)`, echoed back verbatim like mlat-server.
     pub return_stats: Value,
-    /// Extra motd paragraphs (PR #14's placeholder-uuid note).
-    pub notes: Vec<&'static str>,
+    /// Extra motd paragraphs (PR #14's placeholder-uuid note, and the
+    /// rename note of identity.rs on a serve listener).
+    pub notes: Vec<String>,
 }
 
 /// The source address and port of a PROXY v1 line (`PROXY TCP4 src dst
@@ -125,7 +126,7 @@ fn check(hs: &Value) -> Result<Accepted, Refusal> {
     let mut notes = Vec::new();
     let uuid = match hs.get("uuid") {
         Some(Value::String(s)) if is_placeholder_uuid(s) => {
-            notes.push(PLACEHOLDER_NOTE);
+            notes.push(PLACEHOLDER_NOTE.to_string());
             None
         }
         Some(Value::String(s)) => Some(s.clone()),
@@ -281,7 +282,7 @@ pub(crate) fn sanitize_user(raw: &str) -> String {
 }
 
 /// mlat-server's expanded motd (PR #14 layout, notes included).
-fn expanded_motd(motd: &str, notes: &[&str], agpl_url: &str) -> String {
+fn expanded_motd(motd: &str, notes: &[String], agpl_url: &str) -> String {
     let notes: String = notes.iter().map(|n| format!("\n        {n}\n")).collect();
     format!(
         "\n\n        {motd}\n        {notes}\n        The multilateration server source code is available under\n        \
@@ -304,9 +305,10 @@ pub(crate) fn accept_line(a: &Accepted, cfg: &ListenConfig) -> String {
     )
 }
 
-/// The refusal reply (no newline).
-pub(crate) fn deny_line(reason: &str) -> String {
-    format!("{{\"deny\":[{}],\"reconnect_in\":900}}", Value::String(reason.to_string()))
+/// The refusal reply (no newline). `reconnect_in` is 900 for every refusal
+/// but a live duplicate's (identity.rs).
+pub(crate) fn deny_line(reason: &str, reconnect_in: f64) -> String {
+    format!("{{\"deny\":[{}],\"reconnect_in\":{}}}", Value::String(reason.to_string()), reconnect_in)
 }
 
 #[cfg(test)]
@@ -435,7 +437,7 @@ mod tests {
             assert!(is_placeholder_uuid(u), "{u}");
             let a = accept(with("uuid", json!(u)));
             assert_eq!(a.uuid, None);
-            assert_eq!(a.notes, vec![PLACEHOLDER_NOTE]);
+            assert_eq!(a.notes, vec![PLACEHOLDER_NOTE.to_string()]);
         }
         for u in ["6a9423e0-7ba6-4672-81a4-81b715ac1ad2", "<28710a05-d56e-4ca1-8b1b-12f6d88d2c0f", "b2a3a57040f17a3d", "3f9c‑a1b2‑4d5e‑7f90‑123456789abc"] {
             assert!(!is_placeholder_uuid(u), "{u}");
@@ -486,7 +488,7 @@ mod tests {
 
     #[test]
     fn replies() {
-        let cfg = ListenConfig { shadow: true, motd: "Ciao".into(), source_url: "https://example.org/mlat-ng".into() };
+        let cfg = ListenConfig { shadow: true, motd: "Ciao".into(), source_url: "https://example.org/mlat-ng".into(), identity: None };
         let a = accept(with("uuid", json!("XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX")));
         let line = accept_line(&a, &cfg);
         let v: Value = serde_json::from_str(&line).unwrap();
@@ -501,7 +503,9 @@ mod tests {
         let keys = ["compress", "reconnect_in", "selective_traffic", "heartbeat", "return_results", "return_stats", "rate_reports", "forward_all_ac", "motd"];
         let pos: Vec<usize> = keys.iter().map(|k| line.find(&format!("\"{k}\"")).unwrap()).collect();
         assert!(pos.windows(2).all(|w| w[0] < w[1]));
-        let d: Value = serde_json::from_str(&deny_line("Bad \"values\"")).unwrap();
+        let d: Value = serde_json::from_str(&deny_line("Bad \"values\"", 900.0)).unwrap();
         assert_eq!(d, json!({"deny": ["Bad \"values\""], "reconnect_in": 900}));
+        // A whole number of seconds, as util.fuzzy() returns (round(x, 0)).
+        assert!(deny_line("x", 57.0).ends_with("\"reconnect_in\":57}"));
     }
 }

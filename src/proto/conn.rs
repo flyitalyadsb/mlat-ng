@@ -5,17 +5,18 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use tracing::{debug, info};
 
 use super::framing::{FrameError, InBuf, Inflater};
 use super::handshake::{self, Accepted, Outcome};
+use super::identity::{Admission, Liveness, Registry, Ticket, RETRY_MARGIN_S};
 use super::messages::{self, Msg};
 use super::py;
 use super::session::Session;
@@ -30,6 +31,8 @@ enum End {
     Idle,
     /// The engine sent ToClient::Close.
     Closed,
+    /// A new connection of the same receiver took over (identity.rs).
+    Replaced,
     Io,
     Frame(FrameError),
 }
@@ -50,7 +53,7 @@ pub(super) async fn run(
     // Behind the proxy every TCP peer is the proxy: log the PROXY source.
     let mut source_ip = peer.ip().to_string();
     let mut source_port = peer.port().to_string();
-    let a = match handshake_phase(&mut rd, &mut inb, (&mut source_ip, &mut source_port), &limits, &counters.bytes_in).await {
+    let mut a = match handshake_phase(&mut rd, &mut inb, (&mut source_ip, &mut source_port), &limits, &counters.bytes_in).await {
         Hs::Accept(a) => a,
         // PR #14: a TCP probe (connect, send nothing, leave) is not an event.
         Hs::Probe => {
@@ -65,9 +68,25 @@ pub(super) async fn run(
         Hs::Deny(reason) => {
             Counters::inc(&counters.handshake_failed);
             info!(conn, source = %source_ip, %reason, "handshake denied");
-            deny(&mut wr, &reason, &limits).await;
+            deny(&mut wr, &reason, 900.0, &limits).await;
             return;
         }
+    };
+
+    // Serve listener: PR #14's duplicate checks, before the reply (identity.rs).
+    // The ticket holds the name until after the Disconnect below.
+    let ticket = match &cfg.identity {
+        None => None,
+        Some(reg) => match admit(reg, conn, &mut a, &counters).await {
+            Ok(t) => Some(t),
+            Err((reason, retry_s)) => {
+                Counters::inc(&counters.handshake_failed);
+                Counters::inc(&counters.dup_refused);
+                info!(conn, source = %source_ip, %reason, retry_s, "handshake denied: duplicate receiver");
+                deny(&mut wr, &reason, retry_s, &limits).await;
+                return;
+            }
+        },
     };
 
     let msgs = Arc::new(AtomicU64::new(0));
@@ -110,7 +129,8 @@ pub(super) async fn run(
     let writer = tokio::spawn(writer::run(wr, rx, close_tx, reply, wcfg, limits.clone()));
 
     let mut sink = Sink { conn, engine: &engine, n: Local::default(), msgs: &msgs, rx_time: 0.0 };
-    let end = read_messages(&mut rd, &mut inb, &mut sink, &counters, &limits, &a, close_rx).await;
+    let ident = ticket.as_ref().map(|t| (&*t.live, &*t.kick));
+    let end = read_messages(&mut rd, &mut inb, &mut sink, &counters, &limits, &a, close_rx, ident).await;
     sink.flush(&counters);
     writer.abort();
 
@@ -198,9 +218,58 @@ async fn read_line(rd: &mut OwnedReadHalf, inb: &mut InBuf, limits: &Limits, byt
     }
 }
 
+/// How long a newcomer waits for the quiet connection it replaces to close
+/// (it closes as soon as its read loop sees the kick).
+const REPLACE_WAIT: Duration = Duration::from_secs(5);
+
+/// PR #14's duplicate checks for a served connection (identity.rs). Renames
+/// `a` when another receiver has its name. When the receiver's old
+/// connection is quiet, that one is told to close first, so its Disconnect
+/// reaches the engine before this connection's Connect.
+async fn admit(reg: &Arc<Registry>, conn: ConnId, a: &mut Accepted, counters: &Counters) -> Result<Ticket, (String, f64)> {
+    let mut replacing = false;
+    for _ in 0..3 {
+        match reg.admit(conn, &a.user, a.uuid.as_deref(), (a.lat, a.lon, a.alt)) {
+            Admission::Admit { ticket, note } => {
+                if let Some(note) = note {
+                    Counters::inc(&counters.dup_renamed);
+                    // `connection` starts with the name (handshake.rs).
+                    let rest = a.connection.strip_prefix(a.user.as_str()).unwrap_or(&a.connection).to_string();
+                    a.connection = format!("{}{rest}", ticket.user());
+                    a.user = ticket.user().to_string();
+                    a.notes.push(note);
+                }
+                return Ok(ticket);
+            }
+            Admission::Refuse { reason, retry_s } => return Err((reason, retry_s)),
+            Admission::Replace { kick, gone } => {
+                if !replacing {
+                    replacing = true;
+                    Counters::inc(&counters.dup_replaced);
+                }
+                let released = gone.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                kick.notify_one();
+                let _ = timeout(REPLACE_WAIT, released).await;
+            }
+        }
+    }
+    // The old connection would not go (its engine send is stuck): try later.
+    Err((format!("Receiver {} is still connected to this server. Try again shortly.", a.user), RETRY_MARGIN_S))
+}
+
+/// Resolves when the registry tells this connection to close; never without one.
+async fn kicked(k: Option<&Notify>) {
+    match k {
+        Some(k) => k.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Write the refusal (best effort, bounded) and close.
-async fn deny(wr: &mut OwnedWriteHalf, reason: &str, limits: &Limits) {
-    let mut line = handshake::deny_line(reason).into_bytes();
+async fn deny(wr: &mut OwnedWriteHalf, reason: &str, reconnect_in: f64, limits: &Limits) {
+    let mut line = handshake::deny_line(reason, reconnect_in).into_bytes();
     line.push(b'\n');
     let _ = timeout(limits.close_write_timeout, async {
         wr.write_all(&line).await?;
@@ -329,6 +398,9 @@ async fn read_messages(
     limits: &Limits,
     a: &Accepted,
     close_rx: oneshot::Receiver<()>,
+    // A served connection's liveness (touched per line or frame) and the
+    // registry's kick (identity.rs).
+    ident: Option<(&Liveness, &Notify)>,
 ) -> End {
     let zlib = a.compress != "none";
     let mut inflater = Inflater::new();
@@ -355,6 +427,9 @@ async fn read_messages(
         };
         if progressed {
             last = Instant::now();
+            if let Some((live, _)) = ident {
+                live.touch();
+            }
         }
         sink.flush(counters);
 
@@ -383,6 +458,7 @@ async fn read_messages(
                 // The writer is gone without a Close: keep reading.
                 Err(_) => close_armed = false,
             },
+            () = kicked(ident.map(|(_, k)| k)) => return End::Replaced,
         }
     }
 }

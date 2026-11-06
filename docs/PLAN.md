@@ -3,6 +3,10 @@
 Status: v0.1, written 2026-10-23/24. Test window: 7 days from the moment all
 three contenders receive traffic.
 
+> This is the plan as written before the test, with a section added for each
+> feature as it landed. mlat-ng has served every MLAT region of the network
+> since 2026-11-06: see the [README](../README.md) for what runs today.
+
 ## Why a new server
 
 The production server (flyitalyadsb/mlat-server, Python + Cython, a fork of

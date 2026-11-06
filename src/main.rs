@@ -122,7 +122,7 @@ struct Args {
     survey_apply_min_m: f64,
     #[arg(long, default_value = "flyitalyadsb MLAT [mlat-ng]", env = "MLAT_NG_MOTD")]
     motd: String,
-    #[arg(long, default_value = "https://github.com/nesso-labs/mlat-ng", env = "MLAT_NG_SOURCE_URL")]
+    #[arg(long, default_value = "https://github.com/flyitalyadsb/mlat-ng", env = "MLAT_NG_SOURCE_URL")]
     source_url: String,
     /// Seconds to collect copies of a message before solving.
     #[arg(long, default_value_t = 0.9, env = "MLAT_NG_MLAT_DELAY")]

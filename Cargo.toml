@@ -3,8 +3,9 @@ name = "mlat-ng"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "flyitalyadsb next-generation Mode S / Mode A/C multilateration server"
-repository = "https://github.com/nesso-labs/mlat-ng"
+description = "FlyItalyADSB multilateration (MLAT) server: Mode S, one process for the whole network, wire-compatible with mlat-client"
+repository = "https://github.com/flyitalyadsb/mlat-ng"
+homepage = "https://flyitalyadsb.com/en/"
 
 [[bin]]
 name = "mlat-ng"

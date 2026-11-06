@@ -1,14 +1,93 @@
 # mlat-ng
 
-Next-generation Mode S / Mode A/C multilateration server for the
-flyitalyadsb network. Rust, one process for the whole network, wire-compatible
-with every mlat-client from 0.2.13 to 0.4.2.
+**The multilateration (MLAT) server of [FlyItalyADSB](https://flyitalyadsb.com/en/?utm_source=github&utm_campaign=mlat-ng).**
+It is written in Rust and runs as one process for the whole network. It is
+wire-compatible with every mlat-client from 0.2.13 to 0.4.2, so feeders change
+nothing.
 
-Status: **v0.1, shadow test** — it receives a copy of every feeder's stream
-(through mlat-proxy's tee and mlat-shadow-hub in nesso-infra) and is compared
-for 7 days against the production mlat-server and against flightportrait/mlatd
-by `mlat-judge`. Its results reach nobody but the judge. See
-[docs/PLAN.md](docs/PLAN.md) for the design, the test and the decision rule.
+FlyItalyADSB is a global community network, born in Italy in 2020, with about
+3,200 receivers: they send us their data directly, ADS-B and our own
+multilateration (MLAT), open and unfiltered. A free live map, a REST API and an
+MCP server for AI assistants.
+
+## Status
+
+One process serves every MLAT feeder of the network, on about 2.4 CPU cores.
+
+A second instance runs on another server and receives the same traffic. When
+the first one fails or restarts, the second takes over.
+
+## What feeders and users get
+
+Measured from 26 to 31 October 2026, when mlat-ng ran beside mlat-server on a
+copy of the same feeder traffic and both were scored against the aircraft's
+own ADS-B positions ([docs/PLAN.md](docs/PLAN.md)). The figures are for the
+build that now serves the network. Since mlat-ng chooses the traffic itself,
+the two can no longer be compared side by side.
+
+- **More precise positions.** On the same aircraft at the same moment,
+  mlat-ng's position was closer to the ADS-B truth in 66% of cases. Its median
+  error was 177 m, against 273 m for mlat-server.
+- **More aircraft without ADS-B.** mlat-ng located 9.1% more aircraft-minutes
+  of aircraft that send no ADS-B position, such as military and older
+  aircraft.
+- **Fewer impossible jumps.** 0.53% of its positions were implausible, against
+  0.85%.
+- **Aircraft heard by only two receivers.** mlat-server needs three receivers
+  and an altitude, or four. mlat-ng also places aircraft heard by two, from
+  their motion and the receivers' coverage. Their median error was about
+  110 m (measured on 2 November 2026).
+- **No real aircraft hidden.** mlat-server dropped every address up to
+  0xF423F to hide fake Mode A/C tracks. With them went real aircraft whose
+  addresses are low, such as those from Africa, Qatar and Mexico. mlat-ng drops
+  only the exact fake pattern.
+- **One network, no borders.** One process sees every pair of receivers. With
+  five regional shards, a receiver near the edge of its shard could not pair
+  with its neighbours across the edge.
+- **Restarts and failures without a gap.** A warm standby takes over. In a
+  failover test on 3 November 2026, 478 feeders moved over in a median of
+  5.9 s (95th percentile 7.0 s). With mlat-server, a restart made every feeder
+  of the region reconnect, which took up to about a minute.
+- **Antenna positions corrected.** The engine measures each receiver's
+  position from the clock-sync residuals. It corrects the ones that are
+  reliably off, so a wrong antenna position no longer spoils its neighbours'
+  results.
+- **Lightcone for every feeder.** The same engine learns each receiver's
+  coverage. Lightcone uses it to show the aircraft that flew past a receiver
+  that the receiver did not receive.
+
+## How it works, compared
+
+| | mlat-server (as we ran it) | mlat-ng |
+|---|---|---|
+| Process | one thread per process; the network split into five regional shards | one process for the whole network: network I/O on every core, one engine thread owning the state, aircraft workers on their own threads ([docs/MULTICORE.md](docs/MULTICORE.md)) |
+| Clock pairs | windowed fit and PI drift loop | a Kalman filter per pair (offset and drift), whose variance grows with age |
+| Timestamp normalisation | minimum spanning tree | joint weighted least squares over every usable pair |
+| Solver | diagonal errors, numeric Jacobian | full time covariance, analytic Jacobian, multi-start with a mirror-solution check |
+| Tracking | filter fed with fixes only | EKF fed with fixes and directly with time differences, so groups of 2–3 receivers keep a track alive |
+| Inputs | mlat-client | mlat-client, plus the same receiver's Beast feed, merged into one receiver |
+| Self-check | none | 5% of ADS-B sync points are held out and multilaterated against their own ADS-B position: a continuous accuracy figure |
+| Failover | none | a warm standby: `/readyz`, a drain on SIGTERM, and receivers that keep their clock pairs across a takeover |
+
+## Feed the network
+
+With a Raspberry Pi, an RTL-SDR dongle and an antenna (about €55–110) you send
+your receiver's data to the network. In return you get the API with Pro limits
+for free, and you see what your receiver can't see on its own.
+
+Your mlat-client reaches this server in either of two ways:
+- the [install script](https://github.com/flyitalyadsb/fly-italy-adsb);
+- ultrafeeder or adsb.im, which list FlyItalyADSB.
+
+See [how to feed](https://flyitalyadsb.com/en/community/feeder/?utm_source=github&utm_campaign=mlat-ng).
+[Lightcone](https://flyitalyadsb.com/en/community/lightcone/?utm_source=github&utm_campaign=mlat-ng) shows each
+receiver the aircraft that flew past it and it did not receive. Lightcone needs MLAT.
+
+## Using the positions
+
+MLAT positions reach the [live map](https://map.flyitalyadsb.com/?utm_source=github&utm_campaign=mlat-ng) and the
+[API](https://github.com/flyitalyadsb/adsb-api) next to ADS-B, each with its
+source marked. Commercial use is allowed on every plan, Free included.
 
 ## Build, test, run
 
@@ -24,7 +103,7 @@ Every flag also reads an environment variable (`MLAT_NG_*`, see `--help`).
 |---|---|
 | 30100 | mlat-client connections (PROXY v1 line accepted) |
 | 31003 | BaseStation (SBS) MSG,3 results, mlat-server's layout; Mode A/C tracks as `~F0xxxx` |
-| 9100 | `/metrics` (Prometheus), `/state.json`, `/healthz`, `/receivers.json` (receiver positions by UUID; cluster-internal), `/clients.json` (served feeders in mlat-server's clients.json layout, source addresses included; cluster-internal) |
+| 9100 | `/metrics` (Prometheus), `/state.json`, `/healthz`, `/receivers.json` (receiver positions by UUID; keep this port private), `/clients.json` (served feeders in mlat-server's clients.json layout, source addresses included; keep this port private) |
 | 31004 | bench SBS output, feed mode only (`--bench-sbs-listen`) |
 
 ### Feed mode
@@ -134,13 +213,62 @@ positions: keep them out of the repository.
 | `src/replay.rs` | offline replay of feed captures |
 | `src/sim.rs` | end-to-end simulation test |
 
-## Deploy
+## Container image
 
-Image: `ghcr.io/nesso-labs/mlat-ng:sha-<commit>` (built by `.github/workflows/build.yml`
-on every push to main). Kubernetes manifests live in nesso-infra:
-`k8s/flyitalyadsb/base/mlat-contenders.yaml`; the production tag is pinned in
-`k8s/flyitalyadsb/production/kustomization.yaml`.
+`ghcr.io/flyitalyadsb/mlat-ng:sha-<commit>` and `:main`, built by
+[.github/workflows/build.yml](.github/workflows/build.yml) on every push to main.
+
+## Credits
+
+mlat-ng talks to [mlat-client](https://github.com/wiedehopf/mlat-client) and
+keeps the behaviour feeders know from
+[mlat-server](https://github.com/wiedehopf/mlat-server). Both were written by
+Oliver Jowett ([mutability](https://github.com/mutability)) and are maintained
+by wiedehopf. From mlat-server, mlat-ng ports the traffic selection and the
+duplicate-receiver rules, and it keeps the `clients.json` layout. Thank you
+to both.
 
 ## License
 
-AGPL-3.0-or-later.
+[AGPL-3.0-or-later](LICENSE). If you run a modified version for others, offer
+them its source. mlat-ng does this in the message of the day it sends to every
+mlat-client (`--source-url`, `MLAT_NG_SOURCE_URL`).
+
+<details>
+<summary>In italiano</summary>
+
+mlat-ng è il server di multilaterazione (MLAT) di FlyItalyADSB. È scritto in
+Rust e gira come un solo processo per tutta la rete. È compatibile con ogni
+mlat-client dalla 0.2.13 alla 0.4.2, quindi i feeder non cambiano niente.
+
+FlyItalyADSB è una rete community globale, nata in Italia nel 2020, con circa
+3.200 ricevitori: ci mandano i dati direttamente, ADS-B e multilaterazione
+nostra, aperti e non filtrati.
+
+Un solo processo serve tutti i feeder MLAT della rete con circa 2,4 core. Una seconda istanza gira su un
+altro server e riceve lo stesso traffico: se la prima si ferma o si riavvia,
+prende il suo posto.
+
+Rispetto a mlat-server, misurato dal 26 al 31 ottobre 2026 sullo stesso
+traffico e confrontato con le posizioni ADS-B degli aerei:
+- **posizioni più precise**: sullo stesso aereo nello stesso istante, quella di
+  mlat-ng era la più vicina al vero nel 66% dei casi; l'errore mediano era di
+  177 m, contro i 273 m di mlat-server;
+- **più aerei senza ADS-B**: il 9,1% di aerei-minuto in più, come i militari e
+  gli aerei più vecchi;
+- **meno salti impossibili**: 0,53% delle posizioni contro 0,85%;
+- **aerei ricevuti da due soli ricevitori**: mlat-ng li posiziona, mlat-server
+  no;
+- **nessun aereo vero nascosto**: niente filtro sugli indirizzi bassi, per
+  esempio di Africa, Qatar e Messico;
+- **riavvii e guasti senza buchi**: una riserva calda prende il posto
+  dell'istanza attiva, e i feeder si spostano in circa 6 secondi;
+- **posizioni delle antenne corrette** dai dati della rete, e la copertura
+  per Lightcone.
+
+Con un Raspberry Pi, un dongle RTL-SDR e un'antenna (55–110 € circa) mandi alla
+rete i dati del tuo ricevitore. In cambio hai l'API con i limiti Pro gratis e
+vedi quello che il tuo ricevitore da solo non può vedere.
+[Diventa feeder](https://flyitalyadsb.com/community/feeder/?utm_source=github&utm_campaign=mlat-ng).
+
+</details>

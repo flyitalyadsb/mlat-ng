@@ -28,7 +28,7 @@ and the altitude model. That was fine at 0.36 core for 3,203 receivers
 (24/10). Since then coverage (Lightcone), survey, the altitude model, 2-site
 and the hybrid have been added to the same thread.
 
-Live, 2026-10-28 ~09:00Z (`top -H` on nesso-worker-9, EPYC 7542, image
+Live, 2026-10-28 ~09:00Z (`top -H` on a cluster worker, EPYC 7542, image
 sha-5d7dba6), before the EU peak:
 
 | process | `engine` thread | `net` threads | |

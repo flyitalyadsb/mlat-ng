@@ -45,7 +45,7 @@ the two can no longer be compared side by side.
   five regional shards, a receiver near the edge of its shard could not pair
   with its neighbours across the edge.
 - **Restarts and failures without a gap.** A warm standby takes over. In a
-  failover test on 3 November 2026, 478 feeders moved over in a median of
+  failover test on 3 November 2026, the 478 connected feeders moved over in a median of
   5.9 s (95th percentile 7.0 s). With mlat-server, a restart made every feeder
   of the region reconnect, which took up to about a minute.
 - **Antenna positions corrected.** The engine measures each receiver's

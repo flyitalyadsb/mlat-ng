@@ -72,8 +72,8 @@ the two can no longer be compared side by side.
 ## Feed the network
 
 With a Raspberry Pi, an RTL-SDR dongle and an antenna (about €55–110) you send
-your receiver's data to the network. In return you get the API with Pro limits
-for free, and you see what your receiver can't see on its own.
+your receiver's data to the network. In return you get the API with Pro's limits
+and features, free, and you see what your receiver can't see on its own.
 
 Your mlat-client reaches this server in either of two ways:
 - the [install script](https://github.com/flyitalyadsb/fly-italy-adsb);
@@ -267,8 +267,8 @@ traffico e confrontato con le posizioni ADS-B degli aerei:
   per Lightcone.
 
 Con un Raspberry Pi, un dongle RTL-SDR e un'antenna (55–110 € circa) mandi alla
-rete i dati del tuo ricevitore. In cambio hai l'API con i limiti Pro gratis e
-vedi quello che il tuo ricevitore da solo non può vedere.
+rete i dati del tuo ricevitore. In cambio hai l'API con i limiti e le funzioni di
+Pro, gratis, e vedi quello che il tuo ricevitore da solo non può vedere.
 [Diventa feeder](https://flyitalyadsb.com/community/feeder/?utm_source=github&utm_campaign=mlat-ng).
 
 </details>

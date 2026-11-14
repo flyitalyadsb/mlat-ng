@@ -25,6 +25,15 @@
 //! 2-hop path does not; their predicted variances do not include them. As a
 //! last resort for disconnected groups they recovered +3% fixes and +8.6%
 //! Mode-S-only aircraft on a 10-minute capture, accuracy unchanged.
+//!
+//! Drift within a group. A group holds every copy of the same bytes over
+//! `mlat_delay`, so a receiver can have several copies of repeated identical
+//! frames (DF4/DF5/DF11 of an aircraft whose reply has not changed) up to
+//! ~1 s apart. The edges are read at each node's first copy; applying that
+//! one correction to the later copies too left them off by drift x elapsed
+//! time (tens of ppm on RTL-SDR sticks: microseconds, kilometres of range).
+//! `normalize_with_rates` solves the per-node rates from the pair drifts with
+//! the same normal equations and carries each copy from its node's first one.
 
 use crate::hashing::HashMap;
 use std::hash::Hash;
@@ -73,6 +82,8 @@ struct Edge {
     j: usize,
     theta: f64,
     var: f64,
+    /// d(theta)/d(s_i), s/s.
+    rate: f64,
 }
 
 fn components(n: usize, edges: &[Edge]) -> Vec<usize> {
@@ -95,11 +106,24 @@ fn components(n: usize, edges: &[Edge]) -> Vec<usize> {
 
 /// `edge(i, j)` for node indices i < j returns (theta, var) with
 /// s_j - s_i ~= theta for simultaneous events, evaluated at node i's time of
-/// this group, or None when that pair is not usable.
+/// this group, or None when that pair is not usable. Clocks are taken as not
+/// drifting within the group: see `normalize_with_rates`.
 pub fn normalize(
     nodes: &[Node],
     copies: &[Copy],
     mut edge: impl FnMut(usize, usize) -> Option<(f64, f64)>,
+) -> Option<Normalized> {
+    normalize_with_rates(nodes, copies, |i, j| edge(i, j).map(|(theta, var)| (theta, var, 0.0)))
+}
+
+/// As `normalize`, with `edge(i, j)` = (theta, var, rate), rate =
+/// d(theta)/d(s_i) in s/s. "Node i's time of this group" is its first copy in
+/// `copies` (engine::freeze reads the edges there); a node's later copies are
+/// carried from it with the per-node rate solved from the pair rates.
+pub fn normalize_with_rates(
+    nodes: &[Node],
+    copies: &[Copy],
+    mut edge: impl FnMut(usize, usize) -> Option<(f64, f64, f64)>,
 ) -> Option<Normalized> {
     let n = nodes.len();
     if n < 2 || copies.len() < 2 {
@@ -108,11 +132,18 @@ pub fn normalize(
     let mut edges = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
-            if let Some((theta, var)) = edge(i, j) {
-                if var.is_finite() && var > 0.0 && theta.is_finite() {
-                    edges.push(Edge { i, j, theta, var });
+            if let Some((theta, var, rate)) = edge(i, j) {
+                if var.is_finite() && var > 0.0 && theta.is_finite() && rate.is_finite() {
+                    edges.push(Edge { i, j, theta, var, rate });
                 }
             }
+        }
+    }
+    // Each node's first copy: where its edges were read.
+    let mut s_first = vec![f64::NAN; n];
+    for c in copies {
+        if s_first[c.node].is_nan() {
+            s_first[c.node] = c.s;
         }
     }
     let mut dropped = 0;
@@ -213,12 +244,26 @@ pub fn normalize(
         if sel.len() < 2 {
             return None;
         }
+        // Per-node rates relative to the reference: same normal equations,
+        // r_i - r_j = rate_ij (only needed when a node has later copies).
+        let mut b_rate = nalgebra::DVector::<f64>::zeros(k);
+        for e in &used {
+            let w = 1.0 / e.var;
+            if slot[e.i] != usize::MAX {
+                b_rate[slot[e.i]] += w * e.rate;
+            }
+            if slot[e.j] != usize::MAX {
+                b_rate[slot[e.j]] -= w * e.rate;
+            }
+        }
+        let r_sol = chol.solve(&b_rate);
+        let rate = |m: usize| if m == reference { 0.0 } else { r_sol[slot[m]] };
         let m = sel.len();
         let mut t = Vec::with_capacity(m);
         let mut cov = DMatrix::<f64>::zeros(m, m);
         for (r, &q) in sel.iter().enumerate() {
             let node = copies[q].node;
-            t.push(copies[q].s + corr(node));
+            t.push(copies[q].s + corr(node) + rate(node) * (copies[q].s - s_first[node]));
             for (cidx, &q2) in sel.iter().enumerate() {
                 let node2 = copies[q2].node;
                 if node != reference && node2 != reference {
@@ -261,7 +306,7 @@ pub fn member_components(n: usize, mut linked: impl FnMut(usize, usize) -> bool)
     for i in 0..n {
         for j in (i + 1)..n {
             if linked(i, j) {
-                edges.push(Edge { i, j, theta: 0.0, var: 1.0 });
+                edges.push(Edge { i, j, theta: 0.0, var: 1.0, rate: 0.0 });
             }
         }
     }
@@ -345,6 +390,43 @@ mod tests {
         for w in n.t.windows(2) {
             assert!((w[0] - w[1]).abs() < 0.2e-6, "{:?}", n.t);
         }
+    }
+
+    #[test]
+    fn repeated_copies_follow_the_clock_drift() {
+        // Local clocks s_i = a_i + (1 + k_i) tau, tens of ppm apart (RTL-SDR
+        // sticks). The same frame is sent three times 0.4 s apart and every
+        // receiver hears each one (propagation left out: arrivals simultaneous).
+        let a = [0.0, 3.25, -7.5];
+        let k = [0.0, 20e-6, -35e-6];
+        let nodes: Vec<Node> = (0..3).map(|i| node(45.0, 9.0 + i as f64 * 0.1)).collect();
+        let taus = [100.0, 100.4, 100.8];
+        let mut copies = vec![];
+        for &tau in &taus {
+            for i in 0..3 {
+                copies.push(Copy { node: i, s: a[i] + (1.0 + k[i]) * tau });
+            }
+        }
+        // Edges as engine::freeze reads them: at each node's first copy.
+        let s_first: Vec<f64> = (0..3).map(|i| a[i] + (1.0 + k[i]) * taus[0]).collect();
+        let theta = |i: usize, j: usize, s_i: f64| a[j] + (1.0 + k[j]) * (s_i - a[i]) / (1.0 + k[i]) - s_i;
+        let rate = |i: usize, j: usize| (1.0 + k[j]) / (1.0 + k[i]) - 1.0;
+        let var = (30e-9f64).powi(2);
+        let spread = |n: &Normalized| -> Vec<f64> {
+            (0..taus.len()).map(|tx| {
+                let ts: Vec<f64> = (0..3).map(|i| n.t[n.copies.iter().position(|&q| q == tx * 3 + i).unwrap()]).collect();
+                ts.iter().cloned().fold(f64::MIN, f64::max) - ts.iter().cloned().fold(f64::MAX, f64::min)
+            }).collect()
+        };
+        let fixed = normalize_with_rates(&nodes, &copies, |i, j| Some((theta(i, j, s_first[i]), var, rate(i, j)))).unwrap();
+        for (tx, d) in spread(&fixed).iter().enumerate() {
+            assert!(*d < 1e-9, "transmission {tx}: copies {d:e} s apart after the rates");
+        }
+        // Without the rates only the first transmission lines up: the later
+        // copies are off by drift x elapsed time (55 ppm x 0.8 s = 44 us).
+        let stale = normalize(&nodes, &copies, |i, j| Some((theta(i, j, s_first[i]), var))).unwrap();
+        let d = spread(&stale);
+        assert!(d[0] < 1e-9 && d[1] > 10e-6 && d[2] > 30e-6, "{d:?}");
     }
 
     #[test]

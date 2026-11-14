@@ -112,8 +112,8 @@ pub(crate) struct Frozen {
     pub copies: Vec<Copy>,
     /// Members then bridges (only when bridged).
     pub nodes_all: Option<Vec<Node>>,
-    /// Edge (i, j), i < j, at `i * n + j`, n = all nodes.
-    pub edges: Vec<Option<(f64, f64)>>,
+    /// Edge (i, j), i < j, at `i * n + j`, n = all nodes: (theta, var, rate).
+    pub edges: Vec<Option<(f64, f64, f64)>>,
     /// Members' clock-graph components (for the bridging counters).
     pub comp: Vec<usize>,
 }
@@ -122,10 +122,10 @@ impl Frozen {
     pub fn normalize(&self, stats: &Stats) -> Option<norm::Normalized> {
         let Some(nodes_all) = &self.nodes_all else {
             let n = self.nodes.len();
-            return norm::normalize(&self.nodes, &self.copies, |i, j| self.edges[i * n + j]);
+            return norm::normalize_with_rates(&self.nodes, &self.copies, |i, j| self.edges[i * n + j]);
         };
         let n = nodes_all.len();
-        let normd = norm::normalize(nodes_all, &self.copies, |i, j| self.edges[i * n + j])?;
+        let normd = norm::normalize_with_rates(nodes_all, &self.copies, |i, j| self.edges[i * n + j])?;
         let mut per_comp: HashMap<usize, usize> = HashMap::default();
         for c in &self.copies {
             *per_comp.entry(self.comp[c.node]).or_default() += 1;

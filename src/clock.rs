@@ -303,6 +303,12 @@ impl PairModel {
     }
 
     /// Predicted theta and its variance at a's clock time s_a.
+    /// d(theta)/d(s_a), s/s: the pair's current drift estimate (constant in
+    /// the model, so the same at any time `predict` is asked about).
+    pub fn rate(&self) -> f64 {
+        self.x[1]
+    }
+
     pub fn predict(&self, s_a: f64) -> (f64, f64) {
         let (x, p) = self.propagate(s_a);
         (self.base + x[0], p[0][0].max(0.0))

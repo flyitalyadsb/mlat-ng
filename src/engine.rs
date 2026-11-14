@@ -1985,31 +1985,36 @@ impl Engine {
     }
 
     /// The clock edge between nodes i and j of a group (receiver keys, local
-    /// times of this event), as norm::normalize wants it: (theta, variance)
-    /// with s_j - s_i ~= theta, or None when that pair is not usable.
-    fn edge(&self, keys: &[RxKey], s_of: &[f64], i: usize, j: usize, now: f64) -> Option<(f64, f64)> {
+    /// times of this event), as norm::normalize_with_rates wants it: (theta,
+    /// variance, rate) with s_j - s_i ~= theta at node i's time `s_of[i]` and
+    /// rate = d(theta)/d(s_i), or None when that pair is not usable.
+    fn edge(&self, keys: &[RxKey], s_of: &[f64], i: usize, j: usize, now: f64) -> Option<(f64, f64, f64)> {
         let pk = pair_key(keys[i], keys[j]);
         let m = self.pairs.get(&pk)?;
         if !m.usable(now) {
             return None;
         }
-        let (theta, var) = if keys[i] == pk.0 {
-            m.predict(s_of[i])
+        let (theta, var, rate) = if keys[i] == pk.0 {
+            let (th, v) = m.predict(s_of[i]);
+            (th, v, m.rate())
         } else {
-            // model is s_i - s_j at j's time; flip it
+            // model is s_i - s_j at j's time; flip it (the rate to first order:
+            // d(-theta_ji)/ds_i = -rate_ji * ds_j/ds_i, and ds_j/ds_i - 1 ~ 1e-5)
             let (th, v) = m.predict(s_of[j]);
-            (-th, v)
+            (-th, v, -m.rate())
         };
         if var.sqrt() > crate::clock::MAX_SIGMA {
             return None;
         }
-        Some((theta, var))
+        Some((theta, var, rate))
     }
 
     /// What norm::normalize needs for this group, read from the clock pairs
     /// now (worker::Frozen).
     fn freeze(&self, keys: Vec<RxKey>, nodes: Vec<Node>, copies: Vec<Copy>, now: f64) -> Frozen {
-        // Representative local time per node: its first copy.
+        // Representative local time per node: its first copy. The edges are
+        // read there; norm::normalize_with_rates carries a node's later copies
+        // (repeated identical frames in the same group) with the pair rates.
         let mut s_of = vec![f64::NAN; nodes.len()];
         for c in &copies {
             if s_of[c.node].is_nan() {

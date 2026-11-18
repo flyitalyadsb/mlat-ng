@@ -45,6 +45,7 @@ const REGISTRY_RETRY: Duration = Duration::from_secs(10);
 pub struct FeedConfig {
     /// (name, host:port) per cell.
     pub cells: Vec<(String, String)>,
+    /// One or more registry URLs, comma-separated (registry::merge: on the same id the later wins).
     pub receivers_url: String,
     pub adapter: AdapterConfig,
 }
@@ -93,8 +94,14 @@ pub async fn run(cfg: FeedConfig, stats: Arc<FeedStats>, engine: mpsc::Sender<Ev
     for (i, (name, addr)) in cfg.cells.iter().enumerate() {
         tokio::spawn(read_cell(i, name.clone(), addr.clone(), stats.clone(), btx.clone()));
     }
-    let (rtx, mut rrx) = mpsc::channel(4);
-    tokio::spawn(fetch_registry(cfg.receivers_url.clone(), stats.clone(), rtx));
+    let urls: Vec<String> =
+        cfg.receivers_url.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
+    let (rtx, mut rrx) = mpsc::channel(4 * urls.len().max(1));
+    for (i, url) in urls.iter().enumerate() {
+        tokio::spawn(fetch_registry(i, url.clone(), stats.clone(), rtx.clone()));
+    }
+    drop(rtx);
+    let mut parts: Vec<crate::hashing::HashMap<u64, registry::Receiver>> = vec![Default::default(); urls.len()];
 
     let mut ad = Adapter::new(cfg.adapter.clone(), stats.adapter.clone());
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -108,7 +115,12 @@ pub async fn run(cfg: FeedConfig, stats: Arc<FeedStats>, engine: mpsc::Sender<Ev
                     ad.on_frame(f, b.wall, &mut evs);
                 }
             }
-            r = rrx.recv() => if let Some(r) = r { ad.set_registry(r, &mut evs) },
+            r = rrx.recv() => if let Some((i, r)) = r {
+                parts[i] = r;
+                let merged = registry::merge(&parts);
+                stats.registry_size.store(merged.len() as u64, Ordering::Relaxed);
+                ad.set_registry(merged, &mut evs)
+            },
             _ = tick.tick() => ad.tick(unix_now(), &mut evs),
         }
         for ev in evs.drain(..) {
@@ -180,18 +192,18 @@ async fn read_cell(i: usize, name: String, addr: String, stats: Arc<FeedStats>, 
 }
 
 async fn fetch_registry(
+    source: usize,
     url: String,
     stats: Arc<FeedStats>,
-    out: mpsc::Sender<crate::hashing::HashMap<u64, registry::Receiver>>,
+    out: mpsc::Sender<(usize, crate::hashing::HashMap<u64, registry::Receiver>)>,
 ) {
     loop {
         match http_get(&url).await.and_then(|b| Ok(serde_json::from_str::<registry::Doc>(&b)?)) {
             Ok(doc) => {
                 let reg = registry::parse(&doc);
                 let empty = reg.is_empty();
-                stats.registry_size.store(reg.len() as u64, Ordering::Relaxed);
                 stats.registry_ok_ms.store((unix_now() * 1000.0) as u64, Ordering::Relaxed);
-                if out.send(reg).await.is_err() {
+                if out.send((source, reg)).await.is_err() {
                     return;
                 }
                 // The primary fills its registry ~10 s after a restart.

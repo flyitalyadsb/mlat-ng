@@ -68,3 +68,47 @@ pub fn parse(doc: &Doc) -> HashMap<u64, Receiver> {
     }
     m
 }
+
+/// Several registries in one (`--feed-receivers-url` with more than one URL): on the same id the later
+/// source wins. The device gateway's registry (receivers with no mlat-client, positions averaged from
+/// their own GNSS) goes after this instance's own.
+pub fn merge(parts: &[HashMap<u64, Receiver>]) -> HashMap<u64, Receiver> {
+    let mut m = HashMap::default();
+    for part in parts {
+        for (k, r) in part {
+            m.insert(*k, r.clone());
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(key: &str, lat: f64, clock: &str) -> Entry {
+        Entry { key: key.into(), user: "u".into(), lat, lon: 10.0, alt: 100.0, clock: clock.into(), privacy: true }
+    }
+
+    #[test]
+    fn merge_later_source_wins_and_keeps_the_rest() {
+        let own = parse(&Doc { generated: 0.0, receivers: vec![entry("00000000000000aa", 45.0, "dump1090"),
+                                                               entry("00000000000000bb", 46.0, "beast")] });
+        let devices = parse(&Doc { generated: 0.0, receivers: vec![entry("00000000000000bb", 46.5, "beast"),
+                                                                   entry("abcdef0102038f1a", 47.0, "beast")] });
+        let m = merge(&[own, devices]);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[&0xaa].lat, 45.0);
+        assert_eq!(m[&0xbb].lat, 46.5);
+        assert_eq!(m[&0xabcdef0102038f1a].clock, ClockType::Beast);
+        assert!(merge(&[]).is_empty());
+    }
+
+    #[test]
+    fn parse_skips_bad_entries() {
+        let m = parse(&Doc { generated: 0.0, receivers: vec![entry("short", 45.0, "beast"),
+                                                             entry("00000000000000cc", 0.0, "beast"),
+                                                             entry("00000000000000dd", 45.0, "nope")] });
+        assert!(m.is_empty());
+    }
+}

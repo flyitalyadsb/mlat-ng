@@ -140,7 +140,9 @@ struct Args {
     /// outputs (port 4906), one per cell. Empty = no feed.
     #[arg(long, default_value = "", env = "MLAT_NG_FEED")]
     feed: String,
-    /// Where the feed gets receiver positions (the primary's /receivers.json).
+    /// Where the feed gets receiver positions: the primary's /receivers.json, and optionally more
+    /// registries after a comma (e.g. the device gateway's, for receivers with no mlat-client). On the
+    /// same receiver id the later URL wins.
     #[arg(long, default_value = "http://mlat-ng:9100/receivers.json", env = "MLAT_NG_FEED_RECEIVERS_URL")]
     feed_receivers_url: String,
     /// Keep 1 in N DF17 sync pairs (the same pairs at every receiver).

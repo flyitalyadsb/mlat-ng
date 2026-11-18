@@ -111,7 +111,8 @@ Every flag also reads an environment variable (`MLAT_NG_*`, see `--help`).
 `--feed a=readsb-ingest-a:4906,b=readsb-ingest-b:4906` adds a second input:
 readsb-ingest's receiver-tagged Beast output, multilaterated with no
 mlat-client involved (receiver positions from `--feed-receivers-url`, the
-primary instance's `/receivers.json`). With `--bench-sbs-listen`, positions of
+primary instance's `/receivers.json`; more registries can follow after a comma,
+and on the same receiver id the later one wins). With `--bench-sbs-listen`, positions of
 aircraft that also broadcast ADS-B go to a separate port, so they can be
 scored against their own ADS-B. See [docs/PLAN.md](docs/PLAN.md#feed-input).
 

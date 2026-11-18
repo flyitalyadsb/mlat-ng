@@ -106,8 +106,10 @@ mod tests {
 
     #[test]
     fn parse_skips_bad_entries() {
+        let mut at_null_island = entry("00000000000000cc", 0.0, "beast");
+        at_null_island.lon = 0.0; // 0,0 = no position
         let m = parse(&Doc { generated: 0.0, receivers: vec![entry("short", 45.0, "beast"),
-                                                             entry("00000000000000cc", 0.0, "beast"),
+                                                             at_null_island,
                                                              entry("00000000000000dd", 45.0, "nope")] });
         assert!(m.is_empty());
     }
